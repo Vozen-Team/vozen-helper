@@ -28,7 +28,7 @@ fn safe_avatar_url(raw: &str) -> Option<reqwest::Url> {
     Some(url)
 }
 
-async fn avatar(user: &User) -> Option<(String, Vec<u8>)> {
+pub(super) async fn avatar(user: &User) -> Option<(String, Vec<u8>)> {
     static CLIENT: OnceLock<Option<reqwest::Client>> = OnceLock::new();
     let client = CLIENT
         .get_or_init(|| {
@@ -116,7 +116,7 @@ async fn deliver(
     }
 }
 
-fn definite_rejection(error: &serenity::Error) -> bool {
+pub(super) fn definite_rejection(error: &serenity::Error) -> bool {
     // Never retry a possibly accepted send after a timeout or unknown network error.
     matches!(error, serenity::Error::Http(serenity::http::HttpError::UnsuccessfulRequest(response))
         if response.status_code.is_client_error() && response.status_code.as_u16() != 429)

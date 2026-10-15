@@ -58,6 +58,8 @@ use tracing::{info, warn};
 mod rank_card;
 pub mod starboard_card;
 mod starboard_display;
+pub mod suggestion_card;
+mod suggestion_display;
 mod topgg_metrics;
 
 use crate::topgg_metrics::{
@@ -7453,25 +7455,9 @@ impl Handler {
                     self.store.delete_unpublished_suggestion(&guild_text, id)?;
                     return respond(ctx, command, "Suggestion is too long for a Discord message.").await;
                 }
-                let published = target_channel.send_message(&ctx.http, serenity::all::CreateMessage::new()
-                    .content(public_content)
-                    .allowed_mentions(CreateAllowedMentions::new()
-                        .everyone(false).empty_users().empty_roles().replied_user(false))
-                    .components(vec![CreateActionRow::Buttons({
-                        let mut buttons = vec![
-                            CreateButton::new(format!("suggest:up:{id}"))
-                                .label("Support")
-                                .style(ButtonStyle::Success),
-                        ];
-                        if vote_mode != "up_only" {
-                            buttons.push(
-                                CreateButton::new(format!("suggest:down:{id}"))
-                                    .label("Against")
-                                    .style(ButtonStyle::Danger),
-                            );
-                        }
-                        buttons
-                    })])).await;
+                let published = suggestion_display::publish(ctx, target_channel, None,
+                    &suggestion_display::Content { id, author: &author, text: &text, status: "pending", up: 0, down: 0 },
+                    (!anonymous).then_some(&command.user), vote_mode != "up_only").await;
                 let message = match published {
                     Ok(message) => message,
                     Err(_) => {
@@ -7519,6 +7505,8 @@ impl Handler {
                     return respond(ctx, command, "Estado inválido: pending, approved, denied ou considered.").await;
                 }
                 let guild_text = guild_id.to_string();
+                let update_lock = suggestion_display::update_lock(id);
+                let _update = update_lock.lock().await;
                 let Some(suggestion) = self.store.suggestion(id)? else {
                     return respond(ctx, command, "Suggestion not found in this server.").await;
                 };
@@ -7536,14 +7524,18 @@ impl Handler {
                 ) {
                     let panel_channel = ChannelId::new(channel_id);
                     if let Ok(panel) = panel_channel.message(&ctx.http, MessageId::new(message_id)).await {
-                        let author = suggestion_author_label(id, &suggestion.author_id, &panel.content);
+                        let author = suggestion_display::published_author(id, &suggestion.author_id, &panel);
                         let (up, down) = self.store.suggestion_votes(id)?;
                         let content = render_suggestion_message(id, &author, &suggestion.content, &status, up, down);
+                        let user = if author != "Anonymous" {
+                            suggestion.author_id.parse::<u64>().ok().map(serenity::all::UserId::new)
+                        } else { None };
+                        let user = if let Some(user) = user { user.to_user(&ctx.http).await.ok() } else { None };
+                        let against = setting_string(&self.store, &guild_text, "community.suggestions.vote_mode").as_deref() != Some("up_only");
                         if suggestion_message_fits(&content)
-                            && panel_channel.edit_message(&ctx.http, MessageId::new(message_id),
-                                serenity::all::EditMessage::new().content(content)
-                                    .allowed_mentions(CreateAllowedMentions::new()
-                                        .everyone(false).empty_users().empty_roles().replied_user(false)))
+                            && suggestion_display::publish(ctx, panel_channel, Some(MessageId::new(message_id)),
+                                &suggestion_display::Content { id, author: &author, text: &suggestion.content, status: &status, up, down },
+                                user.as_ref(), against)
                                 .await.is_ok()
                         {
                             format!("Suggestion #{id} marked as {status}.")
@@ -8891,9 +8883,8 @@ impl Handler {
                 )
                 .await;
             }
-            let id = raw_id
-                .parse::<i64>()
-                .map_err(|_| anyhow::anyhow!("invalid suggestion button"))?;
+            let id = suggestion_display::vote_id(raw_id)
+                .ok_or_else(|| anyhow::anyhow!("invalid suggestion button"))?;
             if kind == "down"
                 && setting_string(
                     &self.store,
@@ -8910,6 +8901,8 @@ impl Handler {
                 )
                 .await;
             }
+            let update_lock = suggestion_display::update_lock(id);
+            let _update = update_lock.lock().await;
             let Some(suggestion) = self.store.suggestion(id)? else {
                 return respond_component(ctx, component, "Sugestão não encontrada.").await;
             };
@@ -8929,10 +8922,10 @@ impl Handler {
             self.store
                 .vote_suggestion(id, &component.user.id.to_string(), vote)?;
             let (up, down) = self.store.suggestion_votes(id)?;
-            let author = suggestion_author_label(
+            let author = suggestion_display::published_author(
                 suggestion.id,
                 &suggestion.author_id,
-                &component.message.content,
+                &component.message,
             );
             let content = render_suggestion_message(
                 suggestion.id,
@@ -8942,24 +8935,45 @@ impl Handler {
                 up,
                 down,
             );
+            let user = if author != "Anonymous" {
+                suggestion
+                    .author_id
+                    .parse::<u64>()
+                    .ok()
+                    .map(serenity::all::UserId::new)
+            } else {
+                None
+            };
+            let user = if let Some(user) = user {
+                user.to_user(&ctx.http).await.ok()
+            } else {
+                None
+            };
+            let against = setting_string(
+                &self.store,
+                &guild_id.to_string(),
+                "community.suggestions.vote_mode",
+            )
+            .as_deref()
+                != Some("up_only");
             if !suggestion_message_fits(&content)
-                || component
-                    .channel_id
-                    .edit_message(
-                        &ctx.http,
-                        component.message.id,
-                        serenity::all::EditMessage::new()
-                            .content(content)
-                            .allowed_mentions(
-                                CreateAllowedMentions::new()
-                                    .everyone(false)
-                                    .empty_users()
-                                    .empty_roles()
-                                    .replied_user(false),
-                            ),
-                    )
-                    .await
-                    .is_err()
+                || suggestion_display::publish(
+                    ctx,
+                    component.channel_id,
+                    Some(component.message.id),
+                    &suggestion_display::Content {
+                        id: suggestion.id,
+                        author: &author,
+                        text: &suggestion.content,
+                        status: &suggestion.status,
+                        up,
+                        down,
+                    },
+                    user.as_ref(),
+                    against,
+                )
+                .await
+                .is_err()
             {
                 return respond_component(
                     ctx,
