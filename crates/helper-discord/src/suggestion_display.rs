@@ -133,6 +133,20 @@ async fn deliver(
     }
 }
 
+fn alt_text(content: &Content<'_>, author: &str) -> String {
+    let mut units = 0;
+    format!(
+        "Suggestion #{} by {author}. {}. Support {}, Against {}. {}",
+        content.id, content.status, content.up, content.down, content.text
+    )
+    .chars()
+    .take_while(|c| {
+        units += c.len_utf16();
+        units <= 1_000
+    })
+    .collect()
+}
+
 pub(super) async fn publish(
     ctx: &Context,
     channel: ChannelId,
@@ -159,15 +173,7 @@ pub(super) async fn publish(
     let text = content.text.to_owned();
     let status = content.status.to_owned();
     let (id, up, down) = (content.id, content.up, content.down);
-    let mut units = 0;
-    let alt =
-        format!("Suggestion #{id} by {author}: {text}. {status}. Support {up}, Against {down}")
-            .chars()
-            .take_while(|c| {
-                units += c.len_utf16();
-                units <= 1_000
-            })
-            .collect();
+    let alt = alt_text(content, &author);
     let visual = tokio::task::spawn_blocking(move || {
         super::suggestion_card::render(&super::suggestion_card::Card {
             id,
@@ -230,6 +236,16 @@ mod tests {
         for raw in ["0", "-7", "7:other", "7:public:anonymous", "invalid"] {
             assert_eq!(vote_id(raw), None);
         }
+    }
+
+    #[test]
+    fn long_unicode_alt_text_keeps_status_and_vote_counts_before_the_excerpt() {
+        let mut content = sample();
+        let text = "😀".repeat(1_000);
+        content.text = &text;
+        let alt = alt_text(&content, "Rexy");
+        assert!(alt.starts_with("Suggestion #7 by Rexy. pending. Support 3, Against 1. "));
+        assert!(alt.encode_utf16().count() <= 1_000);
     }
 
     #[test]
