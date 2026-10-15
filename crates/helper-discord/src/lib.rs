@@ -7599,7 +7599,7 @@ impl Handler {
                 let id = self.store.create_scheduled_giveaway(&guild_text, &command.channel_id.to_string(), &prize, winners, end_at, required_role.as_deref(), &command.user.id.to_string())?;
                 let giveaway = self.store.giveaway(id)?.ok_or_else(|| anyhow::anyhow!("new giveaway record is missing"))?;
                 let published = giveaway_display::publish(&ctx.http, command.channel_id, None,
-                    &giveaway_display::Content {giveaway: &giveaway, winners: None, rerolled: false}, false).await;
+                    &giveaway_display::Content {giveaway: &giveaway, winners: None, rerolled: false, participants: 0}, false).await;
                 let message = match published {
                     Ok(message) => message,
                     Err(error) => {
@@ -9036,14 +9036,29 @@ impl Handler {
                     .await;
                 }
             }
-            let response = match self
-                .store
-                .toggle_giveaway_entry(id, &component.user.id.to_string())?
-            {
+            let update = giveaway_display::update_entry(
+                &ctx.http,
+                &self.store,
+                id,
+                &component.user.id.to_string(),
+            )
+            .await?;
+            let response = match update.joined {
                 Some(true) => "Entrada registada. Boa sorte!",
                 Some(false) => "Saíste do giveaway.",
                 None => "Este giveaway já terminou.",
             };
+            if !update.panel_updated {
+                return respond_component(
+                    ctx,
+                    component,
+                    &format!(
+                        "{} The participant total could not be updated on the public panel.",
+                        english_bot_text(response)
+                    ),
+                )
+                .await;
+            }
             return respond_component(ctx, component, response).await;
         }
         if let Some(raw) = component.data.custom_id.strip_prefix("poll:") {
@@ -11219,6 +11234,8 @@ async fn finish_giveaway(
     guild_id: &str,
     id: i64,
 ) -> Result<bool> {
+    let update_lock = giveaway_display::update_lock(id);
+    let _update = update_lock.lock().await;
     let Some(giveaway) = store.giveaway(id)? else {
         return Ok(false);
     };
@@ -11232,6 +11249,7 @@ async fn finish_giveaway(
         giveaway: &giveaway,
         winners: Some(&winners),
         rerolled: false,
+        participants: store.giveaway_participant_count(id)?,
     };
     let channel_id = giveaway
         .channel_id
@@ -11291,6 +11309,7 @@ async fn reroll_giveaway(
             giveaway: &giveaway,
             winners: Some(std::slice::from_ref(&winner)),
             rerolled: true,
+            participants: entries.len() as u64,
         },
         true,
     )

@@ -12,6 +12,7 @@ fn main() {
         id: 1,
         prize: &prize,
         winners: if state == State::Empty { 0 } else { 1 },
+        participants: if state == State::Empty { 0 } else { 27 },
         end_at: 1_792_072_800_000,
         state,
     };

@@ -13,6 +13,7 @@ pub struct Card<'a> {
     pub id: i64,
     pub prize: &'a str,
     pub winners: i64,
+    pub participants: u64,
     pub end_at: i64,
     pub state: State,
 }
@@ -28,6 +29,15 @@ fn svg(card: &Card<'_>) -> String {
     };
     let count = card.winners.max(0);
     let winners = format!("{count} {}", if count == 1 { "winner" } else { "winners" });
+    let participants = format!(
+        "{} {}",
+        card.participants,
+        if card.participants == 1 {
+            "participant"
+        } else {
+            "participants"
+        }
+    );
     let deadline = if card.state == State::Open {
         let date = chrono::DateTime::from_timestamp_millis(card.end_at)
             .map(|date| date.format("%d %b %Y · %H:%M UTC").to_string())
@@ -68,6 +78,7 @@ fn svg(card: &Card<'_>) -> String {
         <g transform="translate(0 {})">{continuation}</g>
         <path d="M32 {} H768" stroke="#365269"/>
         <text x="32" y="{}" fill="#8EE5D2" font-size="24" font-weight="700">{winners}</text>
+        <text x="768" y="{}" text-anchor="end" fill="#8EE5D2" font-size="24" font-weight="700">{participants}</text>
         <text x="32" y="{}" fill="#BACBDD" font-size="18">{}</text>
         <text x="768" y="{}" text-anchor="end" fill="#BACBDD" font-size="18">Vozen Giveaways</text>
       </g></svg>"##,
@@ -75,6 +86,7 @@ fn svg(card: &Card<'_>) -> String {
         card.id,
         height - 112,
         height - 92,
+        height - 53,
         height - 53,
         height - 22,
         escape(&deadline),
@@ -95,8 +107,34 @@ mod tests {
             id: 1,
             prize: "bitoque",
             winners: 1,
+            participants: 0,
             end_at: 1_792_072_800_000,
             state: State::Open,
+        }
+    }
+
+    #[test]
+    fn participant_count_is_readable_in_the_banner_and_changes_with_entries() {
+        let mut card = sample();
+        card.participants = 0;
+        let empty = render(&card).unwrap();
+        for (count, label) in [
+            (0, "0 participants"),
+            (1, "1 participant"),
+            (27, "27 participants"),
+        ] {
+            card.participants = count;
+            assert!(svg(&card).contains(label));
+            let png = render(&card).unwrap();
+            if count > 0 {
+                assert_ne!(png, empty);
+            }
+            let pixels = resvg::tiny_skia::Pixmap::decode_png(&png).unwrap();
+            let text_pixels = ((pixels.height() - 78)..(pixels.height() - 48))
+                .flat_map(|y| (490..768).map(move |x| (x, y)))
+                .filter(|(x, y)| pixels.pixel(*x, *y).unwrap().green() > 150)
+                .count();
+            assert!(text_pixels > 80, "participant label must rasterize");
         }
     }
 

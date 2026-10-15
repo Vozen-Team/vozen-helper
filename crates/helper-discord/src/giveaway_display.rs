@@ -3,6 +3,90 @@ use super::giveaway_card::{Card, State};
 use helper_store::GiveawayRecord;
 use serde_json::{Value, json};
 use serenity::all::{ChannelId, CreateAttachment, Message, MessageId};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex, OnceLock, Weak},
+};
+
+pub(super) fn update_lock(id: i64) -> Arc<tokio::sync::Mutex<()>> {
+    // Keep entry mutation and panel delivery ordered with panel closure.
+    type Locks = Mutex<HashMap<i64, Weak<tokio::sync::Mutex<()>>>>;
+    static LOCKS: OnceLock<Locks> = OnceLock::new();
+    let mut locks = LOCKS
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(&id).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(tokio::sync::Mutex::new(()));
+    locks.insert(id, Arc::downgrade(&lock));
+    lock
+}
+
+pub(super) struct EntryUpdate {
+    pub joined: Option<bool>,
+    pub panel_updated: bool,
+}
+
+pub(super) async fn update_entry(
+    http: &serenity::http::Http,
+    store: &helper_store::Store,
+    id: i64,
+    user: &str,
+) -> anyhow::Result<EntryUpdate> {
+    let lock = update_lock(id);
+    let _update = lock.lock().await;
+    let Some(giveaway) = store.giveaway(id)? else {
+        return Ok(EntryUpdate {
+            joined: None,
+            panel_updated: true,
+        });
+    };
+    let joined = store.toggle_giveaway_entry(id, user)?;
+    if joined.is_none() {
+        return Ok(EntryUpdate {
+            joined,
+            panel_updated: true,
+        });
+    }
+    let participants = store.giveaway_participant_count(id)?;
+    let channel = giveaway.channel_id.parse::<u64>()?;
+    let message = giveaway
+        .message_id
+        .as_deref()
+        .and_then(|raw| raw.parse::<u64>().ok());
+    // A failed edit must not re-toggle a saved entry or create another panel.
+    let panel_updated = if let Some(message) = message {
+        match publish(
+            http,
+            ChannelId::new(channel),
+            Some(MessageId::new(message)),
+            &Content {
+                giveaway: &giveaway,
+                winners: None,
+                rerolled: false,
+                participants,
+            },
+            false,
+        )
+        .await
+        {
+            Ok(_) => true,
+            Err(error) => {
+                tracing::warn!(giveaway_id = id, %error, "entry saved but giveaway participant panel could not be refreshed");
+                false
+            }
+        }
+    } else {
+        false
+    };
+    Ok(EntryUpdate {
+        joined,
+        panel_updated,
+    })
+}
 
 struct Visual {
     png: Vec<u8>,
@@ -13,6 +97,7 @@ pub(super) struct Content<'a> {
     pub giveaway: &'a GiveawayRecord,
     pub winners: Option<&'a [String]>,
     pub rerolled: bool,
+    pub participants: u64,
 }
 
 impl Content<'_> {
@@ -33,7 +118,7 @@ impl Content<'_> {
         format!("**Giveaway #{}**", self.giveaway.id)
     }
     fn footer(&self) -> String {
-        match self.winners {
+        let result = match self.winners {
             None => {
                 let role = self
                     .giveaway
@@ -61,7 +146,8 @@ impl Content<'_> {
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
-        }
+        };
+        format!("**Participants:** {}\n{result}", self.participants)
     }
     fn fallback(&self) -> String {
         format!(
@@ -150,9 +236,10 @@ pub(super) async fn publish(
         content.giveaway.end_at,
         content.state(),
     );
+    let participants = content.participants;
     let mut units = 0;
     let alt = format!(
-        "Giveaway #{id}. {} {winners} winner(s). Prize: {prize}",
+        "Giveaway #{id}. {} {participants} participant(s). {winners} winner(s). Prize: {prize}",
         if state == State::Open {
             "Open."
         } else {
@@ -170,6 +257,7 @@ pub(super) async fn publish(
             id,
             prize: &prize,
             winners,
+            participants,
             end_at,
             state,
         })
@@ -255,6 +343,115 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn joining_and_leaving_refresh_the_public_participant_total() {
+        let store = helper_store::Store::open(":memory:").unwrap();
+        let id = store
+            .create_giveaway("10", "20", "Prize", 1, i64::MAX, None, "host")
+            .unwrap();
+        store.set_giveaway_message(id, "30").unwrap();
+        let (http, server) = mock_http(vec![200, 200, 200]);
+        for (user, joined) in [("a", true), ("b", true), ("a", false)] {
+            let update = update_entry(&http, &store, id, user).await.unwrap();
+            assert_eq!(update.joined, Some(joined));
+            assert!(update.panel_updated);
+        }
+        store.end_giveaway(id).unwrap();
+        assert_eq!(
+            update_entry(&http, &store, id, "late")
+                .await
+                .unwrap()
+                .joined,
+            None
+        );
+        let requests = server.join().unwrap();
+        for (request, count) in requests.iter().zip([1, 2, 1]) {
+            assert!(request.starts_with("PATCH /api/v10/channels/20/messages/30 "));
+            assert!(request.contains(&format!("**Participants:** {count}")));
+            assert!(request.contains("giveaway.png"));
+            assert!(request.contains(&format!("giveaway:join:{id}")));
+        }
+        assert_eq!(store.giveaway_participant_count(id).unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn queued_join_then_close_preserve_final_count_without_reopening_the_panel() {
+        let store = helper_store::Store::open(":memory:").unwrap();
+        let id = store
+            .create_giveaway("10", "20", "Prize", 1, i64::MAX, None, "host")
+            .unwrap();
+        store.set_giveaway_message(id, "30").unwrap();
+        let (http, server) = mock_http(vec![200, 200, 200]);
+        let lock = update_lock(id);
+        let held = lock.lock().await;
+        let joining = update_entry(&http, &store, id, "123");
+        tokio::pin!(joining);
+        tokio::select! {
+            biased;
+            _ = &mut joining => panic!("entry must wait for the panel lock"),
+            _ = std::future::ready(()) => {}
+        }
+        let closing = super::super::finish_giveaway(&http, &store, "10", id);
+        tokio::pin!(closing);
+        tokio::select! {
+            biased;
+            _ = &mut closing => panic!("closure must wait for the panel lock"),
+            _ = std::future::ready(()) => {}
+        }
+        drop(held);
+        let (entry, closed) = tokio::join!(joining, closing);
+        assert_eq!(entry.unwrap().joined, Some(true));
+        assert!(closed.unwrap());
+        assert!(store.giveaway(id).unwrap().unwrap().ended);
+        assert_eq!(
+            update_entry(&http, &store, id, "late")
+                .await
+                .unwrap()
+                .joined,
+            None
+        );
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[0].starts_with("PATCH "));
+        assert!(requests[0].contains("giveaway:join:"));
+        assert!(requests[1].starts_with("POST "));
+        assert!(requests[2].starts_with("PATCH "));
+        for request in &requests[1..] {
+            assert!(request.contains("**Participants:** 1"));
+            assert!(!request.contains("giveaway:join:"));
+        }
+    }
+
+    #[tokio::test]
+    async fn participant_refresh_failure_does_not_undo_or_toggle_the_entry_twice() {
+        let store = helper_store::Store::open(":memory:").unwrap();
+        let id = store
+            .create_giveaway("10", "20", "Prize", 1, i64::MAX, None, "host")
+            .unwrap();
+        store.set_giveaway_message(id, "30").unwrap();
+        let (http, server) = mock_http(vec![403, 403]);
+        let update = update_entry(&http, &store, id, "member").await.unwrap();
+        assert_eq!(update.joined, Some(true));
+        assert!(!update.panel_updated);
+        assert_eq!(store.giveaway_participant_count(id).unwrap(), 1);
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].contains("**Participants:** 1"));
+    }
+
+    #[test]
+    fn join_and_close_updates_share_only_their_giveaway_lock() {
+        let first = update_lock(100);
+        let same = update_lock(100);
+        let other = update_lock(101);
+        assert!(std::sync::Arc::ptr_eq(&first, &same));
+        let held = first.try_lock().unwrap();
+        assert!(same.try_lock().is_err());
+        assert!(other.try_lock().is_ok());
+        drop(held);
+        assert!(same.try_lock().is_ok());
+    }
+
+    #[tokio::test]
     async fn giveaway_native_transport_uploads_png_and_closes_original_without_join() {
         let (http, server) = mock_http(vec![200, 200]);
         let giveaway = sample();
@@ -266,6 +463,7 @@ mod tests {
                 giveaway: &giveaway,
                 winners: None,
                 rerolled: false,
+                participants: 0,
             },
             false,
         )
@@ -280,6 +478,7 @@ mod tests {
                 giveaway: &giveaway,
                 winners: Some(&winners),
                 rerolled: false,
+                participants: 0,
             },
             false,
         )
@@ -306,6 +505,7 @@ mod tests {
                 giveaway: &giveaway,
                 winners: None,
                 rerolled: false,
+                participants: 0,
             },
             false,
         )
@@ -342,6 +542,7 @@ mod tests {
             giveaway: &giveaway,
             winners: None,
             rerolled: false,
+            participants: 0,
         };
         let visual = Visual {
             png: vec![1, 2],
@@ -386,6 +587,7 @@ mod tests {
             giveaway: &giveaway,
             winners: Some(&winners),
             rerolled: false,
+            participants: 0,
         };
         let packet = payload(&content, None, false, true);
         assert_eq!(
@@ -416,6 +618,7 @@ mod tests {
                 giveaway: &giveaway,
                 winners,
                 rerolled: false,
+                participants: 0,
             };
             let packet = payload(&content, None, true, true);
             assert!(
@@ -440,6 +643,7 @@ mod tests {
             giveaway: &giveaway,
             winners: None,
             rerolled: false,
+            participants: 0,
         };
         let visual = Visual {
             png: vec![],

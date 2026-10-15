@@ -5789,6 +5789,15 @@ impl Store {
         Ok(Some(!removed))
     }
 
+    pub fn giveaway_participant_count(&self, id: i64) -> Result<u64> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        Ok(conn.query_row(
+            "SELECT COUNT(*) FROM giveaway_entries WHERE giveaway_id=?1",
+            [id],
+            |row| row.get::<_, i64>(0).map(|count| count as u64),
+        )?)
+    }
+
     pub fn giveaway_entries(&self, id: i64) -> Result<Vec<String>> {
         let conn = self.conn.lock().expect("store mutex poisoned");
         let mut stmt = conn.prepare(
@@ -6321,6 +6330,28 @@ mod tests {
         store.vote_poll(open + 1, "missing", 0).unwrap();
         assert_eq!(store.poll_counts(open, 2).unwrap(), vec![1, 0]);
         assert_eq!(store.poll_counts(open + 1, 2).unwrap(), vec![0, 0]);
+    }
+
+    #[test]
+    fn giveaway_participant_count_tracks_unique_entries_and_survives_closure() {
+        let store = Store::open(":memory:").unwrap();
+        let id = store
+            .create_giveaway("g", "c", "Prize", 1, i64::MAX, None, "host")
+            .unwrap();
+        let other = store
+            .create_giveaway("other", "c", "Other", 1, i64::MAX, None, "host")
+            .unwrap();
+        assert_eq!(store.giveaway_participant_count(id).unwrap(), 0);
+        store.toggle_giveaway_entry(id, "a").unwrap();
+        store.toggle_giveaway_entry(id, "b").unwrap();
+        store.toggle_giveaway_entry(other, "c").unwrap();
+        assert_eq!(store.giveaway_participant_count(id).unwrap(), 2);
+        store.toggle_giveaway_entry(id, "a").unwrap();
+        assert_eq!(store.giveaway_participant_count(id).unwrap(), 1);
+        store.end_giveaway(id).unwrap();
+        assert_eq!(store.giveaway_participant_count(id).unwrap(), 1);
+        assert_eq!(store.giveaway_participant_count(other).unwrap(), 1);
+        assert_eq!(store.giveaway_participant_count(other + 1).unwrap(), 0);
     }
 
     #[test]
