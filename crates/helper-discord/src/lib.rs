@@ -55,6 +55,8 @@ use std::{
 };
 use tracing::{info, warn};
 
+pub mod giveaway_card;
+mod giveaway_display;
 mod rank_card;
 pub mod starboard_card;
 mod starboard_display;
@@ -7595,10 +7597,9 @@ impl Handler {
                 let end_at = chrono::Utc::now().timestamp_millis() + decision.duration_ms;
                 let guild_text = guild_id.to_string();
                 let id = self.store.create_scheduled_giveaway(&guild_text, &command.channel_id.to_string(), &prize, winners, end_at, required_role.as_deref(), &command.user.id.to_string())?;
-                let published = command.channel_id.send_message(&ctx.http, serenity::all::CreateMessage::new()
-                    .content(format!("🎉 **Giveaway #{id}**\nPrize: **{prize}**\nWinners: **{winners}**\nEnds <t:{}:R>\nClick the button to join.", end_at / 1_000))
-                    .allowed_mentions(giveaway_allowed_mentions(&[]))
-                    .components(vec![CreateActionRow::Buttons(vec![CreateButton::new(format!("giveaway:join:{id}")).label("Join").style(ButtonStyle::Primary)])])).await;
+                let giveaway = self.store.giveaway(id)?.ok_or_else(|| anyhow::anyhow!("new giveaway record is missing"))?;
+                let published = giveaway_display::publish(&ctx.http, command.channel_id, None,
+                    &giveaway_display::Content {giveaway: &giveaway, winners: None, rerolled: false}, false).await;
                 let message = match published {
                     Ok(message) => message,
                     Err(error) => {
@@ -11227,33 +11228,17 @@ async fn finish_giveaway(
     let Some((winners, claim_at)) = store.prepare_giveaway_result(guild_id, id)? else {
         return Ok(false);
     };
-    let result = if winners.is_empty() {
-        format!("🎁 Giveaway #{} ended without participants.", giveaway.id)
-    } else {
-        format!(
-            "🎁 Giveaway #{} ended! Prize: **{}**\nWinners: {}",
-            giveaway.id,
-            giveaway.prize,
-            winners
-                .iter()
-                .map(|id| format!("<@{id}>"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
+    let content = giveaway_display::Content {
+        giveaway: &giveaway,
+        winners: Some(&winners),
+        rerolled: false,
     };
     let channel_id = giveaway
         .channel_id
         .parse::<u64>()
         .map(ChannelId::new)
         .map_err(|_| anyhow::anyhow!("invalid giveaway channel"))?;
-    let published = channel_id
-        .send_message(
-            http,
-            CreateMessage::new()
-                .content(result)
-                .allowed_mentions(giveaway_allowed_mentions(&winners)),
-        )
-        .await;
+    let published = giveaway_display::publish(http, channel_id, None, &content, true).await;
     if let Err(error) = published {
         store.release_giveaway_claim(id, claim_at)?;
         return Err(error.into());
@@ -11265,18 +11250,14 @@ async fn finish_giveaway(
         .message_id
         .as_deref()
         .and_then(|raw| raw.parse::<u64>().ok())
-        && let Err(error) = channel_id
-            .edit_message(
-                http,
-                serenity::all::MessageId::new(message_id),
-                serenity::all::EditMessage::new()
-                    .content(format!(
-                        "🎉 Giveaway #{} ended. See the result below.",
-                        giveaway.id
-                    ))
-                    .components(Vec::new()),
-            )
-            .await
+        && let Err(error) = giveaway_display::publish(
+            http,
+            channel_id,
+            Some(MessageId::new(message_id)),
+            &content,
+            false,
+        )
+        .await
     {
         warn!(giveaway_id = id, %error, "could not close giveaway panel after announcement");
     }
@@ -11302,17 +11283,18 @@ async fn reroll_giveaway(
     entries.shuffle(&mut rand::rng());
     let winner = entries[0].clone();
     let channel = giveaway.channel_id.parse::<u64>().map(ChannelId::new)?;
-    channel
-        .send_message(
-            http,
-            CreateMessage::new()
-                .content(format!(
-                    "🎲 Giveaway #{} reroll: new winner <@{}> received **{}**.",
-                    giveaway.id, winner, giveaway.prize
-                ))
-                .allowed_mentions(giveaway_allowed_mentions(std::slice::from_ref(&winner))),
-        )
-        .await?;
+    giveaway_display::publish(
+        http,
+        channel,
+        None,
+        &giveaway_display::Content {
+            giveaway: &giveaway,
+            winners: Some(std::slice::from_ref(&winner)),
+            rerolled: true,
+        },
+        true,
+    )
+    .await?;
     Ok(Some(winner))
 }
 

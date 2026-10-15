@@ -12,7 +12,7 @@ pub struct Card<'a> {
     pub avatar: Option<(&'a str, &'a [u8])>,
 }
 
-fn escape(value: &str) -> String {
+pub(super) fn escape(value: &str) -> String {
     value
         .replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -32,7 +32,7 @@ fn glyph_weight(character: char) -> usize {
     }
 }
 
-fn message_lines(value: &str) -> (Vec<String>, bool) {
+pub(super) fn message_lines(value: &str) -> (Vec<String>, bool) {
     let mut lines = vec![String::new()];
     let mut width = 0;
     let mut truncated = false;
@@ -148,6 +148,10 @@ fn svg(card: &Card<'_>) -> String {
 }
 
 pub fn render(card: &Card<'_>) -> Option<Vec<u8>> {
+    rasterize(&svg(card))
+}
+
+pub(super) fn rasterize(svg: &str) -> Option<Vec<u8>> {
     static FONTS: OnceLock<Arc<resvg::usvg::fontdb::Database>> = OnceLock::new();
     let fonts = FONTS.get_or_init(|| {
         let mut fonts = resvg::usvg::fontdb::Database::new();
@@ -168,8 +172,9 @@ pub fn render(card: &Card<'_>) -> Option<Vec<u8>> {
         fontdb: fonts.clone(),
         ..Default::default()
     };
-    let tree = resvg::usvg::Tree::from_str(&svg(card), &options).ok()?;
-    let mut pixels = resvg::tiny_skia::Pixmap::new(800, tree.size().height() as u32)?;
+    let tree = resvg::usvg::Tree::from_str(svg, &options).ok()?;
+    let mut pixels =
+        resvg::tiny_skia::Pixmap::new(tree.size().width() as u32, tree.size().height() as u32)?;
     resvg::render(
         &tree,
         resvg::tiny_skia::Transform::identity(),
