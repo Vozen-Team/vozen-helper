@@ -1124,10 +1124,18 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
     value.chars().take(max_chars).collect()
 }
 
-/// Render the bounded member/server variables used by welcome and farewell
-/// messages.  Legacy settings pass through this function as well, so a value
-/// loaded from the compatibility projection cannot re-enable mass mentions or
-/// exceed Discord's message limit.
+/// Add the greeting emoji to the legacy default without rewriting custom copy.
+pub fn render_welcome_message(template: &str, member: &str, server: &str) -> String {
+    let template = if template == "Welcome {member} to {server}!" {
+        "👋 Welcome {member} to {server}!"
+    } else {
+        template
+    };
+    render_member_message(template, member, server)
+}
+
+/// Render bounded member/server variables, suppress mass mentions and keep the
+/// result within Discord's message limit, including for legacy settings.
 pub fn render_member_message(template: &str, member: &str, server: &str) -> String {
     let rendered = template
         .replace("{member}", member)
@@ -5524,7 +5532,7 @@ impl FeatureAdapter for WelcomeAdapter {
                     ]
                 }]
             }),
-            defaults: serde_json::json!({"channel":"","message":"Welcome {member} to {server}!","delaySeconds":0,"sendDm":false,"dmMessage":"Hello {member}, welcome to {server}!","autoRole":"","farewellChannel":"","farewellMessage":"Goodbye {member}. We hope to see you again!","templateId":"","guideEnabled":false,"steps":["rules","introductions","channels"],"rulesChannel":"","introductionsChannel":"","channelsChannel":""}),
+            defaults: serde_json::json!({"channel":"","message":"👋 Welcome {member} to {server}!","delaySeconds":0,"sendDm":false,"dmMessage":"Hello {member}, welcome to {server}!","autoRole":"","farewellChannel":"","farewellMessage":"Goodbye {member}. We hope to see you again!","templateId":"","guideEnabled":false,"steps":["rules","introductions","channels"],"rulesChannel":"","introductionsChannel":"","channelsChannel":""}),
             dependencies: vec![
                 "guild_members_intent".into(),
                 "send_messages".into(),
@@ -5690,8 +5698,8 @@ impl FeatureAdapter for WelcomeAdapter {
         let message = config
             .get("message")
             .and_then(serde_json::Value::as_str)
-            .unwrap_or("Welcome {member} to {server}!");
-        let rendered = render_member_message(message, member, server);
+            .unwrap_or("👋 Welcome {member} to {server}!");
+        let rendered = render_welcome_message(message, member, server);
         let delay = config
             .get("delaySeconds")
             .and_then(serde_json::Value::as_i64)
@@ -11190,6 +11198,33 @@ pub fn parse_ip(value: &str) -> Result<IpAddr> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn welcome_polish_is_limited_to_the_standard_greeting() {
+        for greeting in [
+            "Welcome {member} to {server}!",
+            "👋 Welcome {member} to {server}!",
+        ] {
+            assert_eq!(
+                super::render_welcome_message(greeting, "<@123>", "Community"),
+                "👋 Welcome <@123> to Community!"
+            );
+        }
+        for custom in [
+            "Hello {member}!",
+            "🎉 Welcome {member}!",
+            "",
+            &"a".repeat(2000),
+        ] {
+            assert_eq!(
+                super::render_welcome_message(custom, "<@123>", "Community"),
+                super::render_member_message(custom, "<@123>", "Community")
+            );
+        }
+        let safe =
+            super::render_welcome_message("Hello {member} @everyone @here", "<@123>", "Community");
+        assert!(!safe.contains("@everyone"));
+        assert!(!safe.contains("@here"));
+    }
     #[test]
     fn suggestion_length_counts_unicode_characters() {
         let text = "é".repeat(1_000);

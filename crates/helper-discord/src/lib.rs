@@ -16,7 +16,7 @@ use helper_core::{
     evaluate_suggestion, evaluate_temp_channel, evaluate_tickets, evaluate_welcome_channel,
     evaluate_workflow, feature_is_configurable, feature_maturity, leaderboard_policy_from_json,
     parse_utc_offset_minutes, quota_limit, render_bounded_template_message, render_member_message,
-    scam_policy_from_json, starboard_policy_from_json,
+    render_welcome_message, scam_policy_from_json, starboard_policy_from_json,
 };
 use helper_modules::{
     BlueskyClient, BlueskyPost, CoinGeckoClient, CoinGeckoQuote, EntitlementClient,
@@ -2534,7 +2534,7 @@ impl EventHandler for Handler {
                 &guild_text,
                 &welcome,
                 "welcome",
-                "Welcome {member} to {server}!",
+                "👋 Welcome {member} to {server}!",
             );
             let guided = welcome["guideEnabled"].as_bool().unwrap_or_else(|| {
                 setting_bool(
@@ -2554,7 +2554,7 @@ impl EventHandler for Handler {
             );
             if let Some(channel_id) = channel {
                 let mut message = CreateMessage::new()
-                    .content(render_member_message(
+                    .content(render_welcome_message(
                         &public_text,
                         &member_mention,
                         server_name,
@@ -2569,18 +2569,7 @@ impl EventHandler for Handler {
                     let buttons = guide
                         .steps
                         .iter()
-                        .map(|step| {
-                            let label = match step.as_str() {
-                                "rules" => "Read the rules",
-                                "introductions" => "Introduce yourself",
-                                "channels" => "Explore channels",
-                                "help" => "Get help",
-                                _ => "Continue",
-                            };
-                            CreateButton::new(format!("welcome:step:{guild_text}:{step}"))
-                                .label(label)
-                                .style(ButtonStyle::Secondary)
-                        })
+                        .map(|step| welcome_guide_button(&guild_text, step))
                         .collect::<Vec<_>>();
                     if !buttons.is_empty() {
                         message = message.components(vec![CreateActionRow::Buttons(buttons)]);
@@ -12017,6 +12006,20 @@ fn setting_string(store: &Store, guild_id: &str, key: &str) -> Option<String> {
     store.get_setting(guild_id, key).ok().flatten()
 }
 
+fn welcome_guide_button(guild: &str, step: &str) -> CreateButton {
+    let (label, emoji) = match step {
+        "rules" => ("Read the rules", "📜"),
+        "introductions" => ("Introduce yourself", "👋"),
+        "channels" => ("Explore channels", "🧭"),
+        "help" => ("Get help", "❓"),
+        _ => ("Continue", "➡️"),
+    };
+    CreateButton::new(format!("welcome:step:{guild}:{step}"))
+        .label(label)
+        .emoji(ReactionType::Unicode(emoji.to_string()))
+        .style(ButtonStyle::Secondary)
+}
+
 /// Resolve a reusable Studio template without allowing arbitrary JSON to leak
 /// into Discord. Templates are opt-in through the templates feature and only
 /// bounded string fields are accepted. Missing or malformed templates fall
@@ -13387,6 +13390,23 @@ mod tests {
         collections::{HashMap, VecDeque},
         time::{Duration, Instant},
     };
+
+    #[test]
+    fn welcome_buttons_add_native_emoji_without_changing_actions() {
+        for (step, label, emoji) in [
+            ("rules", "Read the rules", "📜"),
+            ("introductions", "Introduce yourself", "👋"),
+            ("channels", "Explore channels", "🧭"),
+            ("help", "Get help", "❓"),
+            ("other", "Continue", "➡️"),
+        ] {
+            let button = serde_json::to_value(super::welcome_guide_button("123", step)).unwrap();
+            assert_eq!(button["custom_id"], format!("welcome:step:123:{step}"));
+            assert_eq!(button["label"], label);
+            assert_eq!(button["style"], 2);
+            assert_eq!(button["emoji"]["name"], emoji);
+        }
+    }
 
     #[test]
     fn gateway_intents_are_bounded_and_the_passport_explains_app_level_access() {
