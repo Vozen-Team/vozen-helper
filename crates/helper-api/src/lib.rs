@@ -121,6 +121,10 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/me", get(me))
         .route("/api/starboard/channel", post(starboard_channel::create))
         .route(
+            "/api/tickets/category",
+            post(starboard_channel::create_ticket_category),
+        )
+        .route(
             "/api/tickets/channel",
             post(starboard_channel::create_ticket_panel),
         )
@@ -11996,79 +12000,87 @@ mod tests {
 
     #[tokio::test]
     async fn ticket_channel_creation_checks_session_origin_and_input_before_discord() {
-        let store = Store::open(":memory:").unwrap();
-        let session = claims("guild-a");
-        let token = sign_session(&session, "test-session-secret-with-at-least-32-bytes");
-        store.save_session(&session).unwrap();
-        for (cookie, origin, body, expected) in [
-            (
-                false,
-                None,
-                r#"{"name":"tickets"}"#,
-                StatusCode::UNAUTHORIZED,
-            ),
-            (true, None, r#"{"name":"tickets"}"#, StatusCode::FORBIDDEN),
-            (
-                true,
-                Some("https://evil.test"),
-                r#"{"name":"tickets"}"#,
-                StatusCode::FORBIDDEN,
-            ),
-            (
-                true,
-                Some("https://vozen.org"),
-                r#"{"name":"../bad"}"#,
-                StatusCode::BAD_REQUEST,
-            ),
-            (
-                true,
-                Some("https://vozen.org"),
-                r#"{"name":"tickets","guildId":"other"}"#,
-                StatusCode::UNPROCESSABLE_ENTITY,
-            ),
-            (
-                true,
-                Some("https://vozen.org"),
-                r#"{"name":"tickets","moderatorRoleIds":["arbitrary"]}"#,
-                StatusCode::UNPROCESSABLE_ENTITY,
-            ),
-            (
-                true,
-                Some("https://vozen.org"),
-                r#"{"name":"tickets"}"#,
-                StatusCode::SERVICE_UNAVAILABLE,
-            ),
-        ] {
-            let mut api_state = state(store.clone());
-            api_state.allowed_origin = Some("https://vozen.org".into());
-            let mut request = Request::builder()
-                .method("POST")
-                .uri("/api/tickets/channel")
-                .header(header::CONTENT_TYPE, "application/json");
-            if cookie {
-                request = request.header(header::COOKIE, format!("vh_session={token}"));
+        for endpoint in ["/api/tickets/channel", "/api/tickets/category"] {
+            let store = Store::open(":memory:").unwrap();
+            let session = claims("guild-a");
+            let token = sign_session(&session, "test-session-secret-with-at-least-32-bytes");
+            store.save_session(&session).unwrap();
+            for (cookie, origin, body, expected) in [
+                (
+                    false,
+                    None,
+                    r#"{"name":"tickets"}"#,
+                    StatusCode::UNAUTHORIZED,
+                ),
+                (true, None, r#"{"name":"tickets"}"#, StatusCode::FORBIDDEN),
+                (
+                    true,
+                    Some("https://evil.test"),
+                    r#"{"name":"tickets"}"#,
+                    StatusCode::FORBIDDEN,
+                ),
+                (
+                    true,
+                    Some("https://vozen.org"),
+                    r#"{"name":"../bad"}"#,
+                    StatusCode::BAD_REQUEST,
+                ),
+                (
+                    true,
+                    Some("https://vozen.org"),
+                    r#"{"name":"tickets","guildId":"other"}"#,
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                ),
+                (
+                    true,
+                    Some("https://vozen.org"),
+                    r#"{"name":"tickets","moderatorRoleIds":["arbitrary"]}"#,
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                ),
+                (
+                    true,
+                    Some("https://vozen.org"),
+                    r#"{"name":"tickets"}"#,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                ),
+            ] {
+                let mut api_state = state(store.clone());
+                api_state.allowed_origin = Some("https://vozen.org".into());
+                let mut request = Request::builder()
+                    .method("POST")
+                    .uri(endpoint)
+                    .header(header::CONTENT_TYPE, "application/json");
+                if cookie {
+                    request = request.header(header::COOKIE, format!("vh_session={token}"));
+                }
+                if let Some(origin) = origin {
+                    request = request.header(header::ORIGIN, origin);
+                }
+                let response = router(api_state)
+                    .oneshot(request.body(Body::from(body)).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), expected, "{cookie} {origin:?} {body}");
             }
-            if let Some(origin) = origin {
-                request = request.header(header::ORIGIN, origin);
-            }
-            let response = router(api_state)
-                .oneshot(request.body(Body::from(body)).unwrap())
-                .await
-                .unwrap();
-            assert_eq!(response.status(), expected, "{cookie} {origin:?} {body}");
+            assert!(
+                store
+                    .get_setting("guild-a", "support.tickets.created_panel_channel")
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                store
+                    .get_setting("guild-a", "support.ticket.panel_channel_id")
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                store
+                    .get_setting("guild-a", "support.tickets.created_category")
+                    .unwrap()
+                    .is_none()
+            );
         }
-        assert!(
-            store
-                .get_setting("guild-a", "support.tickets.created_panel_channel")
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            store
-                .get_setting("guild-a", "support.ticket.panel_channel_id")
-                .unwrap()
-                .is_none()
-        );
     }
 
     #[tokio::test]

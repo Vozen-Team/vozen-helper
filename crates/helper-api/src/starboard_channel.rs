@@ -7,6 +7,7 @@ static CREATE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 enum ChannelPurpose {
     Starboard,
     TicketPanel,
+    TicketCategory,
 }
 
 impl ChannelPurpose {
@@ -14,16 +15,37 @@ impl ChannelPurpose {
         match self {
             Self::Starboard => "community.starboard.created_channel",
             Self::TicketPanel => "support.tickets.created_panel_channel",
+            Self::TicketCategory => "support.tickets.created_category",
+        }
+    }
+    fn channel_type(self) -> u64 {
+        if matches!(self, Self::TicketCategory) {
+            4
+        } else {
+            0
+        }
+    }
+    fn required_permissions(self) -> u64 {
+        if matches!(self, Self::TicketCategory) {
+            CATEGORY_BOT_ALLOW | (1 << 28)
+        } else {
+            CREATE_REQUIRED
         }
     }
     fn payload(self, guild: &str, bot: &str, name: &str, staff: &[String]) -> Value {
+        if matches!(self, Self::TicketCategory) {
+            return json!({"name":name,"type":4,"permission_overwrites":[
+                {"id":guild,"type":0,"allow":"0","deny":(1_u64 << 10).to_string()},
+                {"id":bot,"type":1,"allow":CATEGORY_BOT_ALLOW.to_string(),"deny":"0"}
+            ]});
+        }
         let mut payload = channel_payload(
             guild,
             bot,
             name,
             match self {
                 Self::Starboard => staff,
-                Self::TicketPanel => &[],
+                Self::TicketPanel | Self::TicketCategory => &[],
             },
         );
         if matches!(self, Self::TicketPanel) {
@@ -41,6 +63,7 @@ const SEND: u64 = 1 << 11;
 const NO_CHAT: u64 = SEND | (1 << 35) | (1 << 36) | (1 << 38);
 const BOT_ALLOW: u64 = READ | SEND | (1 << 14) | (1 << 15);
 const CREATE_REQUIRED: u64 = BOT_ALLOW | NO_CHAT | 16 | (1 << 28);
+const CATEGORY_BOT_ALLOW: u64 = 16 | (1 << 10) | SEND | (1 << 16);
 const MODERATOR: u64 = 8 | 32 | (1 << 1) | (1 << 2) | (1 << 13) | (1 << 40);
 
 #[derive(Deserialize)]
@@ -79,6 +102,28 @@ pub(super) async fn create_ticket_panel(
     })
 }
 
+pub(super) async fn create_ticket_category(
+    State(state): State<Arc<ApiState>>,
+    headers: HeaderMap,
+    Json(request): Json<TicketCreateRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
+    create_for(
+        state,
+        headers,
+        CreateRequest {
+            name: request.name,
+            moderator_role_ids: vec![],
+        },
+        ChannelPurpose::TicketCategory,
+    )
+    .await
+    .map_err(|(status, Json(mut error))| {
+        error.code = error.code.replace("starboard_", "ticket_category_");
+        error.message = error.message.replace("starboard_", "ticket_category_");
+        (status, Json(error))
+    })
+}
+
 fn channel_name(name: &str) -> Option<String> {
     let name = name.trim().to_ascii_lowercase();
     (name.len() >= 2
@@ -87,6 +132,14 @@ fn channel_name(name: &str) -> Option<String> {
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'))
     .then_some(name)
+}
+
+fn name_exists(channels: &[Value], name: &str, purpose: ChannelPurpose) -> bool {
+    channels.iter().any(|channel| {
+        channel["name"].as_str() == Some(name)
+            && (!matches!(purpose, ChannelPurpose::TicketCategory)
+                || channel["type"].as_u64() == Some(4))
+    })
 }
 
 fn staff_role(role: &Value, guild: &str) -> bool {
@@ -203,7 +256,7 @@ async fn create_for(
     }
     let bits = effective_bot_permissions(&claims.guild_id, &snapshot.roles, &snapshot.bot_role_ids)
         .unwrap_or(0);
-    if bits & 8 == 0 && bits & CREATE_REQUIRED != CREATE_REQUIRED {
+    if bits & 8 == 0 && bits & purpose.required_permissions() != purpose.required_permissions() {
         return Err(client_error(
             StatusCode::FORBIDDEN,
             "starboard_bot_permissions_required",
@@ -218,7 +271,7 @@ async fn create_for(
             "starboard_everyone_administrator",
         ));
     }
-    let staff: Vec<String> = if matches!(purpose, ChannelPurpose::TicketPanel) {
+    let staff: Vec<String> = if !matches!(purpose, ChannelPurpose::Starboard) {
         vec![]
     } else if request.moderator_role_ids.is_empty() {
         snapshot
@@ -266,7 +319,7 @@ async fn create_for(
             .iter()
             .find(|channel| channel["id"] == saved["id"])
     {
-        if channel["type"].as_u64() != Some(0)
+        if channel["type"].as_u64() != Some(purpose.channel_type())
             || channel["name"].as_str() != Some(&name)
             || !matching_permissions(channel, &payload)
         {
@@ -279,11 +332,7 @@ async fn create_for(
             json!({"guildId":claims.guild_id,"channel":channel,"reused":true}),
         ));
     }
-    if snapshot
-        .channels
-        .iter()
-        .any(|channel| channel["name"].as_str() == Some(&name))
-    {
+    if name_exists(&snapshot.channels, &name, purpose) {
         return Err(client_error(
             StatusCode::CONFLICT,
             "starboard_channel_name_exists",
@@ -300,6 +349,7 @@ async fn create_for(
             match purpose {
                 ChannelPurpose::Starboard => "Vozen%20Starboard%20read-only%20channel",
                 ChannelPurpose::TicketPanel => "Vozen%20Tickets%20public%20panel%20channel",
+                ChannelPurpose::TicketCategory => "Vozen%20Tickets%20private%20category",
             },
         )
         .json(&payload)
@@ -339,7 +389,7 @@ async fn create_for(
     let id = channel["id"]
         .as_str()
         .ok_or_else(|| client_error(StatusCode::BAD_GATEWAY, "starboard_creation_uncertain"))?;
-    if channel["type"].as_u64() != Some(0)
+    if channel["type"].as_u64() != Some(purpose.channel_type())
         || channel["guild_id"].as_str() != Some(&claims.guild_id)
         || !matching_permissions(&channel, &payload)
     {
@@ -366,6 +416,7 @@ async fn create_for(
         match purpose {
             ChannelPurpose::Starboard => "starboard_channel_created",
             ChannelPurpose::TicketPanel => "ticket_panel_channel_created",
+            ChannelPurpose::TicketCategory => "ticket_category_created",
         },
         &claims.user_id,
         Some(id),
@@ -380,6 +431,53 @@ async fn create_for(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn category_can_share_the_panel_name_but_does_not_adopt_an_existing_category() {
+        let channels = vec![json!({"name":"tickets","type":0})];
+        assert!(!name_exists(
+            &channels,
+            "tickets",
+            ChannelPurpose::TicketCategory
+        ));
+        assert!(name_exists(
+            &channels,
+            "tickets",
+            ChannelPurpose::TicketPanel
+        ));
+        let categories = vec![json!({"name":"tickets","type":4})];
+        assert!(name_exists(
+            &categories,
+            "tickets",
+            ChannelPurpose::TicketCategory
+        ));
+    }
+    #[test]
+    fn ticket_category_is_private_and_separate_from_the_public_panel() {
+        let purpose = ChannelPurpose::TicketCategory;
+        assert_ne!(purpose.record(), ChannelPurpose::TicketPanel.record());
+        let payload = purpose.payload("guild", "bot", "tickets", &[]);
+        assert_eq!(payload["type"], 4);
+        assert!(
+            payload.get("topic").is_none(),
+            "categories do not have topics"
+        );
+        let overwrites = &payload["permission_overwrites"];
+        let member =
+            channel_bot_permissions(READ | SEND, "guild", "user", &[], overwrites).unwrap();
+        assert_eq!(member & (1 << 10), 0);
+        let bot = channel_bot_permissions(0, "guild", "bot", &[], overwrites).unwrap();
+        assert_eq!(bot & (16 | (1 << 10)), 16 | (1 << 10));
+        for item in overwrites.as_array().unwrap() {
+            let bits = item["allow"].as_str().unwrap().parse::<u64>().unwrap()
+                | item["deny"].as_str().unwrap().parse::<u64>().unwrap();
+            assert_eq!(bits & !purpose.required_permissions(), 0);
+        }
+        assert_eq!(
+            purpose.required_permissions() & NO_CHAT,
+            SEND,
+            "category creation does not need thread privileges"
+        );
+    }
     #[test]
     fn ticket_panel_channel_is_public_read_only_and_uses_an_independent_record() {
         let purpose = ChannelPurpose::TicketPanel;
