@@ -3,7 +3,37 @@ use super::*;
 use serde_json::{Value, json};
 
 static CREATE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-const RECORD: &str = "community.starboard.created_channel";
+#[derive(Clone, Copy)]
+enum ChannelPurpose {
+    Starboard,
+    TicketPanel,
+}
+
+impl ChannelPurpose {
+    fn record(self) -> &'static str {
+        match self {
+            Self::Starboard => "community.starboard.created_channel",
+            Self::TicketPanel => "support.tickets.created_panel_channel",
+        }
+    }
+    fn payload(self, guild: &str, bot: &str, name: &str, staff: &[String]) -> Value {
+        let mut payload = channel_payload(
+            guild,
+            bot,
+            name,
+            match self {
+                Self::Starboard => staff,
+                Self::TicketPanel => &[],
+            },
+        );
+        if matches!(self, Self::TicketPanel) {
+            payload["topic"] = json!(
+                "Vozen Helper • Open a private support ticket using the panel below. Read-only for members; administrators retain access."
+            );
+        }
+        payload
+    }
+}
 const READ: u64 = (1 << 6) | (1 << 10) | (1 << 16);
 const SEND: u64 = 1 << 11;
 // Denying SEND already implicitly denies SEND_TTS_MESSAGES. Including TTS
@@ -19,6 +49,34 @@ pub(super) struct CreateRequest {
     name: String,
     #[serde(default)]
     moderator_role_ids: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct TicketCreateRequest {
+    name: String,
+}
+
+pub(super) async fn create_ticket_panel(
+    State(state): State<Arc<ApiState>>,
+    headers: HeaderMap,
+    Json(request): Json<TicketCreateRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
+    create_for(
+        state,
+        headers,
+        CreateRequest {
+            name: request.name,
+            moderator_role_ids: vec![],
+        },
+        ChannelPurpose::TicketPanel,
+    )
+    .await
+    .map_err(|(status, Json(mut error))| {
+        error.code = error.code.replace("starboard_", "ticket_");
+        error.message = error.message.replace("starboard_", "ticket_");
+        (status, Json(error))
+    })
 }
 
 fn channel_name(name: &str) -> Option<String> {
@@ -75,6 +133,15 @@ pub(super) async fn create(
     State(state): State<Arc<ApiState>>,
     headers: HeaderMap,
     Json(request): Json<CreateRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
+    create_for(state, headers, request, ChannelPurpose::Starboard).await
+}
+
+async fn create_for(
+    state: Arc<ApiState>,
+    headers: HeaderMap,
+    request: CreateRequest,
+    purpose: ChannelPurpose,
 ) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
     let claims = require_mutation_auth(&state, &headers)?;
     let name = channel_name(&request.name)
@@ -151,7 +218,9 @@ pub(super) async fn create(
             "starboard_everyone_administrator",
         ));
     }
-    let staff: Vec<String> = if request.moderator_role_ids.is_empty() {
+    let staff: Vec<String> = if matches!(purpose, ChannelPurpose::TicketPanel) {
+        vec![]
+    } else if request.moderator_role_ids.is_empty() {
         snapshot
             .roles
             .iter()
@@ -185,10 +254,10 @@ pub(super) async fn create(
             "discord_context_unavailable",
         )
     })?;
-    let payload = channel_payload(&claims.guild_id, bot, &name, &staff);
+    let payload = purpose.payload(&claims.guild_id, bot, &name, &staff);
     let saved = state
         .store
-        .get_setting(&claims.guild_id, RECORD)
+        .get_setting(&claims.guild_id, purpose.record())
         .map_err(|_| client_error(StatusCode::INTERNAL_SERVER_ERROR, "store_error"))?
         .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
     if let Some(saved) = saved
@@ -197,7 +266,10 @@ pub(super) async fn create(
             .iter()
             .find(|channel| channel["id"] == saved["id"])
     {
-        if channel["name"].as_str() != Some(&name) || !matching_permissions(channel, &payload) {
+        if channel["type"].as_u64() != Some(0)
+            || channel["name"].as_str() != Some(&name)
+            || !matching_permissions(channel, &payload)
+        {
             return Err(client_error(
                 StatusCode::CONFLICT,
                 "starboard_existing_channel_changed",
@@ -225,7 +297,10 @@ pub(super) async fn create(
         .header(header::AUTHORIZATION, &auth)
         .header(
             "X-Audit-Log-Reason",
-            "Vozen%20Starboard%20read-only%20channel",
+            match purpose {
+                ChannelPurpose::Starboard => "Vozen%20Starboard%20read-only%20channel",
+                ChannelPurpose::TicketPanel => "Vozen%20Tickets%20public%20panel%20channel",
+            },
         )
         .json(&payload)
         .send()
@@ -264,7 +339,10 @@ pub(super) async fn create(
     let id = channel["id"]
         .as_str()
         .ok_or_else(|| client_error(StatusCode::BAD_GATEWAY, "starboard_creation_uncertain"))?;
-    if !matching_permissions(&channel, &payload) {
+    if channel["type"].as_u64() != Some(0)
+        || channel["guild_id"].as_str() != Some(&claims.guild_id)
+        || !matching_permissions(&channel, &payload)
+    {
         return Err(client_error(
             StatusCode::BAD_GATEWAY,
             "starboard_channel_permissions_unconfirmed",
@@ -272,7 +350,11 @@ pub(super) async fn create(
     }
     state
         .store
-        .set_setting(&claims.guild_id, RECORD, &json!({"id":id}).to_string())
+        .set_setting(
+            &claims.guild_id,
+            purpose.record(),
+            &json!({"id":id}).to_string(),
+        )
         .map_err(|_| {
             client_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -281,7 +363,10 @@ pub(super) async fn create(
         })?;
     let _ = state.store.record_activity(
         &claims.guild_id,
-        "starboard_channel_created",
+        match purpose {
+            ChannelPurpose::Starboard => "starboard_channel_created",
+            ChannelPurpose::TicketPanel => "ticket_panel_channel_created",
+        },
         &claims.user_id,
         Some(id),
         Some(&claims.user_id),
@@ -295,6 +380,38 @@ pub(super) async fn create(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ticket_panel_channel_is_public_read_only_and_uses_an_independent_record() {
+        let purpose = ChannelPurpose::TicketPanel;
+        assert_ne!(purpose.record(), ChannelPurpose::Starboard.record());
+        let payload = purpose.payload("guild", "bot", "tickets", &["mod".into()]);
+        assert!(payload["topic"].as_str().unwrap().contains("ticket"));
+        assert_eq!(payload["type"], 0);
+        let overwrites = &payload["permission_overwrites"];
+        assert_eq!(
+            overwrites.as_array().unwrap().len(),
+            2,
+            "no automatic staff posting overrides for the public panel"
+        );
+        let member = channel_bot_permissions(
+            READ | SEND | NO_CHAT,
+            "guild",
+            "user",
+            &["mod".into()],
+            overwrites,
+        )
+        .unwrap();
+        assert_eq!(member & READ, READ);
+        assert_eq!(member & NO_CHAT, 0);
+        let bot = channel_bot_permissions(0, "guild", "bot", &[], overwrites).unwrap();
+        assert_eq!(bot & BOT_ALLOW, BOT_ALLOW);
+        assert!(matching_permissions(&payload, &payload));
+        assert!(!matching_permissions(
+            &json!({"permission_overwrites":[]}),
+            &payload
+        ));
+    }
+
     #[test]
     fn starboard_channel_policy_blocks_member_chat_threads_and_allows_bot_and_mod() {
         let payload = channel_payload("guild", "bot", "starboard", &["mod".into()]);
