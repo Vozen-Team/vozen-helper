@@ -2569,7 +2569,7 @@ impl EventHandler for Handler {
                     let buttons = guide
                         .steps
                         .iter()
-                        .map(|step| welcome_guide_button(&guild_text, step))
+                        .filter_map(|step| welcome_guide_button(&guild_text, step, &welcome))
                         .collect::<Vec<_>>();
                     if !buttons.is_empty() {
                         message = message.components(vec![CreateActionRow::Buttons(buttons)]);
@@ -12006,18 +12006,36 @@ fn setting_string(store: &Store, guild_id: &str, key: &str) -> Option<String> {
     store.get_setting(guild_id, key).ok().flatten()
 }
 
-fn welcome_guide_button(guild: &str, step: &str) -> CreateButton {
-    let (label, emoji) = match step {
-        "rules" => ("Read the rules", "📜"),
-        "introductions" => ("Introduce yourself", "👋"),
-        "channels" => ("Explore channels", "🧭"),
-        "help" => ("Get help", "❓"),
-        _ => ("Continue", "➡️"),
+fn welcome_guide_button(
+    guild: &str,
+    step: &str,
+    config: &serde_json::Value,
+) -> Option<CreateButton> {
+    let guild = guild.parse::<u64>().ok().filter(|id| *id > 0)?;
+    if step == "help" {
+        return Some(
+            CreateButton::new(format!("welcome:step:{guild}:help"))
+                .label("Get help")
+                .emoji(ReactionType::Unicode("❓".into()))
+                .style(ButtonStyle::Secondary),
+        );
+    }
+    let (field, label, emoji) = match step {
+        "rules" => ("rulesChannel", "Read the rules", "📜"),
+        "introductions" => ("introductionsChannel", "Introduce yourself", "👋"),
+        "channels" => ("channelsChannel", "Explore channels", "🧭"),
+        _ => return None,
     };
-    CreateButton::new(format!("welcome:step:{guild}:{step}"))
-        .label(label)
-        .emoji(ReactionType::Unicode(emoji.to_string()))
-        .style(ButtonStyle::Secondary)
+    let channel = config[field]
+        .as_str()?
+        .parse::<u64>()
+        .ok()
+        .filter(|id| *id > 0)?;
+    Some(
+        CreateButton::new_link(format!("https://discord.com/channels/{guild}/{channel}"))
+            .label(label)
+            .emoji(ReactionType::Unicode(emoji.to_string())),
+    )
 }
 
 /// Resolve a reusable Studio template without allowing arbitrary JSON to leak
@@ -13392,20 +13410,71 @@ mod tests {
     };
 
     #[test]
-    fn welcome_buttons_add_native_emoji_without_changing_actions() {
-        for (step, label, emoji) in [
-            ("rules", "Read the rules", "📜"),
-            ("introductions", "Introduce yourself", "👋"),
-            ("channels", "Explore channels", "🧭"),
-            ("help", "Get help", "❓"),
-            ("other", "Continue", "➡️"),
+    fn welcome_buttons_link_to_the_configured_guild_channels() {
+        let config = serde_json::json!({"rulesChannel":"456","introductionsChannel":"789","channelsChannel":"321"});
+        for (step, label, emoji, channel) in [
+            ("rules", "Read the rules", "📜", "456"),
+            ("introductions", "Introduce yourself", "👋", "789"),
+            ("channels", "Explore channels", "🧭", "321"),
         ] {
-            let button = serde_json::to_value(super::welcome_guide_button("123", step)).unwrap();
-            assert_eq!(button["custom_id"], format!("welcome:step:123:{step}"));
+            let button =
+                serde_json::to_value(super::welcome_guide_button("123", step, &config).unwrap())
+                    .unwrap();
+            assert_eq!(
+                button["url"],
+                format!("https://discord.com/channels/123/{channel}")
+            );
+            assert!(button.get("custom_id").is_none());
             assert_eq!(button["label"], label);
-            assert_eq!(button["style"], 2);
+            assert_eq!(button["style"], 5);
             assert_eq!(button["emoji"]["name"], emoji);
         }
+        let other_guild =
+            serde_json::to_value(super::welcome_guide_button("999", "rules", &config).unwrap())
+                .unwrap();
+        assert_eq!(other_guild["url"], "https://discord.com/channels/999/456");
+    }
+
+    #[test]
+    fn welcome_buttons_omit_unset_or_invalid_destinations() {
+        for (step, field) in [
+            ("rules", "rulesChannel"),
+            ("introductions", "introductionsChannel"),
+            ("channels", "channelsChannel"),
+        ] {
+            assert!(super::welcome_guide_button("123", step, &serde_json::json!({})).is_none());
+            for value in [
+                serde_json::json!(null),
+                serde_json::json!(true),
+                serde_json::json!(456),
+                serde_json::json!(""),
+                serde_json::json!("0"),
+                serde_json::json!("-1"),
+                serde_json::json!("invalid"),
+                serde_json::json!("12/34"),
+                serde_json::json!("https://example.com"),
+                serde_json::json!("18446744073709551616"),
+            ] {
+                let mut config = serde_json::json!({});
+                config[field] = value;
+                assert!(super::welcome_guide_button("123", step, &config).is_none());
+            }
+        }
+        let partial = serde_json::json!({"rulesChannel":"456"});
+        let buttons: Vec<_> = ["rules", "introductions", "channels"]
+            .into_iter()
+            .filter_map(|step| super::welcome_guide_button("123", step, &partial))
+            .collect();
+        assert_eq!(buttons.len(), 1);
+        for guild in ["", "0", "invalid", "12/34"] {
+            assert!(super::welcome_guide_button(guild, "rules", &partial).is_none());
+        }
+        assert!(super::welcome_guide_button("123", "unknown", &partial).is_none());
+        let help =
+            serde_json::to_value(super::welcome_guide_button("123", "help", &partial).unwrap())
+                .unwrap();
+        assert_eq!(help["custom_id"], "welcome:step:123:help");
+        assert_eq!(help["style"], 2);
     }
 
     #[test]

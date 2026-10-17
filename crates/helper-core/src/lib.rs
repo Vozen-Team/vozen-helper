@@ -5519,11 +5519,11 @@ impl FeatureAdapter for WelcomeAdapter {
                         {"key":"message","label":"Public message","kind":"textarea","maxLength":2000,"help":"Variables: {member} and {server}."},
                         {"key":"delaySeconds","label":"Delay before sending (seconds)","kind":"number","min":0,"max":300,"advanced":true},
                         {"key":"sendDm","label":"Send a direct message","kind":"toggle"},
-                        {"key":"guideEnabled","label":"Add orientation buttons","kind":"toggle","help":"Add rules, introductions, channels and help buttons to the same welcome message."},
+                        {"key":"guideEnabled","label":"Add orientation buttons","kind":"toggle","help":"Link directly to the configured rules, introductions and channels destinations. Buttons without a destination are hidden. The optional help step shows command guidance."},
                         {"key":"steps","label":"Guided steps","kind":"tags","max":4,"help":"Choose from rules, introductions, channels and help.","advanced":true},
-                        {"key":"rulesChannel","label":"Rules channel (optional)","kind":"channel","advanced":true},
-                        {"key":"introductionsChannel","label":"Introductions channel (optional)","kind":"channel","advanced":true},
-                        {"key":"channelsChannel","label":"Channels guide (optional)","kind":"channel","advanced":true},
+                        {"key":"rulesChannel","label":"Rules channel (optional)","kind":"channel","help":"Open this channel directly. Leave empty to hide Read the rules.","advanced":true},
+                        {"key":"introductionsChannel","label":"Introductions channel (optional)","kind":"channel","help":"Open this channel directly. Leave empty to hide Introduce yourself.","advanced":true},
+                        {"key":"channelsChannel","label":"Channels guide (optional)","kind":"channel","help":"Open this channel directly. Leave empty to hide Explore channels.","advanced":true},
                         {"key":"dmMessage","label":"Direct message","kind":"textarea","maxLength":2000,"advanced":true},
                         {"key":"autoRole","label":"Automatic role","kind":"role","advanced":true},
                         {"key":"farewellChannel","label":"Farewell channel","kind":"channel","advanced":true},
@@ -5709,7 +5709,7 @@ impl FeatureAdapter for WelcomeAdapter {
             "Send the welcome message `{rendered}` after {delay} second(s)."
         )];
         if config["guideEnabled"].as_bool() == Some(true) {
-            effects.push("Attach orientation buttons to that same message; do not send a second public welcome.".into());
+            effects.push("Attach orientation buttons for the configured destinations to that same message; hide destination buttons without a channel. Do not send a second public welcome.".into());
         }
         if config
             .get("sendDm")
