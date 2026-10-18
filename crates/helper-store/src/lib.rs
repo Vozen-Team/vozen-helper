@@ -923,26 +923,35 @@ impl Store {
 
     pub fn migrate(&self) -> Result<()> {
         let conn = self.conn.lock().expect("store mutex poisoned");
-        // Older Node Helper databases may already have `birthdays` without
-        // the Rust-only annual announcement marker. Add it before creating
-        // the index below so the migration remains additive and idempotent.
+        // Node-era databases can lack timestamps and/or the annual marker.
+        // Add columns without rebuilding the table or resetting announcements.
+        // A zero legacy timestamp means unknown, not the member's birth date.
         let birthdays_table_exists: i64 = conn.query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='birthdays'",
             [],
             |row| row.get(0),
         )?;
         if birthdays_table_exists > 0 {
-            let birthdays_last_announced_exists: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM pragma_table_info('birthdays') WHERE name='last_announced_year'",
-                [],
-                |row| row.get(0),
-            )?;
-            if birthdays_last_announced_exists == 0 {
-                conn.execute(
-                    "ALTER TABLE birthdays ADD COLUMN last_announced_year INTEGER",
-                    [],
+            let transaction = conn.unchecked_transaction()?;
+            for (column, definition) in [
+                ("last_announced_year", "INTEGER"),
+                ("created_at", "INTEGER NOT NULL DEFAULT 0"),
+                ("updated_at", "INTEGER NOT NULL DEFAULT 0"),
+            ] {
+                let exists: i64 = transaction.query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('birthdays') WHERE name=?1",
+                    [column],
+                    |row| row.get(0),
                 )?;
+                if exists == 0 {
+                    // Both SQL identifiers and types are the fixed list above.
+                    transaction.execute(
+                        &format!("ALTER TABLE birthdays ADD COLUMN {column} {definition}"),
+                        [],
+                    )?;
+                }
             }
+            transaction.commit()?;
         }
         conn.execute_batch("CREATE TABLE IF NOT EXISTS helper_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL); CREATE TABLE IF NOT EXISTS helper_sessions (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, guild_id TEXT NOT NULL, issued_at TEXT NOT NULL, expires_at TEXT NOT NULL, last_seen_at TEXT NOT NULL, revoked_at TEXT); CREATE TABLE IF NOT EXISTS helper_session_guilds (session_id TEXT NOT NULL, guild_id TEXT NOT NULL, name TEXT NOT NULL, permissions TEXT, PRIMARY KEY(session_id,guild_id)); CREATE TABLE IF NOT EXISTS helper_oauth_states (state_hash TEXT PRIMARY KEY, expires_at INTEGER NOT NULL, used_at INTEGER); CREATE TABLE IF NOT EXISTS helper_entitlements (subject_id TEXT PRIMARY KEY, payload TEXT NOT NULL, fetched_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS helper_usage (guild_id TEXT NOT NULL, user_id TEXT NOT NULL, quota_key TEXT NOT NULL, period TEXT NOT NULL, used INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(guild_id,user_id,quota_key,period)); CREATE TABLE IF NOT EXISTS cases (id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id TEXT NOT NULL, type TEXT NOT NULL, target_id TEXT NOT NULL, moderator_id TEXT NOT NULL, reason TEXT NOT NULL DEFAULT '', duration_ms INTEGER, created_at INTEGER NOT NULL); CREATE INDEX IF NOT EXISTS idx_cases_guild_time ON cases(guild_id, created_at DESC); CREATE TABLE IF NOT EXISTS settings (guild_id TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY(guild_id,key)); CREATE TABLE IF NOT EXISTS activity_log (id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id TEXT NOT NULL, type TEXT NOT NULL, user_id TEXT NOT NULL, user_tag TEXT, actor_id TEXT, detail TEXT NOT NULL DEFAULT '{}', created_at INTEGER NOT NULL); CREATE INDEX IF NOT EXISTS idx_activity_guild_time ON activity_log(guild_id, created_at DESC); CREATE TABLE IF NOT EXISTS scheduled_actions (id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id TEXT NOT NULL, type TEXT NOT NULL, target_id TEXT NOT NULL, execute_at INTEGER NOT NULL, payload TEXT NOT NULL DEFAULT '', case_id INTEGER); CREATE INDEX IF NOT EXISTS idx_scheduled_due ON scheduled_actions(execute_at); CREATE TABLE IF NOT EXISTS infractions (id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id TEXT NOT NULL, target_id TEXT NOT NULL, weight INTEGER NOT NULL DEFAULT 1, source TEXT NOT NULL DEFAULT 'manual', created_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS afk (guild_id TEXT NOT NULL, user_id TEXT NOT NULL, reason TEXT NOT NULL DEFAULT '', since INTEGER NOT NULL, PRIMARY KEY(guild_id,user_id)); CREATE TABLE IF NOT EXISTS tags (guild_id TEXT NOT NULL, name TEXT NOT NULL, content TEXT NOT NULL, author_id TEXT NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY(guild_id,name)); CREATE TABLE IF NOT EXISTS levels (guild_id TEXT NOT NULL, user_id TEXT NOT NULL, xp INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(guild_id,user_id)); CREATE TABLE IF NOT EXISTS achievements (guild_id TEXT NOT NULL, user_id TEXT NOT NULL, achievement_key TEXT NOT NULL, threshold INTEGER NOT NULL, unlocked_at INTEGER NOT NULL, PRIMARY KEY(guild_id,user_id,achievement_key)); CREATE INDEX IF NOT EXISTS idx_achievements_guild_user ON achievements(guild_id,user_id,unlocked_at); CREATE TABLE IF NOT EXISTS stats (guild_id TEXT NOT NULL, date TEXT NOT NULL, messages INTEGER NOT NULL DEFAULT 0, joins INTEGER NOT NULL DEFAULT 0, leaves INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(guild_id,date)); CREATE TABLE IF NOT EXISTS invite_snapshots (guild_id TEXT NOT NULL, code TEXT NOT NULL, uses INTEGER NOT NULL DEFAULT 0, inviter_id TEXT, updated_at INTEGER NOT NULL, PRIMARY KEY(guild_id,code)); CREATE TABLE IF NOT EXISTS invite_attributions (guild_id TEXT NOT NULL, user_id TEXT NOT NULL, code TEXT NOT NULL, inviter_id TEXT, joined_at INTEGER NOT NULL, PRIMARY KEY(guild_id,user_id)); CREATE INDEX IF NOT EXISTS idx_invite_attributions_guild ON invite_attributions(guild_id,joined_at DESC);")?;
         // XP awards are recorded separately from the materialized balance so
@@ -8586,6 +8595,144 @@ mod tests {
         assert_eq!(store.due_birthdays(8, 3, 2027, 10).unwrap().len(), 1);
         assert!(store.remove_birthday("g", "u").unwrap());
         assert!(store.due_birthdays(8, 3, 2027, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn migration_preserves_legacy_birthdays_and_adds_only_missing_timestamps() {
+        for (label, extra_columns, expected_created, expected_updated) in [
+            ("node", "", 0, 0),
+            (
+                "created",
+                ", created_at INTEGER NOT NULL DEFAULT 123",
+                123,
+                0,
+            ),
+            (
+                "updated",
+                ", updated_at INTEGER NOT NULL DEFAULT 456",
+                0,
+                456,
+            ),
+            (
+                "current",
+                ", created_at INTEGER NOT NULL DEFAULT 123, updated_at INTEGER NOT NULL DEFAULT 456",
+                123,
+                456,
+            ),
+        ] {
+            let path = std::env::temp_dir().join(format!(
+                "vozen-helper-birthday-timestamps-{}-{label}.db",
+                std::process::id()
+            ));
+            assert!(!path.exists(), "isolated fixture must not overwrite a file");
+            let legacy = Connection::open(&path).unwrap();
+            legacy.execute_batch(&format!(
+                "CREATE TABLE birthdays (guild_id TEXT NOT NULL, user_id TEXT NOT NULL, day INTEGER NOT NULL, month INTEGER NOT NULL, last_announced_year INTEGER{extra_columns}, PRIMARY KEY(guild_id,user_id));
+                 INSERT INTO birthdays(guild_id,user_id,day,month,last_announced_year) VALUES('guild-a','announced',18,10,2026),('guild-a','pending',29,2,NULL),('guild-b','other',18,10,2025);"
+            )).unwrap();
+            drop(legacy);
+            let store = Store::open(&path).unwrap();
+            for _ in 0..2 {
+                store.migrate().unwrap();
+                let conn = store.conn.lock().unwrap();
+                let mut statement = conn.prepare("SELECT guild_id,user_id,day,month,last_announced_year,created_at,updated_at FROM birthdays ORDER BY guild_id,user_id").unwrap();
+                let rows = statement
+                    .query_map([], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, u32>(2)?,
+                            row.get::<_, u32>(3)?,
+                            row.get::<_, Option<i32>>(4)?,
+                            row.get::<_, i64>(5)?,
+                            row.get::<_, i64>(6)?,
+                        ))
+                    })
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap();
+                assert_eq!(
+                    rows,
+                    vec![
+                        (
+                            "guild-a".into(),
+                            "announced".into(),
+                            18,
+                            10,
+                            Some(2026),
+                            expected_created,
+                            expected_updated
+                        ),
+                        (
+                            "guild-a".into(),
+                            "pending".into(),
+                            29,
+                            2,
+                            None,
+                            expected_created,
+                            expected_updated
+                        ),
+                        (
+                            "guild-b".into(),
+                            "other".into(),
+                            18,
+                            10,
+                            Some(2025),
+                            expected_created,
+                            expected_updated
+                        ),
+                    ],
+                    "{label}: preserve members, dates, timestamps and announcement state"
+                );
+            }
+            assert!(
+                store
+                    .due_birthdays_for_guild("guild-a", 10, 18, 2026, 10)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                store
+                    .due_birthdays_for_guild("guild-b", 10, 18, 2026, 10)
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert_eq!(
+                store
+                    .due_birthdays_for_guild("guild-a", 2, 29, 2026, 10)
+                    .unwrap()
+                    .len(),
+                1
+            );
+            store
+                .set_birthday("new-guild", "new-member", 10, 18)
+                .unwrap();
+            assert_eq!(
+                store
+                    .due_birthdays_for_guild("new-guild", 10, 18, 2026, 10)
+                    .unwrap()
+                    .len(),
+                1
+            );
+            drop(store);
+            let reopened = Store::open(&path).unwrap();
+            assert!(
+                reopened
+                    .due_birthdays_for_guild("guild-a", 10, 18, 2026, 10)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                reopened
+                    .due_birthdays_for_guild("new-guild", 10, 18, 2026, 10)
+                    .unwrap()
+                    .len(),
+                1
+            );
+            drop(reopened);
+            std::fs::remove_file(path).unwrap();
+        }
     }
 
     #[test]
