@@ -12,5 +12,6 @@ IOSchedulingClass=idle
 ProtectSystem=strict
 ProtectHome=read-only
 ReadWritePaths=/home/vozen/vozen-helper-rust/releases /var/lib/vozen-helper-release-retention
+ReadWritePaths=/home/ubuntu
 PrivateTmp=yes
 NoNewPrivileges=yes
