@@ -123,6 +123,10 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/me", get(me))
         .route("/api/starboard/channel", post(starboard_channel::create))
         .route(
+            "/api/birthdays/channel",
+            post(starboard_channel::create_birthday),
+        )
+        .route(
             "/api/tickets/category",
             post(starboard_channel::create_ticket_category),
         )
@@ -12012,8 +12016,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ticket_channel_creation_checks_session_origin_and_input_before_discord() {
-        for endpoint in ["/api/tickets/channel", "/api/tickets/category"] {
+    async fn channel_creation_checks_session_origin_and_input_before_discord() {
+        for endpoint in [
+            "/api/tickets/channel",
+            "/api/tickets/category",
+            "/api/birthdays/channel",
+        ] {
             let store = Store::open(":memory:").unwrap();
             let session = claims("guild-a");
             let token = sign_session(&session, "test-session-secret-with-at-least-32-bytes");
@@ -12087,6 +12095,12 @@ mod tests {
                     .unwrap()
                     .is_none()
             );
+            for key in [
+                "community.birthdays.created_channel",
+                "community.birthdays.channel_id",
+            ] {
+                assert!(store.get_setting("guild-a", key).unwrap().is_none());
+            }
             assert!(
                 store
                     .get_setting("guild-a", "support.tickets.created_category")

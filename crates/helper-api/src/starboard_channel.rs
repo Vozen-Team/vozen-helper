@@ -8,6 +8,7 @@ enum ChannelPurpose {
     Starboard,
     TicketPanel,
     TicketCategory,
+    Birthday,
 }
 
 impl ChannelPurpose {
@@ -16,6 +17,7 @@ impl ChannelPurpose {
             Self::Starboard => "community.starboard.created_channel",
             Self::TicketPanel => "support.tickets.created_panel_channel",
             Self::TicketCategory => "support.tickets.created_category",
+            Self::Birthday => "community.birthdays.created_channel",
         }
     }
     fn channel_type(self) -> u64 {
@@ -45,12 +47,17 @@ impl ChannelPurpose {
             name,
             match self {
                 Self::Starboard => staff,
-                Self::TicketPanel | Self::TicketCategory => &[],
+                Self::TicketPanel | Self::TicketCategory | Self::Birthday => &[],
             },
         );
         if matches!(self, Self::TicketPanel) {
             payload["topic"] = json!(
                 "Vozen Helper • Open a private support ticket using the panel below. Read-only for members; administrators retain access."
+            );
+        }
+        if matches!(self, Self::Birthday) {
+            payload["topic"] = json!(
+                "Vozen Helper • Birthday announcements. Read-only for members; administrators retain access."
             );
         }
         payload
@@ -78,6 +85,28 @@ pub(super) struct CreateRequest {
 #[serde(deny_unknown_fields)]
 pub(super) struct TicketCreateRequest {
     name: String,
+}
+
+pub(super) async fn create_birthday(
+    State(state): State<Arc<ApiState>>,
+    headers: HeaderMap,
+    Json(request): Json<TicketCreateRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
+    create_for(
+        state,
+        headers,
+        CreateRequest {
+            name: request.name,
+            moderator_role_ids: vec![],
+        },
+        ChannelPurpose::Birthday,
+    )
+    .await
+    .map_err(|(status, Json(mut error))| {
+        error.code = error.code.replace("starboard_", "birthday_");
+        error.message = error.message.replace("starboard_", "birthday_");
+        (status, Json(error))
+    })
 }
 
 pub(super) async fn create_ticket_panel(
@@ -350,6 +379,7 @@ async fn create_for(
                 ChannelPurpose::Starboard => "Vozen%20Starboard%20read-only%20channel",
                 ChannelPurpose::TicketPanel => "Vozen%20Tickets%20public%20panel%20channel",
                 ChannelPurpose::TicketCategory => "Vozen%20Tickets%20private%20category",
+                ChannelPurpose::Birthday => "Vozen%20Birthdays%20announcement%20channel",
             },
         )
         .json(&payload)
@@ -417,6 +447,7 @@ async fn create_for(
             ChannelPurpose::Starboard => "starboard_channel_created",
             ChannelPurpose::TicketPanel => "ticket_panel_channel_created",
             ChannelPurpose::TicketCategory => "ticket_category_created",
+            ChannelPurpose::Birthday => "birthday_channel_created",
         },
         &claims.user_id,
         Some(id),
@@ -431,6 +462,51 @@ async fn create_for(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn birthday_channel_is_read_only_and_has_an_independent_creation_record() {
+        let purpose = ChannelPurpose::Birthday;
+        assert_eq!(purpose.record(), "community.birthdays.created_channel");
+        for other in [
+            ChannelPurpose::Starboard,
+            ChannelPurpose::TicketPanel,
+            ChannelPurpose::TicketCategory,
+        ] {
+            assert_ne!(purpose.record(), other.record());
+        }
+        let payload = purpose.payload("guild", "bot", "birthdays", &["mod".into()]);
+        assert_eq!(payload["type"], 0);
+        assert!(payload["topic"].as_str().unwrap().contains("Birthday"));
+        let overwrites = &payload["permission_overwrites"];
+        assert_eq!(overwrites.as_array().unwrap().len(), 2);
+        let member =
+            channel_bot_permissions(READ | NO_CHAT, "guild", "user", &["mod".into()], overwrites)
+                .unwrap();
+        assert_eq!(member & READ, READ);
+        assert_eq!(member & NO_CHAT, 0);
+        let bot = channel_bot_permissions(0, "guild", "bot", &[], overwrites).unwrap();
+        assert_eq!(bot & BOT_ALLOW, BOT_ALLOW);
+        let admin = channel_bot_permissions(8, "guild", "admin", &[], overwrites).unwrap();
+        assert_eq!(
+            admin & 8,
+            8,
+            "channel overwrites do not remove Administrator"
+        );
+        assert!(matching_permissions(&payload, &payload));
+        assert!(!matching_permissions(
+            &json!({"permission_overwrites":[]}),
+            &payload
+        ));
+        assert!(name_exists(
+            &[json!({"name":"birthdays","type":0})],
+            "birthdays",
+            purpose
+        ));
+        for overwrite in overwrites.as_array().unwrap() {
+            let allow = overwrite["allow"].as_str().unwrap().parse::<u64>().unwrap();
+            let deny = overwrite["deny"].as_str().unwrap().parse::<u64>().unwrap();
+            assert_eq!((allow | deny) & !purpose.required_permissions(), 0);
+        }
+    }
     #[test]
     fn category_can_share_the_panel_name_but_does_not_adopt_an_existing_category() {
         let channels = vec![json!({"name":"tickets","type":0})];
