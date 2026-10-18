@@ -1,0 +1,15 @@
+name: Helper retention checks
+on:
+  push:
+    paths: ['deploy/retention/**', '.github/workflows/helper-retention-checks.yml']
+  pull_request:
+    paths: ['deploy/retention/**', '.github/workflows/helper-retention-checks.yml']
+jobs:
+  retention:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -B -m unittest discover -s deploy/retention -p 'test_*.py' -v
