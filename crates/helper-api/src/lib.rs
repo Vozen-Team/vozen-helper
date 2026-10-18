@@ -2,6 +2,7 @@
 
 #![recursion_limit = "256"]
 
+mod discord_context;
 mod discord_read;
 mod starboard_channel;
 mod ticket_panel;
@@ -5020,7 +5021,7 @@ async fn guilds(
 
 const DISCORD_API_BASE: &str = "https://discord.com/api/v10";
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct DiscordGuildSnapshot {
     channels: Vec<serde_json::Value>,
     roles: Vec<serde_json::Value>,
@@ -5077,6 +5078,30 @@ async fn discord_send_channel_message(
 }
 
 async fn fetch_discord_guild_snapshot(guild_id: &str, discord_token: &str) -> DiscordGuildSnapshot {
+    static INFLIGHT: std::sync::OnceLock<discord_context::Inflight<DiscordGuildSnapshot>> =
+        std::sync::OnceLock::new();
+    // Scope sharing to both the guild and credential, without storing tokens in
+    // the index. Only overlapping reads share the same fresh Discord request.
+    let key = format!(
+        "{guild_id}:{}",
+        hex::encode(Sha256::digest(discord_token.as_bytes()))
+    );
+    let guild_id = guild_id.to_owned();
+    let discord_token = discord_token.to_owned();
+    INFLIGHT
+        .get_or_init(discord_context::Inflight::new)
+        .read(key, async move {
+            fetch_discord_guild_snapshot_uncached(&guild_id, &discord_token).await
+        })
+        .await
+        .as_ref()
+        .clone()
+}
+
+async fn fetch_discord_guild_snapshot_uncached(
+    guild_id: &str,
+    discord_token: &str,
+) -> DiscordGuildSnapshot {
     if discord_token.len() < 20 {
         return DiscordGuildSnapshot {
             bot_reason: Some("bot_token_not_configured".into()),
