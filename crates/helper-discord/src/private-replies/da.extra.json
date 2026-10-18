@@ -1,0 +1,16 @@
+{
+"r_3743e72c3e63":"`{0}` — {1} tilskrevne tilmeldinger",
+"r_5fbb8903b06d":"**{0}** har ingen tilmeldinger endnu.",
+"r_a2dd6f74f466":"#{0} — {1} — slutter <t:{2}:R>",
+"r_d2c06ffff370":"**{0}** — {1} tilmeldinger\n{2}",
+"r_de206fb45243":"`{0}` — brugt {1} gange",
+"r_e838c2444527":"`{0}` — brugt {1} gange — {2}",
+"r_05699a19fe58":"visningsnavnet matcher `{0}`",
+"r_23625061c74d":"; konfigurér en rolle for at begrænse kanaladgang",
+"r_258aec37f1e6":"<@{0}> sat i karantæne som moderationssag #{1}. Roller er gemt til gendannelse.",
+"r_3366ef49dd49":"; bekræftelsesrolle opdateret",
+"r_c76525238489":" uden navne på dem, der inviterede",
+"r_eb4a6ce8e56d":" med navne på dem, der inviterede",
+"r_f22ae96535a7":" (kun animerede)",
+"r_fe6ebea0bf5e":" · intern note gemt"
+}

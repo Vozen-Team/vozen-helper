@@ -1,0 +1,20 @@
+{
+  "complete": "已完成",
+  "pending": "待处理",
+  "none": "无",
+  "enabled": "已启用",
+  "disabled": "已禁用",
+  "reacts": "作出反应",
+  "replies": "回复",
+  "disabled immediately": "已立即禁用",
+  "registered": "已报名",
+  "checked_in": "已签到",
+  "credits": "积分",
+  "exports": "数据导出",
+  "erasure": "数据删除",
+  "invalid_reaction": "无效的反应",
+  "unsupported_action": "不支持的操作",
+  "First steps": "入门步骤",
+  "Regular": "常客",
+  "Community pillar": "社区支柱"
+}

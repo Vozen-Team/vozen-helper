@@ -1,0 +1,16 @@
+{
+  "r_3743e72c3e63": "`{0}` — {1} tähän kohdistettua liittymistä",
+  "r_5fbb8903b06d": "**{0}** ei vielä sisällä ilmoittautumisia.",
+  "r_a2dd6f74f466": "#{0} — {1} — päättyy <t:{2}:R>",
+  "r_d2c06ffff370": "**{0}** — {1} ilmoittautumista\n{2}",
+  "r_de206fb45243": "`{0}` — {1} käyttökertaa",
+  "r_e838c2444527": "`{0}` — {1} käyttökertaa — {2}",
+  "r_05699a19fe58": "näyttönimi vastaa arvoa `{0}`",
+  "r_23625061c74d": "; määritä rooli kanavien rajoittamista varten",
+  "r_258aec37f1e6": "<@{0}> asetettiin karanteeniin valvontatapauksena #{1}. Roolit tallennettiin palautusta varten.",
+  "r_3366ef49dd49": "; vahvistusrooli päivitettiin",
+  "r_c76525238489": " ilman kutsujien nimiä",
+  "r_eb4a6ce8e56d": " kutsujien nimillä",
+  "r_f22ae96535a7": " (vain animoidut)",
+  "r_fe6ebea0bf5e": " · sisäinen huomautus tallennettiin"
+}

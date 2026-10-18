@@ -1,0 +1,20 @@
+{
+  "complete": "complete",
+  "pending": "pending",
+  "none": "none",
+  "enabled": "enabled",
+  "disabled": "disabled",
+  "reacts": "reacts",
+  "replies": "replies",
+  "disabled immediately": "disabled immediately",
+  "registered": "registered",
+  "checked_in": "checked in",
+  "credits": "credits",
+  "exports": "exports",
+  "erasure": "erasure",
+  "invalid_reaction": "Invalid reaction",
+  "unsupported_action": "Unsupported action",
+  "First steps": "First steps",
+  "Regular": "Regular",
+  "Community pillar": "Community pillar"
+}

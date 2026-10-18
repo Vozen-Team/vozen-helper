@@ -1,0 +1,20 @@
+{
+  "complete": "kész",
+  "pending": "függőben",
+  "none": "nincs",
+  "enabled": "engedélyezve",
+  "disabled": "letiltva",
+  "reacts": "reagál",
+  "replies": "válaszol",
+  "disabled immediately": "azonnal letiltva",
+  "registered": "regisztrálva",
+  "checked_in": "jelenlét rögzítve",
+  "credits": "kredit",
+  "exports": "exportálások",
+  "erasure": "törlés",
+  "invalid_reaction": "Érvénytelen reakció",
+  "unsupported_action": "Nem támogatott művelet",
+  "First steps": "Első lépések",
+  "Regular": "Törzstag",
+  "Community pillar": "A közösség oszlopa"
+}

@@ -1,0 +1,20 @@
+{
+  "complete": "завършена",
+  "pending": "чакаща",
+  "none": "няма",
+  "enabled": "включен",
+  "disabled": "изключен",
+  "reacts": "реагира",
+  "replies": "отговаря",
+  "disabled immediately": "изключен незабавно",
+  "registered": "регистриран",
+  "checked_in": "с отчетено присъствие",
+  "credits": "кредити",
+  "exports": "експортирания",
+  "erasure": "изтриване",
+  "invalid_reaction": "Невалидна реакция",
+  "unsupported_action": "Неподдържано действие",
+  "First steps": "Първи стъпки",
+  "Regular": "Редовен участник",
+  "Community pillar": "Опора на общността"
+}

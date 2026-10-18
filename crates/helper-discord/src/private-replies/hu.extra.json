@@ -1,0 +1,16 @@
+{
+  "r_3743e72c3e63": "`{0}` — {1} hozzárendelt csatlakozás",
+  "r_5fbb8903b06d": "**{0}** eseményre még nincs regisztráció.",
+  "r_a2dd6f74f466": "#{0} — {1} — vége: <t:{2}:R>",
+  "r_d2c06ffff370": "**{0}** — {1} regisztráció\n{2}",
+  "r_de206fb45243": "`{0}` — {1} használat",
+  "r_e838c2444527": "`{0}` — {1} használat — {2}",
+  "r_05699a19fe58": "a megjelenített név egyezik ezzel: `{0}`",
+  "r_23625061c74d": "; állíts be szerepkört a csatornák korlátozásához",
+  "r_258aec37f1e6": "<@{0}> karanténba helyezve, ügyszám: #{1}. A szerepköröket elmentettük a visszaállításhoz.",
+  "r_3366ef49dd49": "; hitelesítési szerepkör frissítve",
+  "r_c76525238489": " a meghívók neve nélkül",
+  "r_eb4a6ce8e56d": " a meghívók nevével",
+  "r_f22ae96535a7": " (csak animált)",
+  "r_fe6ebea0bf5e": " · belső megjegyzés mentve"
+}

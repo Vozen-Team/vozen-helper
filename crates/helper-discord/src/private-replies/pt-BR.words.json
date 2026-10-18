@@ -1,0 +1,20 @@
+{
+  "complete": "concluído",
+  "pending": "pendente",
+  "none": "nenhum",
+  "enabled": "ativado",
+  "disabled": "desativado",
+  "reacts": "reage",
+  "replies": "responde",
+  "disabled immediately": "desativado imediatamente",
+  "registered": "inscrito",
+  "checked_in": "presença confirmada",
+  "credits": "créditos",
+  "exports": "exportações",
+  "erasure": "exclusão",
+  "invalid_reaction": "Reação inválida",
+  "unsupported_action": "Ação não compatível",
+  "First steps": "Primeiros passos",
+  "Regular": "Membro frequente",
+  "Community pillar": "Pilar da comunidade"
+}

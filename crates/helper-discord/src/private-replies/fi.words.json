@@ -1,0 +1,20 @@
+{
+  "complete": "valmis",
+  "pending": "odottaa",
+  "none": "ei mitään",
+  "enabled": "käytössä",
+  "disabled": "pois käytöstä",
+  "reacts": "reagoi",
+  "replies": "vastaa",
+  "disabled immediately": "poistettu heti käytöstä",
+  "registered": "ilmoittautunut",
+  "checked_in": "läsnäolo kirjattu",
+  "credits": "krediitit",
+  "exports": "viennit",
+  "erasure": "poistaminen",
+  "invalid_reaction": "Virheellinen reaktio",
+  "unsupported_action": "Toimintoa ei tueta",
+  "First steps": "Ensiaskeleet",
+  "Regular": "Vakiokävijä",
+  "Community pillar": "Yhteisön tukipilari"
+}

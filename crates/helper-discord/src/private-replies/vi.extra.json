@@ -1,0 +1,16 @@
+{
+  "r_3743e72c3e63": "`{0}` — {1} lượt gia nhập được ghi nhận",
+  "r_5fbb8903b06d": "**{0}** chưa có người đăng ký.",
+  "r_a2dd6f74f466": "#{0} — {1} — kết thúc <t:{2}:R>",
+  "r_d2c06ffff370": "**{0}** — {1} lượt đăng ký\n{2}",
+  "r_de206fb45243": "`{0}` — {1} lượt sử dụng",
+  "r_e838c2444527": "`{0}` — {1} lượt sử dụng — {2}",
+  "r_05699a19fe58": "tên hiển thị khớp với `{0}`",
+  "r_23625061c74d": "; cấu hình vai trò để hạn chế quyền truy cập kênh",
+  "r_258aec37f1e6": "<@{0}> đã bị cách ly theo vụ việc #{1}. Các vai trò được lưu để khôi phục.",
+  "r_3366ef49dd49": "; đã cập nhật vai trò xác minh",
+  "r_c76525238489": " không có tên người mời",
+  "r_eb4a6ce8e56d": " có tên người mời",
+  "r_f22ae96535a7": " (chỉ biểu tượng động)",
+  "r_fe6ebea0bf5e": " · đã lưu ghi chú nội bộ"
+}

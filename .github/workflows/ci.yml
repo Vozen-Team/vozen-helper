@@ -29,6 +29,8 @@ jobs:
             panel/package-lock.json
       - name: Install npm dependencies
         run: npm ci --no-audit --prefer-offline
+      - name: Validate private reply catalogues
+        run: node tools/private-reply-sources.mjs --check
       - name: Audit npm dependencies
         run: node tools/npm-audit-ci.mjs
       - run: npm run lint

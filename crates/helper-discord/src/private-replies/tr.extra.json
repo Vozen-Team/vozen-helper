@@ -1,0 +1,16 @@
+{
+  "r_3743e72c3e63": "`{0}` — ilişkilendirilen {1} katılım",
+  "r_5fbb8903b06d": "**{0}** için henüz kayıt yok.",
+  "r_a2dd6f74f466": "#{0} — {1} — bitiş: <t:{2}:R>",
+  "r_d2c06ffff370": "**{0}** — {1} kayıt\n{2}",
+  "r_de206fb45243": "`{0}` — {1} kullanım",
+  "r_e838c2444527": "`{0}` — {1} kullanım — {2}",
+  "r_05699a19fe58": "görünen ad `{0}` ile eşleşiyor",
+  "r_23625061c74d": "; kanalları kısıtlamak için bir rol yapılandır",
+  "r_258aec37f1e6": "<@{0}>, #{1} numaralı işlem kaydıyla karantinaya alındı. Roller geri yüklenmek üzere kaydedildi.",
+  "r_3366ef49dd49": "; doğrulama rolü güncellendi",
+  "r_c76525238489": " davet edenlerin adları olmadan",
+  "r_eb4a6ce8e56d": " davet edenlerin adlarıyla",
+  "r_f22ae96535a7": " (yalnızca animasyonlu)",
+  "r_fe6ebea0bf5e": " · dahili not kaydedildi"
+}

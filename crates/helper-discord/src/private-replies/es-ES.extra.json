@@ -1,0 +1,16 @@
+{
+  "r_3743e72c3e63": "`{0}` — {1} entrada(s) atribuida(s)",
+  "r_5fbb8903b06d": "**{0}** todavía no tiene inscripciones.",
+  "r_a2dd6f74f466": "#{0} — {1} — termina <t:{2}:R>",
+  "r_d2c06ffff370": "**{0}** — {1} inscripción(es)\n{2}",
+  "r_de206fb45243": "`{0}` — {1} usos",
+  "r_e838c2444527": "`{0}` — {1} usos — {2}",
+  "r_05699a19fe58": "el nombre visible coincide con `{0}`",
+  "r_23625061c74d": "; configura un rol para restringir los canales",
+  "r_258aec37f1e6": "<@{0}> puesto en cuarentena como caso #{1}. Se han guardado los roles para restaurarlos.",
+  "r_3366ef49dd49": "; rol de verificación actualizado",
+  "r_c76525238489": " sin los nombres de quienes invitan",
+  "r_eb4a6ce8e56d": " con los nombres de quienes invitan",
+  "r_f22ae96535a7": " (solo animados)",
+  "r_fe6ebea0bf5e": " · nota interna guardada"
+}

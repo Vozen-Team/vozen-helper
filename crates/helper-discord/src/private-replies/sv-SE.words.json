@@ -1,0 +1,20 @@
+{
+  "complete": "klart",
+  "pending": "väntar",
+  "none": "inga",
+  "enabled": "aktiverat",
+  "disabled": "inaktiverat",
+  "reacts": "reagerar",
+  "replies": "svarar",
+  "disabled immediately": "inaktiverat omedelbart",
+  "registered": "anmäld",
+  "checked_in": "incheckad",
+  "credits": "krediter",
+  "exports": "exporter",
+  "erasure": "radering",
+  "invalid_reaction": "Ogiltig reaktion",
+  "unsupported_action": "Åtgärden stöds inte",
+  "First steps": "Första stegen",
+  "Regular": "Stammis",
+  "Community pillar": "Gemenskapens stöttepelare"
+}

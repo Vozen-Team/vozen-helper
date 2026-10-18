@@ -1,0 +1,20 @@
+{
+  "complete": "завершено",
+  "pending": "очікує",
+  "none": "немає",
+  "enabled": "увімкнено",
+  "disabled": "вимкнено",
+  "reacts": "реагує",
+  "replies": "відповідає",
+  "disabled immediately": "негайно вимкнено",
+  "registered": "зареєстровано",
+  "checked_in": "присутність відзначено",
+  "credits": "кредити",
+  "exports": "експорти",
+  "erasure": "видалення",
+  "invalid_reaction": "Неприпустима реакція",
+  "unsupported_action": "Непідтримувана дія",
+  "First steps": "Перші кроки",
+  "Regular": "Постійний учасник",
+  "Community pillar": "Опора спільноти"
+}

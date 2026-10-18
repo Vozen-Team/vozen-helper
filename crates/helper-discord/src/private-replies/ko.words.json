@@ -1,0 +1,20 @@
+{
+  "complete": "완료",
+  "pending": "대기 중",
+  "none": "없음",
+  "enabled": "활성화됨",
+  "disabled": "비활성화됨",
+  "reacts": "반응",
+  "replies": "응답",
+  "disabled immediately": "즉시 비활성화됨",
+  "registered": "등록됨",
+  "checked_in": "출석 확인됨",
+  "credits": "크레딧",
+  "exports": "내보내기",
+  "erasure": "삭제",
+  "invalid_reaction": "잘못된 반응",
+  "unsupported_action": "지원하지 않는 작업",
+  "First steps": "첫 단계",
+  "Regular": "단골 회원",
+  "Community pillar": "커뮤니티의 기둥"
+}

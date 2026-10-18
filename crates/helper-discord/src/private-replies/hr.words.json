@@ -1,0 +1,20 @@
+{
+  "complete": "dovršeno",
+  "pending": "na čekanju",
+  "none": "nema",
+  "enabled": "omogućeno",
+  "disabled": "onemogućeno",
+  "reacts": "reagira",
+  "replies": "odgovara",
+  "disabled immediately": "odmah onemogućeno",
+  "registered": "prijavljen",
+  "checked_in": "dolazak potvrđen",
+  "credits": "krediti",
+  "exports": "izvozi",
+  "erasure": "brisanje",
+  "invalid_reaction": "Nevaljana reakcija",
+  "unsupported_action": "Nepodržana radnja",
+  "First steps": "Prvi koraci",
+  "Regular": "Redoviti član",
+  "Community pillar": "Stup zajednice"
+}

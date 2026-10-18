@@ -1,0 +1,16 @@
+{
+"r_3743e72c3e63":"`{0}` — {1} toegeschreven toetredingen",
+"r_5fbb8903b06d":"**{0}** heeft nog geen inschrijvingen.",
+"r_a2dd6f74f466":"#{0} — {1} — eindigt <t:{2}:R>",
+"r_d2c06ffff370":"**{0}** — {1} inschrijvingen\n{2}",
+"r_de206fb45243":"`{0}` — {1} keer gebruikt",
+"r_e838c2444527":"`{0}` — {1} keer gebruikt — {2}",
+"r_05699a19fe58":"weergavenaam komt overeen met `{0}`",
+"r_23625061c74d":"; stel een rol in om kanaaltoegang te beperken",
+"r_258aec37f1e6":"<@{0}> in quarantaine geplaatst als zaak #{1}. Rollen zijn opgeslagen voor herstel.",
+"r_3366ef49dd49":"; verificatierol bijgewerkt",
+"r_c76525238489":" zonder namen van uitnodigers",
+"r_eb4a6ce8e56d":" met namen van uitnodigers",
+"r_f22ae96535a7":" (alleen bewegende)",
+"r_fe6ebea0bf5e":" · interne notitie opgeslagen"
+}

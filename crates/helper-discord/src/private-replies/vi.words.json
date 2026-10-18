@@ -1,0 +1,20 @@
+{
+  "complete": "hoàn tất",
+  "pending": "đang chờ",
+  "none": "không có",
+  "enabled": "đã bật",
+  "disabled": "đã tắt",
+  "reacts": "thả cảm xúc",
+  "replies": "trả lời",
+  "disabled immediately": "bị tắt ngay lập tức",
+  "registered": "đã đăng ký",
+  "checked_in": "đã điểm danh",
+  "credits": "điểm",
+  "exports": "xuất dữ liệu",
+  "erasure": "xóa dữ liệu",
+  "invalid_reaction": "Phản ứng không hợp lệ",
+  "unsupported_action": "Thao tác không được hỗ trợ",
+  "First steps": "Các bước đầu tiên",
+  "Regular": "Thành viên thường xuyên",
+  "Community pillar": "Trụ cột cộng đồng"
+}

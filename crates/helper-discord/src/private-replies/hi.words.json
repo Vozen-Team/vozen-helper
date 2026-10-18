@@ -1,0 +1,20 @@
+{
+  "complete": "पूर्ण",
+  "pending": "लंबित",
+  "none": "कोई नहीं",
+  "enabled": "चालू",
+  "disabled": "बंद",
+  "reacts": "प्रतिक्रिया देता है",
+  "replies": "उत्तर देता है",
+  "disabled immediately": "तुरंत बंद",
+  "registered": "पंजीकृत",
+  "checked_in": "उपस्थिति दर्ज",
+  "credits": "क्रेडिट",
+  "exports": "निर्यात",
+  "erasure": "मिटाना",
+  "invalid_reaction": "अमान्य प्रतिक्रिया",
+  "unsupported_action": "असमर्थित कार्रवाई",
+  "First steps": "पहले कदम",
+  "Regular": "नियमित सदस्य",
+  "Community pillar": "समुदाय का आधार"
+}

@@ -1,0 +1,20 @@
+{
+  "complete": "selesai",
+  "pending": "tertunda",
+  "none": "tidak ada",
+  "enabled": "diaktifkan",
+  "disabled": "dinonaktifkan",
+  "reacts": "memberi reaksi",
+  "replies": "membalas",
+  "disabled immediately": "langsung dinonaktifkan",
+  "registered": "terdaftar",
+  "checked_in": "sudah mencatat kehadiran",
+  "credits": "kredit",
+  "exports": "ekspor",
+  "erasure": "penghapusan",
+  "invalid_reaction": "Reaksi tidak valid",
+  "unsupported_action": "Tindakan tidak didukung",
+  "First steps": "Langkah awal",
+  "Regular": "Anggota tetap",
+  "Community pillar": "Pilar komunitas"
+}

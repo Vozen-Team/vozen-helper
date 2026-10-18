@@ -1,0 +1,16 @@
+{
+  "r_3743e72c3e63": "`{0}` — {1} arrivée(s) attribuée(s)",
+  "r_5fbb8903b06d": "**{0}** n'a pas encore d'inscriptions.",
+  "r_a2dd6f74f466": "#{0} — {1} — se termine <t:{2}:R>",
+  "r_d2c06ffff370": "**{0}** — {1} inscription(s)\n{2}",
+  "r_de206fb45243": "`{0}` — {1} utilisations",
+  "r_e838c2444527": "`{0}` — {1} utilisations — {2}",
+  "r_05699a19fe58": "le nom affiché correspond à `{0}`",
+  "r_23625061c74d": "; configure un rôle pour restreindre les salons",
+  "r_258aec37f1e6": "<@{0}> mis en quarantaine dans le dossier #{1}. Les rôles ont été enregistrés pour être rétablis.",
+  "r_3366ef49dd49": "; rôle de vérification mis à jour",
+  "r_c76525238489": " sans les noms des auteurs d'invitations",
+  "r_eb4a6ce8e56d": " avec les noms des auteurs d'invitations",
+  "r_f22ae96535a7": " (animés uniquement)",
+  "r_fe6ebea0bf5e": " · note interne enregistrée"
+}

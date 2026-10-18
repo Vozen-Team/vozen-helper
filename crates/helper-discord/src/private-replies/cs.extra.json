@@ -1,0 +1,16 @@
+{
+  "r_3743e72c3e63": "`{0}` — {1} přiřazených připojení",
+  "r_5fbb8903b06d": "**{0}** zatím nemá žádné registrace.",
+  "r_a2dd6f74f466": "#{0} — {1} — konec <t:{2}:R>",
+  "r_d2c06ffff370": "**{0}** — {1} registrací\n{2}",
+  "r_de206fb45243": "`{0}` — {1} použití",
+  "r_e838c2444527": "`{0}` — {1} použití — {2}",
+  "r_05699a19fe58": "zobrazované jméno odpovídá `{0}`",
+  "r_23625061c74d": "; nastavte roli pro omezení přístupu ke kanálům",
+  "r_258aec37f1e6": "<@{0}> byl umístěn do karantény jako případ #{1}. Role byly uloženy pro obnovení.",
+  "r_3366ef49dd49": "; ověřovací role upravena",
+  "r_c76525238489": " bez jmen zvoucích",
+  "r_eb4a6ce8e56d": " se jmény zvoucích",
+  "r_f22ae96535a7": " (pouze animované)",
+  "r_fe6ebea0bf5e": " · interní poznámka uložena"
+}

@@ -1,0 +1,20 @@
+{
+  "complete": "ολοκληρώθηκε",
+  "pending": "σε εκκρεμότητα",
+  "none": "κανένα",
+  "enabled": "ενεργοποιημένη",
+  "disabled": "απενεργοποιημένη",
+  "reacts": "αντιδρά",
+  "replies": "απαντά",
+  "disabled immediately": "απενεργοποιήθηκε αμέσως",
+  "registered": "εγγεγραμμένος",
+  "checked_in": "με καταγεγραμμένη προσέλευση",
+  "credits": "μονάδες",
+  "exports": "εξαγωγές",
+  "erasure": "διαγραφή",
+  "invalid_reaction": "Μη έγκυρη αντίδραση",
+  "unsupported_action": "Μη υποστηριζόμενη ενέργεια",
+  "First steps": "Πρώτα βήματα",
+  "Regular": "Τακτικό μέλος",
+  "Community pillar": "Στυλοβάτης της κοινότητας"
+}

@@ -59,6 +59,7 @@ pub mod giveaway_card;
 mod giveaway_display;
 pub mod poll_card;
 mod poll_display;
+mod private_replies;
 mod rank_card;
 pub mod starboard_card;
 mod starboard_display;
@@ -2071,13 +2072,23 @@ impl EventHandler for Handler {
                     warn!(%error, "command acknowledgement failed");
                     return;
                 }
-                if let Err(error) = self.handle_command(&ctx, &command).await {
+                if let Err(error) = private_replies::with_locale(
+                    ephemeral.then(|| command.locale.clone()),
+                    self.handle_command(&ctx, &command),
+                )
+                .await
+                {
                     tracing::error!(%error, command = %command.data.name, "command failed");
                     let _ = command
                         .edit_response(
                             &ctx,
                             EditInteractionResponse::new()
-                                .content("Something went wrong while running that command."),
+                                .content(private_replies::for_visibility(
+                                    ephemeral,
+                                    &command.locale,
+                                    "Something went wrong while running that command.",
+                                ))
+                                .allowed_mentions(CreateAllowedMentions::new()),
                         )
                         .await;
                 } else if let Some(guild_id) = command.guild_id {
@@ -2107,7 +2118,11 @@ impl EventHandler for Handler {
                         .edit_response(
                             &ctx,
                             EditInteractionResponse::new()
-                                .content("Unable to complete this action."),
+                                .content(private_replies::text(
+                                    &component.locale,
+                                    "Unable to complete this action.",
+                                ))
+                                .allowed_mentions(CreateAllowedMentions::new()),
                         )
                         .await;
                 } else if let Some(guild_id) = component.guild_id {
@@ -6141,12 +6156,12 @@ impl Handler {
                     }),
                 });
                 let decision = evaluate_help(&help_config);
-                let mut message = "Vozen Helper: Core, Studio, Security, Support, Events, Community, Automate and Insights.".to_string();
+                let mut message = private_replies::current_text("Vozen Helper: Core, Studio, Security, Support, Events, Community, Automate and Insights.");
                 if decision.show_modules {
-                    message.push_str(" Use /modules to see what is enabled.");
+                    message.push_str(&private_replies::current_text(" Use /modules to see what is enabled."));
                 }
                 if decision.show_dashboard {
-                    message.push_str(" Use /dashboard to configure your server.");
+                    message.push_str(&private_replies::current_text(" Use /dashboard to configure your server."));
                 }
                 message
             }
@@ -6220,7 +6235,7 @@ impl Handler {
                     })
                     .copied()
                     .collect::<Vec<_>>();
-                format!("Setup: **{}** · Modules: **{}** · Guild isolation enabled · Privacy export/delete available", if setup { "complete" } else { "pending" }, if configured.is_empty() { "none".to_string() } else { configured.join(", ") })
+                format!("Setup: **{}** · Modules: **{}** · Guild isolation enabled · Privacy export/delete available", private_replies::system_word(if setup { "complete" } else { "pending" }), if configured.is_empty() { private_replies::system_word("none") } else { configured.join(", ") })
             }
             "dashboard" => "Dashboard: https://helper.vozen.org (the endpoint remains disabled until the approved rollout).".to_string(),
             "plan" => {
@@ -6289,7 +6304,7 @@ impl Handler {
                                 channel.send_message(
                                     &ctx.http,
                                     CreateMessage::new()
-                                        .content("Here is your Vozen Helper data export.")
+                                        .content(private_replies::text(&command.locale,"Here is your Vozen Helper data export."))
                                         .add_file(CreateAttachment::bytes(bytes, "my-vozen-data.json")),
                                 ).await?;
                                 "Enviei os teus dados por mensagem privada.".to_string()
@@ -6303,7 +6318,7 @@ impl Handler {
             "cases" => {
                 if let Some(guild_id) = command.guild_id {
                     let cases = self.store.recent_cases(&guild_id.to_string(), 10)?;
-                    if cases.is_empty() { "There are no cases in this server yet.".to_string() } else { cases.into_iter().map(|case_record| format!("#{} {} <@{}>: {}", case_record.id, case_record.kind, case_record.target_id, case_record.reason)).collect::<Vec<_>>().join("\n") }
+                    if cases.is_empty() { "There are no cases in this server yet.".to_string() } else { return respond_raw(ctx,command,&cases.into_iter().map(|case_record| format!("#{} {} <@{}>: {}", case_record.id, case_record.kind, case_record.target_id, case_record.reason)).collect::<Vec<_>>().join("\n")).await; }
                 } else { "Este comando só pode ser usado num servidor.".to_string() }
             }
             "modlogs" => {
@@ -6320,7 +6335,7 @@ impl Handler {
                 if cases.is_empty() {
                     format!("There are no cases for <@{}>.", target)
                 } else {
-                    cases.into_iter().map(|case_record| format!("#{} {}: {}", case_record.id, case_record.kind, case_record.reason)).collect::<Vec<_>>().join("\n")
+                    return respond_raw(ctx,command,&cases.into_iter().map(|case_record| format!("#{} {}: {}", case_record.id, case_record.kind, case_record.reason)).collect::<Vec<_>>().join("\n")).await;
                 }
             }
             "warn" => {
@@ -6689,7 +6704,7 @@ impl Handler {
                 }
                 let name = option_string(command, "name").unwrap_or_default().to_lowercase();
                 match self.store.get_tag(&guild_id.to_string(), &name)? {
-                    Some(tag) => tag.content.replace("{user}", &format!("<@{}>", command.user.id)),
+                    Some(tag) => return respond_raw(ctx,command,&tag.content.replace("{user}", &format!("<@{}>", command.user.id))).await,
                     None => "Tag not found.".to_string(),
                 }
             }
@@ -6702,7 +6717,7 @@ impl Handler {
                 }
                 let max_tags = setting_u64(&self.store, &guild_id.to_string(), "management.custom_commands.max_tags", 100).clamp(1, 100) as u32;
                 let names = self.store.list_tags(&guild_id.to_string(), max_tags)?;
-                if names.is_empty() { "There are no tags yet.".to_string() } else { names.join(", ") }
+                if names.is_empty() { "There are no tags yet.".to_string() } else { return respond_raw(ctx,command,&names.join(", ")).await; }
             }
             "tag-set" => {
                 let Some(guild_id) = command.guild_id else {
@@ -6851,6 +6866,7 @@ impl Handler {
                 let achievements = configured_achievement_milestones(&self.store, &guild_text)
                     .into_iter()
                     .map(|(key, label, threshold)| {
+                        let label = private_replies::system_word(label);
                         let persisted = unlocked.iter().any(|entry| entry.achievement_key == key);
                         if persisted {
                             format!("✅ {label} ({threshold} XP)")
@@ -6962,7 +6978,7 @@ impl Handler {
                                     .collect::<Vec<_>>()
                             })
                             .unwrap_or_default();
-                        if rows.is_empty() { "No Wikipedia results were found.".to_string() } else { rows.join("\n") }
+                        if rows.is_empty() { "No Wikipedia results were found.".to_string() } else { return respond_raw(ctx,command,&rows.join("\n")).await; }
                     }
                     "anilist" if anilist => {
                         let body = serde_json::json!({
@@ -6998,7 +7014,7 @@ impl Handler {
                                     .collect::<Vec<_>>()
                             })
                             .unwrap_or_default();
-                        if rows.is_empty() { "No AniList results were found.".to_string() } else { rows.join("\n") }
+                        if rows.is_empty() { "No AniList results were found.".to_string() } else { return respond_raw(ctx,command,&rows.join("\n")).await; }
                     }
                     "bluesky" if bluesky => {
                         let response = http
@@ -7033,7 +7049,7 @@ impl Handler {
                                     .collect::<Vec<_>>()
                             })
                             .unwrap_or_default();
-                        if rows.is_empty() { "No Bluesky results were found.".to_string() } else { rows.join("\n") }
+                        if rows.is_empty() { "No Bluesky results were found.".to_string() } else { return respond_raw(ctx,command,&rows.join("\n")).await; }
                     }
                     "youtube" | "twitch" | "wikipedia" | "anilist" | "bluesky" => "That search provider is disabled in this server's settings.".to_string(),
                     _ => "Choose an approved provider: `youtube`, `twitch`, `wikipedia`, `anilist` or `bluesky`.".to_string(),
@@ -7190,19 +7206,20 @@ impl Handler {
                         .into_iter()
                         .take(max_entries)
                         .map(|invite| {
-                            let inviter = invite.inviter.map(|user| user.name).unwrap_or_else(|| "Discord system".into());
-                            if include_inviter { format!("`{}` — {} uses — {}", invite.code, invite.uses, inviter) } else { format!("`{}` — {} uses", invite.code, invite.uses) }
+                            let inviter = invite.inviter.map(|user| user.name).unwrap_or_else(|| private_replies::current_text("Discord system"));
+                            private_replies::current_text(&if include_inviter { format!("`{}` — {} uses — {}", invite.code, invite.uses, inviter) } else { format!("`{}` — {} uses", invite.code, invite.uses) })
                         })
                         .collect::<Vec<_>>()
                         .join("\n")
                 };
+                let invite_text=private_replies::current_text(&invite_text);
                 let tracked = self.store.invite_attribution_summary(&guild_text, max_entries as u32)?;
                 if tracked.is_empty() {
                     invite_text
                 } else {
                     let tracked_text = tracked
                         .into_iter()
-                        .map(|(code, joins)| format!("`{code}` — {joins} attributed join(s)"))
+                        .map(|(code, joins)| private_replies::current_text(&format!("`{code}` — {joins} attributed join(s)")))
                         .collect::<Vec<_>>()
                         .join("\n");
                     format!("{invite_text}\n\nTracked joins:\n{tracked_text}")
@@ -7218,7 +7235,7 @@ impl Handler {
                 }
                 let account = self.store.economy_account(&guild_text, &command.user.id.to_string())?;
                 let currency = setting_string(&self.store, &guild_text, "community.economy.currency_name")
-                    .unwrap_or_else(|| "credits".to_string());
+                    .unwrap_or_else(|| private_replies::system_word("credits"));
                 format!("Your balance is **{}** {currency}.", account.balance)
             }
             "daily" => {
@@ -7237,7 +7254,7 @@ impl Handler {
                 }
                 let reward = decision.amount;
                 let currency = setting_string(&self.store, &guild_text, "community.economy.currency_name")
-                    .unwrap_or_else(|| "credits".to_string());
+                    .unwrap_or_else(|| private_replies::system_word("credits"));
                 match self.store.claim_daily(&guild_text, &command.user.id.to_string(), reward)? {
                     Some(account) => format!("Daily reward claimed: **{}** {currency}. Your balance is **{}**.", reward, account.balance),
                     None => "You already claimed your daily reward. Try again after the 24-hour cooldown.".to_string(),
@@ -7260,7 +7277,7 @@ impl Handler {
                 let reward = decision.amount;
                 let cooldown = decision.cooldown_ms as u64;
                 let currency = setting_string(&self.store, &guild_text, "community.economy.currency_name")
-                    .unwrap_or_else(|| "credits".to_string());
+                    .unwrap_or_else(|| private_replies::system_word("credits"));
                 match self.store.claim_economy_reward(&guild_text, &command.user.id.to_string(), "work", reward, cooldown as i64)? {
                     Some(account) => format!("Work reward claimed: **{}** {currency}. Your balance is **{}**.", reward, account.balance),
                     None => format!("You are on cooldown. Try work again in about {}.", format_duration(cooldown as i64)),
@@ -7275,7 +7292,7 @@ impl Handler {
                     return respond(ctx, command, "Economy is disabled in this server. Enable it in the dashboard.").await;
                 }
                 let currency = setting_string(&self.store, &guild_text, "community.economy.currency_name")
-                    .unwrap_or_else(|| "credits".to_string());
+                    .unwrap_or_else(|| private_replies::system_word("credits"));
                 let rows = self.store.economy_top(&guild_text, 10)?;
                 if rows.is_empty() {
                     "No community balances have been earned yet.".to_string()
@@ -7626,7 +7643,7 @@ impl Handler {
                 }
                 let rows = self.store.active_giveaways(&guild_id.to_string(), 20)?;
                 if rows.is_empty() { "There are no active giveaways.".to_string() } else {
-                    rows.into_iter().map(|row| format!("#{} — {} — ends <t:{}:R>", row.id, row.prize, row.end_at / 1_000)).collect::<Vec<_>>().join("\n")
+                    rows.into_iter().map(|row| private_replies::current_text(&format!("#{} — {} — ends <t:{}:R>", row.id, row.prize, row.end_at / 1_000))).collect::<Vec<_>>().join("\n")
                 }
             }
             "greroll" => {
@@ -7792,11 +7809,11 @@ impl Handler {
                     )?;
                 }
                 if enabled {
-                    let role_note = if option_role(command, "role").is_some() {
+                    let role_note = private_replies::current_text(if option_role(command, "role").is_some() {
                         "; verification role updated"
                     } else {
                         "; configure a role to restrict channels"
-                    };
+                    });
                     format!("Join gate enabled for accounts younger than {minimum_age} day(s){role_note}.")
                 } else {
                     "Join gate disabled; saved settings can be re-enabled.".to_string()
@@ -8358,9 +8375,9 @@ impl Handler {
                                 "<@{}> · {}",
                                 registration.user_id,
                                 if registration.status == "checked_in" {
-                                    "check-in"
+                                    private_replies::system_word("checked_in")
                                 } else {
-                                    "registered"
+                                    private_replies::system_word("registered")
                                 }
                             )
                         })
@@ -8479,7 +8496,7 @@ impl Handler {
                 };
                 format!(
                     "Workflow #{id} created. It {} when a message matches the condition.",
-                    if action == "react" { "reacts" } else { "replies" }
+                    private_replies::system_word(if action == "react" { "reacts" } else { "replies" })
                 )
             }
             "workflow-list" => {
@@ -8488,7 +8505,7 @@ impl Handler {
                 };
                 let workflows = self.store.workflows(&guild_id.to_string(), 25)?;
                 if workflows.is_empty() { "There are no workflows configured.".to_string() } else {
-                    workflows.into_iter().map(|workflow| format!("#{} **{}** · {} · {}", workflow.id, workflow.name, workflow.trigger, if workflow.enabled { "enabled" } else { "disabled" })).collect::<Vec<_>>().join("\n")
+                    workflows.into_iter().map(|workflow| format!("#{} **{}** · {} · {}", workflow.id, workflow.name, workflow.trigger, private_replies::system_word(if workflow.enabled { "enabled" } else { "disabled" }))).collect::<Vec<_>>().join("\n")
                 }
             }
             "workflow-dry-run" => {
@@ -8537,7 +8554,7 @@ impl Handler {
                 } else if let Some(reaction) = decision.reaction {
                     format!("Dry run: workflow **{}** would react with {}.", workflow.name, reaction)
                 } else {
-                    format!("Dry run: workflow **{}** would not run ({}).", workflow.name, decision.reason)
+                    format!("Dry run: workflow **{}** would not run ({}).", workflow.name, private_replies::system_word(&decision.reason))
                 }
             }
             "workflow-toggle" => {
@@ -8547,7 +8564,7 @@ impl Handler {
                 let id = option_i64(command, "id").unwrap_or(0);
                 let enabled = option_bool(command, "enabled").unwrap_or(false);
                 if self.store.set_workflow_enabled(&guild_id.to_string(), id, enabled)? {
-                    format!("Workflow #{id} {}.", if enabled { "enabled" } else { "disabled immediately" })
+                    format!("Workflow #{id} {}.", private_replies::system_word(if enabled { "enabled" } else { "disabled immediately" }))
                 } else {
                     "Workflow not found in this server.".to_string()
                 }
@@ -8691,7 +8708,7 @@ impl Handler {
                     self.store.set_ticket_notes(&ticket.channel_id, note)?;
                 }
                 let updated = self.store.ticket_by_channel(&ticket.channel_id)?.ok_or_else(|| anyhow::anyhow!("ticket disappeared"))?;
-                format!("Ticket updated: category **{}**, priority **{}**{}.", updated.category, updated.priority, if updated.notes.is_empty() { String::new() } else { " · internal note saved".to_string() })
+                format!("Ticket updated: category **{}**, priority **{}**{}.", updated.category, updated.priority, if updated.notes.is_empty() { String::new() } else { private_replies::current_text(" · internal note saved") })
             }
             "ticket-rate" => {
                 let Some(_guild_id) = command.guild_id else {
@@ -9046,7 +9063,7 @@ impl Handler {
                     component,
                     &format!(
                         "{} The participant total could not be updated on the public panel.",
-                        english_bot_text(response)
+                        private_replies::text(&component.locale, response)
                     ),
                 )
                 .await;
@@ -9801,15 +9818,25 @@ fn command_response_ephemeral(store: &Store, command: &CommandInteraction) -> bo
 }
 
 async fn respond(ctx: &Context, command: &CommandInteraction, content: &str) -> Result<()> {
-    command
-        .edit_response(
-            ctx,
-            EditInteractionResponse::new()
-                .content(english_bot_text(content))
-                .allowed_mentions(CreateAllowedMentions::new()),
-        )
-        .await?;
+    respond_raw(ctx, command, &private_replies::current_text(content)).await
+}
+
+async fn respond_raw(ctx: &Context, command: &CommandInteraction, content: &str) -> Result<()> {
+    command.edit_response(ctx, raw_feedback(content)).await?;
     Ok(())
+}
+
+fn raw_feedback(content: &str) -> EditInteractionResponse {
+    EditInteractionResponse::new()
+        .content(content)
+        .allowed_mentions(CreateAllowedMentions::new())
+}
+
+fn component_feedback(
+    component: &serenity::all::ComponentInteraction,
+    content: &str,
+) -> EditInteractionResponse {
+    raw_feedback(&private_replies::text(&component.locale, content))
 }
 
 async fn respond_component(
@@ -9818,24 +9845,19 @@ async fn respond_component(
     content: &str,
 ) -> Result<()> {
     component
-        .edit_response(
-            ctx,
-            EditInteractionResponse::new()
-                .content(english_bot_text(content))
-                .allowed_mentions(CreateAllowedMentions::new()),
-        )
+        .edit_response(ctx, component_feedback(component, content))
         .await?;
     Ok(())
 }
 
-/// Translate legacy Portuguese system text at the Discord boundary.
+/// Preserve the legacy English presentation of shared/public responses.
 ///
 /// Configuration values, tag bodies and user supplied content remain untouched;
 /// only known Helper-owned phrases are translated. This keeps existing guild
-/// settings compatible while ensuring command/component feedback is English.
+/// settings compatible. Private interaction feedback uses private_replies instead.
 fn english_bot_text(input: &str) -> String {
     const REPLACEMENTS: &[(&str, &str)] = &[
-        // Keep all Helper-owned command and component feedback in English.
+        // Retain compatibility for existing shared/public text only.
         // These entries intentionally cover the correctly encoded strings
         // still present in older handlers; the mojibake variants below keep
         // responses from legacy persisted/configured paths readable too.
@@ -11479,9 +11501,8 @@ fn required_permission(command: &str) -> Option<Permissions> {
     }
 }
 
-/// The Helper never derives its language from Discord or browser settings.
-/// A server starts in English until an administrator explicitly selects one of
-/// the locales supported by the Vozen site.
+/// Shared server language remains independent from personal interaction feedback.
+/// Private command/button replies use the actor's Discord interaction locale.
 const DEFAULT_HELPER_LOCALE: &str = "en";
 const HELPER_LANGUAGE_SETTING: &str = "core.language";
 const HELPER_LOCALES: &[(&str, &str)] = &[

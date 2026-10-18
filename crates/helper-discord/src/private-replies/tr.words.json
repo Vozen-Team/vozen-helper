@@ -1,0 +1,20 @@
+{
+  "complete": "tamamlandı",
+  "pending": "beklemede",
+  "none": "yok",
+  "enabled": "etkin",
+  "disabled": "devre dışı",
+  "reacts": "tepki verir",
+  "replies": "yanıt verir",
+  "disabled immediately": "hemen devre dışı bırakıldı",
+  "registered": "kayıtlı",
+  "checked_in": "katılım onaylandı",
+  "credits": "kredi",
+  "exports": "dışa aktarımlar",
+  "erasure": "silme",
+  "invalid_reaction": "Geçersiz tepki",
+  "unsupported_action": "Desteklenmeyen işlem",
+  "First steps": "İlk adımlar",
+  "Regular": "Düzenli üye",
+  "Community pillar": "Topluluğun temel taşı"
+}

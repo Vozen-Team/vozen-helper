@@ -1,0 +1,20 @@
+{
+  "complete": "finalizat",
+  "pending": "în așteptare",
+  "none": "niciunul",
+  "enabled": "activat",
+  "disabled": "dezactivat",
+  "reacts": "reacționează",
+  "replies": "răspunde",
+  "disabled immediately": "dezactivat imediat",
+  "registered": "înscris",
+  "checked_in": "prezență confirmată",
+  "credits": "credite",
+  "exports": "exporturi",
+  "erasure": "ștergere",
+  "invalid_reaction": "Reacție nevalidă",
+  "unsupported_action": "Acțiune neacceptată",
+  "First steps": "Primii pași",
+  "Regular": "Membru obișnuit",
+  "Community pillar": "Stâlp al comunității"
+}

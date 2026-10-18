@@ -1,0 +1,16 @@
+{
+  "r_3743e72c3e63": "`{0}` — {1} tillskrivna anslutningar",
+  "r_5fbb8903b06d": "**{0}** har inga anmälningar ännu.",
+  "r_a2dd6f74f466": "#{0} — {1} — slutar <t:{2}:R>",
+  "r_d2c06ffff370": "**{0}** — {1} anmälningar\n{2}",
+  "r_de206fb45243": "`{0}` — {1} användningar",
+  "r_e838c2444527": "`{0}` — {1} användningar — {2}",
+  "r_05699a19fe58": "visningsnamnet matchar `{0}`",
+  "r_23625061c74d": "; konfigurera en roll för att begränsa kanaler",
+  "r_258aec37f1e6": "<@{0}> sattes i karantän som moderationsärende #{1}. Roller sparades för återställning.",
+  "r_3366ef49dd49": "; verifieringsrollen uppdaterad",
+  "r_c76525238489": " utan inbjudarnas namn",
+  "r_eb4a6ce8e56d": " med inbjudarnas namn",
+  "r_f22ae96535a7": " (endast animerade)",
+  "r_fe6ebea0bf5e": " · intern anteckning sparad"
+}

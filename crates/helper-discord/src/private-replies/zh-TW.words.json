@@ -1,0 +1,20 @@
+{
+  "complete": "已完成",
+  "pending": "待處理",
+  "none": "無",
+  "enabled": "已啟用",
+  "disabled": "已停用",
+  "reacts": "作出反應",
+  "replies": "回覆",
+  "disabled immediately": "已立即停用",
+  "registered": "已報名",
+  "checked_in": "已報到",
+  "credits": "點數",
+  "exports": "資料匯出",
+  "erasure": "資料刪除",
+  "invalid_reaction": "無效的反應",
+  "unsupported_action": "不支援的操作",
+  "First steps": "入門步驟",
+  "Regular": "常客",
+  "Community pillar": "社群支柱"
+}

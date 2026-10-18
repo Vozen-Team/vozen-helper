@@ -1,0 +1,20 @@
+{
+  "complete": "完了",
+  "pending": "未完了",
+  "none": "なし",
+  "enabled": "有効",
+  "disabled": "無効",
+  "reacts": "リアクションします",
+  "replies": "返信します",
+  "disabled immediately": "即座に無効化",
+  "registered": "登録済み",
+  "checked_in": "チェックイン済み",
+  "credits": "クレジット",
+  "exports": "エクスポート",
+  "erasure": "消去",
+  "invalid_reaction": "無効なリアクション",
+  "unsupported_action": "未対応の操作",
+  "First steps": "はじめの一歩",
+  "Regular": "常連",
+  "Community pillar": "コミュニティの支柱"
+}

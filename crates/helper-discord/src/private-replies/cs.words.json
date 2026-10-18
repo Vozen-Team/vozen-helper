@@ -1,0 +1,20 @@
+{
+  "complete": "dokončeno",
+  "pending": "čeká",
+  "none": "žádné",
+  "enabled": "zapnutý",
+  "disabled": "vypnutý",
+  "reacts": "reaguje",
+  "replies": "odpovídá",
+  "disabled immediately": "okamžitě vypnutý",
+  "registered": "registrováno",
+  "checked_in": "účast potvrzena",
+  "credits": "kredity",
+  "exports": "exporty",
+  "erasure": "výmaz",
+  "invalid_reaction": "Neplatná reakce",
+  "unsupported_action": "Nepodporovaná akce",
+  "First steps": "První kroky",
+  "Regular": "Pravidelný člen",
+  "Community pillar": "Pilíř komunity"
+}

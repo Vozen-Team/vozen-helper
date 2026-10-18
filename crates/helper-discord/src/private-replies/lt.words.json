@@ -1,0 +1,20 @@
+{
+  "complete": "baigta",
+  "pending": "laukiama",
+  "none": "nėra",
+  "enabled": "įjungta",
+  "disabled": "išjungta",
+  "reacts": "reaguoja",
+  "replies": "atsako",
+  "disabled immediately": "nedelsiant išjungta",
+  "registered": "užsiregistravęs",
+  "checked_in": "dalyvavimas patvirtintas",
+  "credits": "kreditai",
+  "exports": "eksportai",
+  "erasure": "ištrynimas",
+  "invalid_reaction": "Netinkama reakcija",
+  "unsupported_action": "Nepalaikomas veiksmas",
+  "First steps": "Pirmieji žingsniai",
+  "Regular": "Nuolatinis narys",
+  "Community pillar": "Bendruomenės ramstis"
+}

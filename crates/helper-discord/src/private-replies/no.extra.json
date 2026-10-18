@@ -1,0 +1,16 @@
+{
+"r_3743e72c3e63":"`{0}` — {1} tilskrevne innmeldinger",
+"r_5fbb8903b06d":"**{0}** har ingen påmeldinger ennå.",
+"r_a2dd6f74f466":"#{0} — {1} — slutter <t:{2}:R>",
+"r_d2c06ffff370":"**{0}** — {1} påmeldinger\n{2}",
+"r_de206fb45243":"`{0}` — brukt {1} ganger",
+"r_e838c2444527":"`{0}` — brukt {1} ganger — {2}",
+"r_05699a19fe58":"visningsnavnet samsvarer med `{0}`",
+"r_23625061c74d":"; konfigurer en rolle for å begrense kanaltilgang",
+"r_258aec37f1e6":"<@{0}> satt i karantene som modereringssak #{1}. Roller er lagret for gjenoppretting.",
+"r_3366ef49dd49":"; bekreftelsesrolle oppdatert",
+"r_c76525238489":" uten navn på dem som inviterte",
+"r_eb4a6ce8e56d":" med navn på dem som inviterte",
+"r_f22ae96535a7":" (bare animerte)",
+"r_fe6ebea0bf5e":" · intern merknad lagret"
+}

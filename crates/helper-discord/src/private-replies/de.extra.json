@@ -1,0 +1,16 @@
+{
+"r_3743e72c3e63":"`{0}` — {1} zugeordnete Beitritte",
+"r_5fbb8903b06d":"**{0}** hat noch keine Anmeldungen.",
+"r_a2dd6f74f466":"#{0} — {1} — endet <t:{2}:R>",
+"r_d2c06ffff370":"**{0}** — {1} Anmeldungen\n{2}",
+"r_de206fb45243":"`{0}` — {1} Verwendungen",
+"r_e838c2444527":"`{0}` — {1} Verwendungen — {2}",
+"r_05699a19fe58":"Anzeigename entspricht `{0}`",
+"r_23625061c74d":"; richte eine Rolle ein, um den Kanalzugriff einzuschränken",
+"r_258aec37f1e6":"<@{0}> als Fall #{1} unter Quarantäne gestellt. Rollen wurden zur Wiederherstellung gespeichert.",
+"r_3366ef49dd49":"; Verifizierungsrolle aktualisiert",
+"r_c76525238489":" ohne Namen der Einladenden",
+"r_eb4a6ce8e56d":" mit Namen der Einladenden",
+"r_f22ae96535a7":" (nur animierte)",
+"r_fe6ebea0bf5e":" · interne Notiz gespeichert"
+}

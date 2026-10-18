@@ -1,0 +1,16 @@
+{
+  "r_3743e72c3e63": "`{0}` — {1} przypisanych dołączeń",
+  "r_5fbb8903b06d": "**{0}** nie ma jeszcze zapisów.",
+  "r_a2dd6f74f466": "#{0} — {1} — koniec <t:{2}:R>",
+  "r_d2c06ffff370": "**{0}** — {1} zapisów\n{2}",
+  "r_de206fb45243": "`{0}` — {1} użyć",
+  "r_e838c2444527": "`{0}` — {1} użyć — {2}",
+  "r_05699a19fe58": "wyświetlana nazwa pasuje do `{0}`",
+  "r_23625061c74d": "; skonfiguruj rolę ograniczającą dostęp do kanałów",
+  "r_258aec37f1e6": "<@{0}> poddano kwarantannie jako sprawę #{1}. Role zapisano do przywrócenia.",
+  "r_3366ef49dd49": "; zaktualizowano rolę weryfikacji",
+  "r_c76525238489": " bez nazw zapraszających",
+  "r_eb4a6ce8e56d": " z nazwami zapraszających",
+  "r_f22ae96535a7": " (tylko animowane)",
+  "r_fe6ebea0bf5e": " · zapisano notatkę wewnętrzną"
+}
