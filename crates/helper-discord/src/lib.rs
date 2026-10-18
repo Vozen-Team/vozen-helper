@@ -1721,14 +1721,7 @@ impl EventHandler for Handler {
                     )
                     .required(true),
                 )
-                .add_option(
-                    CreateCommandOption::new(
-                        serenity::all::CommandOptionType::String,
-                        "start",
-                        "RFC3339 start, for example 2026-07-24T20:00:00Z",
-                    )
-                    .required(true),
-                )
+                .add_option(event_time_option("start", true))
                 .add_option(
                     CreateCommandOption::new(
                         serenity::all::CommandOptionType::String,
@@ -1737,14 +1730,7 @@ impl EventHandler for Handler {
                     )
                     .required(true),
                 )
-                .add_option(
-                    CreateCommandOption::new(
-                        serenity::all::CommandOptionType::String,
-                        "end",
-                        "RFC3339 end",
-                    )
-                    .required(false),
-                )
+                .add_option(event_time_option("end", false))
                 .add_option(
                     CreateCommandOption::new(
                         serenity::all::CommandOptionType::String,
@@ -1780,22 +1766,8 @@ impl EventHandler for Handler {
                     )
                     .required(false),
                 )
-                .add_option(
-                    CreateCommandOption::new(
-                        serenity::all::CommandOptionType::String,
-                        "start",
-                        "New RFC3339 start",
-                    )
-                    .required(false),
-                )
-                .add_option(
-                    CreateCommandOption::new(
-                        serenity::all::CommandOptionType::String,
-                        "end",
-                        "New RFC3339 end",
-                    )
-                    .required(false),
-                )
+                .add_option(event_time_option("start", false))
+                .add_option(event_time_option("end", false))
                 .add_option(
                     CreateCommandOption::new(
                         serenity::all::CommandOptionType::String,
@@ -7982,8 +7954,7 @@ impl Handler {
                         Ok(window) => window,
                         Err(reason) => {
                             let message = match reason {
-                                "invalid_start" => "The start date is not valid RFC3339.",
-                                "invalid_end" => "The end date is not valid RFC3339.",
+                                "invalid_start" | "invalid_end" => "Use `30m`, `2h` or a full date with a time zone.",
                                 "start_must_be_in_future" => "The start must be in the future.",
                                 "end_must_follow_start" => "The end must be after the start.",
                                 "event_too_long" => "The event cannot last longer than 365 days.",
@@ -7993,13 +7964,13 @@ impl Handler {
                         }
                     }
                 } else {
-                    let start = match serenity::all::Timestamp::parse(start_raw) {
-                        Ok(value) if value.unix_timestamp() > now_seconds => value,
-                        Ok(_) => {
+                    let start = match parse_scheduled_event_time(start_raw, now_seconds) {
+                        Some(value) if value.unix_timestamp() > now_seconds => value,
+                        Some(_) => {
                             return respond(ctx, command, "The start must be in the future.").await;
                         }
-                        Err(_) => {
-                            return respond(ctx, command, "The start date is not valid RFC3339.").await;
+                        None => {
+                            return respond(ctx, command, "Use `30m`, `2h` or a full date with a time zone.").await;
                         }
                     };
                     let duration_hours = setting_u64(
@@ -8165,21 +8136,26 @@ impl Handler {
                 let start_raw = option_string(command, "start").map(str::trim);
                 let end_raw = option_string(command, "end").map(str::trim);
                 let (start, end) = if start_raw.is_some() || end_raw.is_some() {
+                    let now_seconds = serenity::all::Timestamp::now().unix_timestamp();
                     let start = match start_raw {
-                        Some(raw) => serenity::all::Timestamp::parse(raw)
-                            .map_err(|_| anyhow::anyhow!("The new start date is not valid RFC3339."))?,
+                        Some(raw) => match parse_scheduled_event_time(raw, now_seconds) {
+                            Some(time) => time,
+                            None => return respond(ctx, command, "Use `30m`, `2h` or a full date with a time zone.").await,
+                        },
                         None => existing.start_time,
                     };
                     let end = match end_raw {
-                        Some(raw) => serenity::all::Timestamp::parse(raw)
-                            .map_err(|_| anyhow::anyhow!("The new end date is not valid RFC3339."))?,
+                        Some(raw) => match parse_scheduled_event_time(raw, start.unix_timestamp()) {
+                            Some(time) => time,
+                            None => return respond(ctx, command, "Use `30m`, `2h` or a full date with a time zone.").await,
+                        },
                         None => existing.end_time.ok_or_else(|| {
                             anyhow::anyhow!("This event has no end date; provide `end` to edit it.")
                         })?,
                     };
                     if start_raw.is_some()
                         && start.unix_timestamp()
-                            <= serenity::all::Timestamp::now().unix_timestamp()
+                            <= now_seconds
                     {
                         return respond(ctx, command, "The new start date must be in the future.").await;
                     }
@@ -12584,13 +12560,34 @@ fn permission_passport_message() -> String {
     "**Permission Passport**\nBase: `View Channels`, `Send Messages`, `Embed Links`, `Read Message History`, `Use Application Commands`.\nOptional security: `Manage Messages`, `Moderate Members`, `Kick Members`, `Ban Members`, `Manage Roles`.\nOptional support/events: `Manage Channels`, `Manage Threads`, `Create Private Threads`.\nGateway: `MESSAGE_CONTENT` and `GUILD_MEMBERS` must be enabled for the app at gateway startup; their data is processed only by configured modules that need it.\nEvery extra permission has a module and an explicit consequence; use the dashboard to compare granted permissions with the required ones.".to_string()
 }
 
+fn event_time_option(name: &str, required: bool) -> CreateCommandOption {
+    let description = if name == "start" {
+        "Starts in: e.g. 30m, 2h, 1d (or a full date with time zone)"
+    } else {
+        "Length after start: e.g. 1h, 2h (or a full date with time zone)"
+    };
+    CreateCommandOption::new(serenity::all::CommandOptionType::String, name, description)
+        .required(required)
+}
+
+fn parse_scheduled_event_time(raw: &str, base_timestamp: i64) -> Option<serenity::all::Timestamp> {
+    if let Ok(time) = serenity::all::Timestamp::parse(raw.trim()) {
+        return Some(time);
+    }
+    let seconds = parse_duration(raw)?.checked_div(1_000)?;
+    let timestamp = base_timestamp.checked_add(seconds)?;
+    // Serenity converts seconds to milliseconds internally without a checked multiply.
+    timestamp.checked_mul(1_000)?;
+    serenity::all::Timestamp::from_unix_timestamp(timestamp).ok()
+}
+
 fn parse_scheduled_event_window(
     start_raw: &str,
     end_raw: &str,
     now_timestamp: i64,
 ) -> Result<(serenity::all::Timestamp, serenity::all::Timestamp), &'static str> {
-    let start = serenity::all::Timestamp::parse(start_raw).map_err(|_| "invalid_start")?;
-    let end = serenity::all::Timestamp::parse(end_raw).map_err(|_| "invalid_end")?;
+    let start = parse_scheduled_event_time(start_raw, now_timestamp).ok_or("invalid_start")?;
+    let end = parse_scheduled_event_time(end_raw, start.unix_timestamp()).ok_or("invalid_end")?;
     if start.unix_timestamp() <= now_timestamp {
         return Err("start_must_be_in_future");
     }
@@ -14027,6 +14024,82 @@ mod tests {
         assert_eq!(anti_nuke_containment_deadline(1_000, 10), 1_600);
         assert_eq!(anti_nuke_containment_deadline(1_000, 0), 1_060);
         assert_eq!(anti_nuke_containment_deadline(1_000, 999), 8_200);
+    }
+
+    #[test]
+    fn scheduled_event_options_advertise_simple_inputs_without_changing_names_or_required_flags() {
+        for (name, required) in [("start", true), ("start", false), ("end", false)] {
+            let option = serde_json::to_value(super::event_time_option(name, required)).unwrap();
+            assert_eq!(option["name"], name);
+            assert_eq!(option["type"], 3);
+            assert_eq!(option["required"], required);
+            let description = option["description"].as_str().unwrap();
+            assert!(description.len() <= 100);
+            assert!(description.contains("full date"));
+            assert!(!description.contains("RFC3339"));
+            assert!(description.contains(if name == "start" {
+                "Starts in"
+            } else {
+                "after start"
+            }));
+        }
+    }
+
+    #[test]
+    fn scheduled_event_times_keep_offsets_and_handle_invalid_or_overflowing_inputs() {
+        assert!(super::parse_scheduled_event_time("1h", i64::MAX).is_none());
+        assert!(super::parse_scheduled_event_time("1h", i64::MIN).is_none());
+        assert!(super::parse_scheduled_event_time("2026-10-18 18:00", 0).is_none());
+        let absolute = super::parse_scheduled_event_time(" 2026-10-18T18:00:00+01:00 ", 0).unwrap();
+        assert_eq!(
+            absolute,
+            serenity::all::Timestamp::parse("2026-10-18T17:00:00Z").unwrap()
+        );
+        assert_eq!(
+            super::parse_scheduled_event_time("1s", 1000)
+                .unwrap()
+                .unix_timestamp(),
+            1001
+        );
+        let hint = "Use `30m`, `2h` or a full date with a time zone.";
+        assert_eq!(
+            super::private_replies::text("pt-BR", hint),
+            "Use `30m`, `2h` ou uma data completa com fuso horário."
+        );
+    }
+
+    #[test]
+    fn scheduled_event_window_accepts_relative_start_and_length() {
+        let now = serenity::all::Timestamp::parse("2026-10-18T12:00:00Z")
+            .unwrap()
+            .unix_timestamp();
+        for (start, end, delay, length) in [
+            ("30m", "1h", 1800, 3600),
+            ("2h", "30m", 7200, 1800),
+            (" 1d ", "2h", 86400, 7200),
+        ] {
+            let (start_time, end_time) = parse_scheduled_event_window(start, end, now).unwrap();
+            assert_eq!(start_time.unix_timestamp(), now + delay);
+            assert_eq!(end_time.unix_timestamp(), now + delay + length);
+        }
+        let (start, end) =
+            parse_scheduled_event_window("30m", "2026-10-18T15:00:00+02:00", now).unwrap();
+        assert_eq!(start.unix_timestamp(), now + 1800);
+        assert_eq!(end.unix_timestamp(), now + 3600);
+        for bad in ["0m", "-2h", "1.5h", "tomorrow", "9999999999999999999d", ""] {
+            assert_eq!(
+                parse_scheduled_event_window(bad, "1h", now).unwrap_err(),
+                "invalid_start"
+            );
+            assert_eq!(
+                parse_scheduled_event_window("30m", bad, now).unwrap_err(),
+                "invalid_end"
+            );
+        }
+        assert_eq!(
+            parse_scheduled_event_window("30m", "366d", now).unwrap_err(),
+            "invalid_end"
+        );
     }
 
     #[test]
