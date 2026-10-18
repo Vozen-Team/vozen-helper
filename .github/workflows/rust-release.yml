@@ -61,6 +61,7 @@ jobs:
           else
             gh release create "$tag" "vozen-helper-rust-${GITHUB_SHA}.tar.gz" \
               --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
               --title "Vozen Helper ${GITHUB_SHA}" \
               --notes "CI-validated Linux release for commit ${GITHUB_SHA}."
           fi
