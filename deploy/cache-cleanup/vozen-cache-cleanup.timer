@@ -1,0 +1,11 @@
+[Unit]
+Description=Weekly rebuildable cache maintenance
+
+[Timer]
+OnCalendar=Sun *-*-* 04:00:00 UTC
+RandomizedDelaySec=30m
+Persistent=true
+Unit=vozen-cache-cleanup.service
+
+[Install]
+WantedBy=timers.target
