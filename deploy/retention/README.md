@@ -33,8 +33,26 @@ deployment files are eligible. Symlinks, hardlinks, mount points, archives and
 unknown layouts are skipped. Missing state, missing retained binaries, failed
 health or a detected concurrent deployment cancels cleanup. There is no global
 prune, backup expiration, database cleanup, forced process stop or bot restart.
-The maintenance unit can write only to `releases` and its control-state directory;
-`shared`, data and backups remain read-only. A warning does not fail Helper.
+Release-directory deletion is confined to `releases`; state writes use the
+control-state directory. `shared`, Helper data and its backups remain read-only.
+A warning does not fail Helper.
+
+The same healthy-start job also expires old publication packages under immediate
+`/home/ubuntu/helper-<name>-YYYYMMDD/` staging directories. It reads the same current
+and rollback state, preserving matching packages in every staging directory.
+Only regular single-link `vozen-helper-rust-<40-character revision>.tar.gz` files
+with the exact ELF/deploy-only archive layout are eligible. Archives are inspected
+without extraction. Newer staged packages, open files, active staging working
+directories, symlinks, mount points, malformed archives and unknown layouts stay.
+Directories whose names include backup/snapshot/restore/data are excluded.
+
+The unit needs write access to `/home/ubuntu` to unlink packages from dynamically
+named staging directories; code restricts deletion to those validated archive
+files and does not remove directories or scripts. No cache cleanup, database or
+backup expiration is included. Paths outside the existing writable roots and
+`/home/ubuntu` remain read-only. The rollout receipt and journal record exact
+removed/skipped files. A detected change to current or retention state stops
+further package deletion.
 
 Publication scripts must retain the current release until the new service has
 started and must not replace the installed systemd drop-in. Preserve the state
