@@ -1,0 +1,16 @@
+[Unit]
+Description=Retain current and rollback Vozen Helper code releases
+After=vozen-helper.service
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/usr/bin/python3 -B /usr/local/lib/vozen-helper-release-retention/retention.py
+TimeoutStartSec=120
+Nice=10
+IOSchedulingClass=idle
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/vozen/vozen-helper-rust/releases /var/lib/vozen-helper-release-retention
+PrivateTmp=yes
+NoNewPrivileges=yes
