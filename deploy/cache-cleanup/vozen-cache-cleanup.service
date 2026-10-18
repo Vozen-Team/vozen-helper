@@ -1,0 +1,17 @@
+[Unit]
+Description=Clean rebuildable APT and npm caches
+After=local-fs.target
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/usr/bin/python3 -B /usr/local/lib/vozen-cache-cleanup/cache_cleanup.py
+TimeoutStartSec=120
+Nice=10
+IOSchedulingClass=idle
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/cache/apt /var/lib/vozen-cache-cleanup
+ReadWritePaths=-/home/ubuntu/.npm/_cacache
+PrivateTmp=yes
+NoNewPrivileges=yes

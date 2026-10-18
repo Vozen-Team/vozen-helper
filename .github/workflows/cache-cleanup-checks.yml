@@ -1,0 +1,15 @@
+name: Cache cleanup checks
+on:
+  push:
+    paths: ['deploy/cache-cleanup/**', '.github/workflows/cache-cleanup-checks.yml']
+  pull_request:
+    paths: ['deploy/cache-cleanup/**', '.github/workflows/cache-cleanup-checks.yml']
+jobs:
+  cache-cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -B -m unittest discover -s deploy/cache-cleanup -v
