@@ -57,6 +57,8 @@ use tracing::{info, warn};
 
 pub mod giveaway_card;
 mod giveaway_display;
+pub mod poll_card;
+mod poll_display;
 mod rank_card;
 pub mod starboard_card;
 mod starboard_display;
@@ -7688,7 +7690,8 @@ impl Handler {
                 let guild_text = guild_id.to_string();
                 let id = self.store.create_scheduled_poll(&guild_text, &poll_channel, &question, &options, end_at)?;
                 let message_channel = poll_channel.parse::<u64>().map(ChannelId::new).unwrap_or(command.channel_id);
-                let published = message_channel.send_message(&ctx.http, poll_open_message(id, &question, &options, end_at)).await;
+                let poll = self.store.poll(id)?.ok_or_else(|| anyhow::anyhow!("created poll missing"))?;
+                let published = poll_display::publish(&ctx.http, message_channel, None, &poll, None).await;
                 let message = match published {
                     Ok(message) => message,
                     Err(error) => {
@@ -11336,55 +11339,6 @@ where
     Ok((role_ids.len() - pending.len(), pending.len()))
 }
 
-fn poll_open_message(id: i64, question: &str, options: &[String], end_at: i64) -> CreateMessage {
-    let labels = options
-        .iter()
-        .enumerate()
-        .map(|(index, value)| {
-            CreateButton::new(format!("poll:{id}:{index}"))
-                .label(format!("{}: {}", index + 1, truncate(value, 70)))
-                .style(ButtonStyle::Secondary)
-        })
-        .collect::<Vec<_>>();
-    CreateMessage::new()
-        .content(format!(
-            "🗳️ **Poll #{id}: {question}**\n{}\nEnds <t:{}:R>",
-            options
-                .iter()
-                .enumerate()
-                .map(|(i, v)| format!("{}️⃣ {}", i + 1, v))
-                .collect::<Vec<_>>()
-                .join("\n"),
-            end_at / 1_000
-        ))
-        .allowed_mentions(CreateAllowedMentions::new())
-        .components(vec![CreateActionRow::Buttons(labels)])
-}
-
-fn poll_result_message(poll: &helper_store::PollRecord, counts: &[i64]) -> EditMessage {
-    let results = poll
-        .options
-        .iter()
-        .enumerate()
-        .map(|(index, option)| {
-            format!(
-                "{}️⃣ {} — {} voto(s)",
-                index + 1,
-                option,
-                counts.get(index).copied().unwrap_or_default()
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    EditMessage::new()
-        .content(format!(
-            "🗳️ **Poll #{} encerrada: {}**\n{}",
-            poll.id, poll.question, results
-        ))
-        .allowed_mentions(CreateAllowedMentions::new())
-        .components(Vec::new())
-}
-
 async fn finish_poll(
     http: &serenity::http::Http,
     store: &Store,
@@ -11415,13 +11369,14 @@ async fn finish_poll(
         .ok()
         .filter(|id| *id != 0)
         .ok_or_else(|| anyhow::anyhow!("poll channel is invalid"))?;
-    ChannelId::new(channel)
-        .edit_message(
-            http,
-            MessageId::new(message_id),
-            poll_result_message(&poll, &counts),
-        )
-        .await?;
+    poll_display::publish(
+        http,
+        ChannelId::new(channel),
+        Some(MessageId::new(message_id)),
+        &poll,
+        Some(&counts),
+    )
+    .await?;
     Ok(true)
 }
 
@@ -13156,20 +13111,6 @@ mod tests {
             );
             assert!(store.poll(poll).unwrap().unwrap().closed);
             assert_eq!(store.due_scheduled_actions(0, 1).unwrap().len(), 1);
-        }
-    }
-
-    #[test]
-    fn poll_panels_and_results_do_not_expand_user_supplied_mentions() {
-        let options = ["@everyone".into(), "<@&123>".into()];
-        let store = helper_store::Store::open(":memory:").unwrap();
-        let id = store.create_poll("g", "10", "<@456>", &options, 0).unwrap();
-        let poll = store.poll(id).unwrap().unwrap();
-        let panel = serde_json::to_value(super::poll_open_message(id, &poll.question, &options, 0))
-            .unwrap();
-        let result = serde_json::to_value(super::poll_result_message(&poll, &[1, 2])).unwrap();
-        for message in [panel, result] {
-            assert_eq!(message["allowed_mentions"]["parse"], serde_json::json!([]));
         }
     }
 
