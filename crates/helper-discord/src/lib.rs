@@ -9130,17 +9130,7 @@ impl Handler {
                 .store
                 .get_setting(&guild_id.to_string(), &panel_key)?
                 .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
-            let panel_roles = panel
-                .as_ref()
-                .and_then(|value| value.get("role_ids"))
-                .and_then(serde_json::Value::as_array)
-                .map(|roles| {
-                    roles
-                        .iter()
-                        .filter_map(serde_json::Value::as_u64)
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
+            let panel_roles = stored_role_panel_role_ids(panel.as_ref());
             if !panel_roles.contains(&role_id.get()) {
                 return respond_component(ctx, component, "This role panel is no longer valid.")
                     .await;
@@ -13059,8 +13049,78 @@ fn approved_wallet_contract(value: &str) -> bool {
             })
 }
 
+fn stored_role_panel_role_ids(panel: Option<&serde_json::Value>) -> Vec<u64> {
+    let Some(roles) = panel
+        .and_then(|value| value.get("role_ids"))
+        .and_then(serde_json::Value::as_array)
+    else {
+        return Vec::new();
+    };
+    let mut ids = Vec::new();
+    for value in roles {
+        // A API guarda IDs como texto; painéis antigos dos comandos usam
+        // números. Ambos os formatos identificam os mesmos cargos Discord.
+        let id = value.as_u64().or_else(|| {
+            let raw = value.as_str()?;
+            (!raw.is_empty() && raw.len() <= 20 && raw.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| raw.parse::<u64>().ok())
+                .flatten()
+        });
+        if let Some(id) = id.filter(|id| *id != 0)
+            && !ids.contains(&id)
+        {
+            ids.push(id);
+        }
+    }
+    ids
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn stored_role_panel_ids_accept_api_strings_and_legacy_numbers() {
+        for value in [
+            serde_json::json!({"role_ids":["1561352308594577429"]}),
+            serde_json::json!({"role_ids":[1561352308594577429u64]}),
+        ] {
+            let ids = super::stored_role_panel_role_ids(Some(&value));
+            assert_eq!(ids, vec![1561352308594577429]);
+            let assigned = helper_core::evaluate_role_panel(&helper_core::RolePanelObservation {
+                panel_role_ids: ids.clone(),
+                selected_role_ids: vec![],
+                clicked_role_id: ids[0],
+                selection_mode: "multiple".into(),
+                remove_on_unselect: true,
+            });
+            assert!(assigned.allowed && assigned.assign_clicked);
+            let removed = helper_core::evaluate_role_panel(&helper_core::RolePanelObservation {
+                panel_role_ids: ids.clone(),
+                selected_role_ids: ids.clone(),
+                clicked_role_id: ids[0],
+                selection_mode: "multiple".into(),
+                remove_on_unselect: true,
+            });
+            assert!(removed.allowed && !removed.assign_clicked);
+            assert_eq!(removed.remove_role_ids, ids);
+        }
+    }
+    #[test]
+    fn stored_role_panel_ids_ignore_invalid_and_duplicate_values() {
+        let value = serde_json::json!({"role_ids":["20",20,"30",30,"0",0,"",true,null,-1,1.5,"18446744073709551616","abc"]});
+        assert_eq!(
+            super::stored_role_panel_role_ids(Some(&value)),
+            vec![20, 30]
+        );
+        for value in [
+            serde_json::json!({}),
+            serde_json::json!({"role_ids":"20"}),
+            serde_json::Value::Null,
+        ] {
+            assert!(super::stored_role_panel_role_ids(Some(&value)).is_empty());
+        }
+        assert!(super::stored_role_panel_role_ids(None).is_empty());
+    }
     #[tokio::test]
     async fn failed_quarantine_restore_keeps_pending_roles_for_retry() {
         let store = helper_store::Store::open(":memory:").unwrap();
