@@ -2,6 +2,7 @@
 
 #![recursion_limit = "256"]
 
+mod discord_read;
 mod starboard_channel;
 mod ticket_panel;
 
@@ -5037,20 +5038,7 @@ async fn discord_json(
     auth: &str,
     path: &str,
 ) -> Result<serde_json::Value, String> {
-    let response = client
-        .get(format!("{DISCORD_API_BASE}{path}"))
-        .header(header::AUTHORIZATION, auth)
-        .send()
-        .await
-        .map_err(|_| "discord_request_failed".to_string())?;
-    let status = response.status();
-    if !status.is_success() {
-        return Err(format!("discord_http_{}", status.as_u16()));
-    }
-    response
-        .json::<serde_json::Value>()
-        .await
-        .map_err(|_| "discord_invalid_response".to_string())
+    discord_read::get_json(client, auth, &format!("{DISCORD_API_BASE}{path}")).await
 }
 
 async fn discord_send_channel_message(
