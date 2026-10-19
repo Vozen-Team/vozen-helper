@@ -8209,9 +8209,8 @@ impl FeatureAdapter for LevelsAdapter {
             return Vec::new();
         };
         let mut pairs = Vec::new();
-        // Keep the legacy setting compatible without allowing an old client
-        // or restored revision to disable the mandatory level-up card.
-        pairs.push(("community.levels.banner_enabled".into(), "true".into()));
+        // bannerEnabled is retained in the config for old clients, but is no
+        // longer projected: Discord always includes the level-up card.
         if let Some(card) = object.get("rankCard") {
             pairs.push(("community.rank_card".into(), card.to_string()));
         }
@@ -13209,9 +13208,10 @@ mod tests {
             serde_json::json!({"bannerEnabled": true}),
         ] {
             assert!(
-                levels
+                !levels
                     .runtime_projection(&config)
-                    .contains(&("community.levels.banner_enabled".into(), "true".into()))
+                    .iter()
+                    .any(|(key, _)| key == "community.levels.banner_enabled")
             );
         }
     }

@@ -12828,7 +12828,7 @@ mod tests {
                 .get_setting("guild-a", "community.levels.banner_enabled")
                 .unwrap()
                 .as_deref(),
-            Some("true")
+            None
         );
         assert!(
             store
@@ -12880,7 +12880,7 @@ mod tests {
                 .get_setting("guild-a", "community.levels.banner_enabled")
                 .unwrap()
                 .as_deref(),
-            Some("true")
+            None
         );
         assert!(
             store
