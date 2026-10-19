@@ -7986,7 +7986,6 @@ impl FeatureAdapter for LevelsAdapter {
                     "title": "XP progression",
                     "description": "Tune message XP and level-up announcements.",
                     "fields": [
-                        {"key":"bannerEnabled","label":"Show a card when a member levels up","kind":"toggle","help":"The default card is free. Background images and customization require Premium."},
                         {"key":"xpMin","label":"Minimum XP per message","kind":"number","min":1,"max":1000},
                         {"key":"xpMax","label":"Maximum XP per message","kind":"number","min":1,"max":2000},
                         {"key":"cooldownSeconds","label":"XP cooldown (seconds)","kind":"number","min":0,"max":3600},
@@ -8001,7 +8000,7 @@ impl FeatureAdapter for LevelsAdapter {
                 }]
             }),
             defaults: serde_json::json!({
-                "bannerEnabled": false,
+                "bannerEnabled": true,
                 "xpMin": 15,
                 "xpMax": 30,
                 "cooldownSeconds": 60,
@@ -8013,7 +8012,12 @@ impl FeatureAdapter for LevelsAdapter {
                 "announceChannel": "",
                 "announceTemplate": "{member} reached level {level}!"
             }),
-            dependencies: vec!["message_content_intent".into(), "send_messages".into()],
+            dependencies: vec![
+                "message_content_intent".into(),
+                "send_messages".into(),
+                "embed_links".into(),
+                "attach_files".into(),
+            ],
         }
     }
 
@@ -8205,12 +8209,9 @@ impl FeatureAdapter for LevelsAdapter {
             return Vec::new();
         };
         let mut pairs = Vec::new();
-        if let Some(value) = object
-            .get("bannerEnabled")
-            .and_then(serde_json::Value::as_bool)
-        {
-            pairs.push(("community.levels.banner_enabled".into(), value.to_string()));
-        }
+        // Keep the legacy setting compatible without allowing an old client
+        // or restored revision to disable the mandatory level-up card.
+        pairs.push(("community.levels.banner_enabled".into(), "true".into()));
         if let Some(card) = object.get("rankCard") {
             pairs.push(("community.rank_card".into(), card.to_string()));
         }
@@ -13193,6 +13194,26 @@ mod tests {
         assert!(invalid[0].contains("invalid_date"));
         assert!(evaluate_birthday(&config, "42", 2, 29).allowed);
         assert!(!evaluate_birthday(&config, "42", 2, 31).allowed);
+    }
+
+    #[test]
+    fn level_banners_are_mandatory_even_for_legacy_disabled_configs() {
+        let levels = feature_adapter("community.levels").unwrap();
+        let descriptor = levels.descriptor();
+        assert_eq!(descriptor.defaults["bannerEnabled"], true);
+        assert!(!descriptor.schema.to_string().contains("bannerEnabled"));
+        assert!(descriptor.dependencies.contains(&"embed_links".into()));
+        for config in [
+            serde_json::json!({}),
+            serde_json::json!({"bannerEnabled": false}),
+            serde_json::json!({"bannerEnabled": true}),
+        ] {
+            assert!(
+                levels
+                    .runtime_projection(&config)
+                    .contains(&("community.levels.banner_enabled".into(), "true".into()))
+            );
+        }
     }
 
     #[test]

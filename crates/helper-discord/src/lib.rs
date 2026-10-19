@@ -3486,12 +3486,9 @@ impl EventHandler for Handler {
                                 CreateMessage::new().content(&text).allowed_mentions(
                                     CreateAllowedMentions::new().users([message.author.id]),
                                 );
-                            if setting_bool(
-                                &self.store,
-                                &guild_text,
-                                "community.levels.banner_enabled",
-                                false,
-                            ) {
+                            // Cards are mandatory, including for existing guilds
+                            // whose legacy banner_enabled setting is false.
+                            {
                                 let premium = matches!(
                                     self.effective_plan(&user_text, Some(&guild_text)).await,
                                     Plan::Premium { .. }

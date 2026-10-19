@@ -5742,7 +5742,7 @@ async fn generic_feature_preflight(
     if key == "community.levels" && request.config.get("rankCard").is_some() {
         require_feature_premium(&state, &claims, "studio.rank_card").await?;
     }
-    let mut descriptor = feature_adapter(&key).map(|adapter| adapter.descriptor());
+    let descriptor = feature_adapter(&key).map(|adapter| adapter.descriptor());
     if key == "community.levels"
         && let Some(card) = request.config.get("rankCard")
     {
@@ -5751,19 +5751,6 @@ async fn generic_feature_preflight(
         if !valid_rank_card_config(&card) {
             return Err(client_error(StatusCode::BAD_REQUEST, "invalid_rank_card"));
         }
-    }
-    if key == "community.levels"
-        && request.enabled
-        && request
-            .config
-            .get("bannerEnabled")
-            .and_then(serde_json::Value::as_bool)
-            == Some(true)
-        && let Some(adapter) = descriptor.as_mut()
-    {
-        adapter
-            .dependencies
-            .extend(["attach_files".into(), "embed_links".into()]);
     }
     // Disabling a feature must not require a complete replacement config. A
     // historical revision may intentionally contain `{}` (or a provider
@@ -8855,7 +8842,7 @@ async fn feature_detail(
         })
         .unwrap_or_else(|| serde_json::json!({}));
     let maturity = effective_feature_maturity(&state, &key);
-    let config = if key == "support.welcome" {
+    let mut config = if key == "support.welcome" {
         state
             .store
             .welcome_configuration(&claims.guild_id)
@@ -8864,6 +8851,11 @@ async fn feature_detail(
     } else {
         config
     };
+    if key == "community.levels"
+        && let Some(config) = config.as_object_mut()
+    {
+        config.insert("bannerEnabled".into(), serde_json::Value::Bool(true));
+    }
     let mut issues = validate_feature_config(&key, &config);
     issues.extend(lifecycle_issues(&key, maturity));
     let revision = stored.as_ref().map(|value| value.revision).unwrap_or(0);
@@ -9034,9 +9026,14 @@ async fn update_feature_detail(
     State(state): State<Arc<ApiState>>,
     headers: HeaderMap,
     Path(key): Path<String>,
-    Json(update): Json<FeatureDetailUpdate>,
+    Json(mut update): Json<FeatureDetailUpdate>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
     let claims = require_mutation_auth(&state, &headers)?;
+    if key == "community.levels"
+        && let Some(config) = update.config.as_object_mut()
+    {
+        config.insert("bannerEnabled".into(), serde_json::Value::Bool(true));
+    }
     let _ticket_save_guard = if key == "support.tickets" {
         Some(TICKET_PANEL_SAVE_LOCK.lock().await)
     } else {
@@ -12805,8 +12802,8 @@ mod tests {
             background_preset: Some("neon-rain".into()),
             ..Default::default()
         };
-        // Free servers can save the default card toggle without supplying any
-        // custom style. The same endpoint must still reject custom card data.
+        // Old clients cannot turn mandatory cards off. Free servers still
+        // cannot save custom styles, even alongside a legacy disabled flag.
         let response = router(state(store.clone()))
             .oneshot(
                 Request::builder()
@@ -12815,13 +12812,24 @@ mod tests {
                     .header(header::AUTHORIZATION, format!("Bearer {token}"))
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
-                        r#"{"enabled":false,"config":{"bannerEnabled":true}}"#,
+                        r#"{"enabled":false,"config":{"bannerEnabled":false}}"#,
                     ))
                     .unwrap(),
             )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 1_000_000).await.unwrap())
+                .unwrap();
+        assert_eq!(body["config"]["bannerEnabled"], true);
+        assert_eq!(
+            store
+                .get_setting("guild-a", "community.levels.banner_enabled")
+                .unwrap()
+                .as_deref(),
+            Some("true")
+        );
         assert!(
             store
                 .get_setting("guild-a", "community.rank_card")
