@@ -209,9 +209,58 @@ pub async fn image(
     .flatten()
 }
 
+pub fn level_up_message(
+    png: Option<Vec<u8>>,
+    text: &str,
+    member: serenity::all::UserId,
+) -> serenity::all::CreateMessage {
+    use serenity::all::{CreateAllowedMentions, CreateAttachment, CreateMessage};
+    let message =
+        CreateMessage::new().allowed_mentions(CreateAllowedMentions::new().users([member]));
+    match png {
+        Some(bytes) => message.add_file(
+            CreateAttachment::bytes(bytes, "level-up-banner.png")
+                .description(text.chars().take(1000).collect::<String>()),
+        ),
+        None => message.content(text),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn level_up_sends_only_the_card_or_a_text_fallback() {
+        let card = serde_json::to_value(level_up_message(
+            Some(vec![1, 2, 3]),
+            "Member reached level 15!",
+            serenity::all::UserId::new(42),
+        ))
+        .unwrap();
+        assert!(card.get("content").is_none_or(|value| value.is_null()));
+        assert!(
+            card.get("embeds")
+                .is_none_or(|value| value.as_array().is_some_and(Vec::is_empty))
+        );
+        assert_eq!(card["attachments"][0]["filename"], "level-up-banner.png");
+        let fallback = serde_json::to_value(level_up_message(
+            None,
+            "Member reached level 15!",
+            serenity::all::UserId::new(42),
+        ))
+        .unwrap();
+        assert_eq!(fallback["content"], "Member reached level 15!");
+        assert!(
+            fallback
+                .get("embeds")
+                .is_none_or(|value| value.as_array().is_some_and(Vec::is_empty))
+        );
+        assert_eq!(
+            fallback["allowed_mentions"]["users"],
+            serde_json::json!(["42"])
+        );
+    }
 
     #[test]
     fn default_banner_is_a_readable_png_without_a_premium_background() {

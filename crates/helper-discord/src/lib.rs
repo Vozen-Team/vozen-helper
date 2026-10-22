@@ -3482,13 +3482,9 @@ impl EventHandler for Handler {
                             )
                             .map(ChannelId::new)
                             .unwrap_or(message.channel_id);
-                            let mut announcement =
-                                CreateMessage::new().content(&text).allowed_mentions(
-                                    CreateAllowedMentions::new().users([message.author.id]),
-                                );
                             // Cards are mandatory, including for existing guilds
                             // whose legacy banner_enabled setting is false.
-                            {
+                            let announcement = {
                                 let premium = matches!(
                                     self.effective_plan(&user_text, Some(&guild_text)).await,
                                     Plan::Premium { .. }
@@ -3500,20 +3496,7 @@ impl EventHandler for Handler {
                                         .flatten(),
                                     premium,
                                 );
-                                let colour = u32::from_str_radix(
-                                    card.primary_color.trim_start_matches('#'),
-                                    16,
-                                )
-                                .unwrap_or(0x8EE5D2);
-                                let mut embed = CreateEmbed::new()
-                                    .title(format!(
-                                        "{} · Level {}",
-                                        message.author.name, after_level
-                                    ))
-                                    .description(format!("{} XP", after))
-                                    .thumbnail(message.author.face())
-                                    .colour(Colour::new(colour));
-                                if let Some(bytes) = rank_card::image(
+                                let png = rank_card::image(
                                     card,
                                     &message.author,
                                     self.store
@@ -3523,18 +3506,12 @@ impl EventHandler for Handler {
                                     after_level,
                                     after,
                                 )
-                                .await
-                                {
-                                    announcement = announcement.add_file(CreateAttachment::bytes(
-                                        bytes,
-                                        "level-up-banner.png",
-                                    ));
-                                    embed = embed.image("attachment://level-up-banner.png");
-                                } else {
+                                .await;
+                                if png.is_none() {
                                     warn!(%guild_id, "failed to render level-up banner; sending text fallback");
                                 }
-                                announcement = announcement.embed(embed);
-                            }
+                                rank_card::level_up_message(png, &text, message.author.id)
+                            };
                             if let Err(error) = channel.send_message(&ctx.http, announcement).await
                             {
                                 warn!(%guild_id, %error, "failed to send level-up announcement");
