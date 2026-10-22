@@ -31,7 +31,7 @@ fn font_family(font: &str) -> &'static str {
         "poppins" => "Poppins, Arial, sans-serif",
         "space_grotesk" => "'Space Grotesk', Arial, sans-serif",
         "lexend" => "Lexend, Arial, sans-serif",
-        _ => "system-ui, -apple-system, Segoe UI, sans-serif",
+        _ => "sans-serif",
     }
 }
 
@@ -160,9 +160,119 @@ pub fn config_for_plan(raw: Option<String>, premium: bool) -> RankCardConfig {
     }
 }
 
+pub fn render_png(
+    config: &RankCardConfig,
+    username: &str,
+    avatar: Option<(&str, &[u8])>,
+    rank: Option<u64>,
+    level: i64,
+    xp: i64,
+) -> Option<Vec<u8>> {
+    let avatar = avatar
+        .filter(|(mime, bytes)| {
+            matches!(*mime, "image/png" | "image/jpeg" | "image/webp") && bytes.len() <= 256 * 1024
+        })
+        .map(|(mime, bytes)| format!("data:{mime};base64,{}", STANDARD.encode(bytes)));
+    super::suggestion_card::rasterize(&render_rank_card(
+        config,
+        username,
+        avatar.as_deref(),
+        rank,
+        level,
+        xp,
+    ))
+}
+
+pub async fn image(
+    config: RankCardConfig,
+    user: &serenity::all::User,
+    rank: Option<u64>,
+    level: i64,
+    xp: i64,
+) -> Option<Vec<u8>> {
+    let avatar = super::starboard_display::avatar(user).await;
+    let name = user.global_name.as_deref().unwrap_or(&user.name).to_owned();
+    tokio::task::spawn_blocking(move || {
+        render_png(
+            &config,
+            &name,
+            avatar
+                .as_ref()
+                .map(|(mime, bytes)| (mime.as_str(), bytes.as_slice())),
+            rank,
+            level,
+            xp,
+        )
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_banner_is_a_readable_png_without_a_premium_background() {
+        let mut avatar = resvg::tiny_skia::Pixmap::new(32, 32).unwrap();
+        avatar.fill(resvg::tiny_skia::Color::from_rgba8(220, 40, 80, 255));
+        let bytes = avatar.encode_png().unwrap();
+        let png = render_png(
+            &RankCardConfig::default(),
+            "Member & friend",
+            Some(("image/png", &bytes)),
+            Some(2),
+            14,
+            1311,
+        )
+        .unwrap();
+        let pixels = resvg::tiny_skia::Pixmap::decode_png(&png).unwrap();
+        assert_eq!((pixels.width(), pixels.height()), (900, 300));
+        let pixel = |x: usize, y: usize| &pixels.data()[(y * 900 + x) * 4..(y * 900 + x + 1) * 4];
+        assert_eq!(
+            pixel(150, 150),
+            &[220, 40, 80, 255],
+            "avatar must be embedded in the PNG"
+        );
+        let text_pixels = (40..75)
+            .flat_map(|y| (285..700).map(move |x| (x, y)))
+            .filter(|&(x, y)| {
+                let color = pixel(x, y);
+                color[0] > 200 && color[1] > 200 && color[2] > 200
+            })
+            .count();
+        assert!(
+            text_pixels > 100,
+            "member name must rasterize, not merely exist in SVG"
+        );
+        if let Ok(path) = std::env::var("HELPER_LEVEL_CARD_PREVIEW") {
+            std::fs::write(path, &png).unwrap();
+        }
+    }
+
+    #[test]
+    fn premium_background_still_renders_as_a_complete_card() {
+        let config = RankCardConfig {
+            background_preset: Some("aurora-lake".into()),
+            ..Default::default()
+        };
+        let default =
+            render_png(&RankCardConfig::default(), "Member", None, None, 14, 1311).unwrap();
+        let premium = render_png(&config, "Member", None, None, 14, 1311).unwrap();
+        assert_ne!(default, premium);
+        assert!(
+            render_png(
+                &config,
+                "Member",
+                Some(("image/svg+xml", b"untrusted")),
+                None,
+                14,
+                1311
+            )
+            .is_some()
+        );
+    }
 
     #[test]
     fn free_card_ignores_saved_premium_customization() {

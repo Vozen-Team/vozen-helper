@@ -34,7 +34,14 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Test workspace
+        env:
+          HELPER_LEVEL_CARD_PREVIEW: ${{ github.workspace }}/level-up-default.png
         run: cargo test --workspace
+      - uses: actions/upload-artifact@v4
+        with:
+          name: level-up-preview-${{ github.sha }}
+          path: level-up-default.png
+          if-no-files-found: error
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Build release

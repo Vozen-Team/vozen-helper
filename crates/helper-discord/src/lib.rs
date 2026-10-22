@@ -3513,16 +3513,25 @@ impl EventHandler for Handler {
                                     .description(format!("{} XP", after))
                                     .thumbnail(message.author.face())
                                     .colour(Colour::new(colour));
-                                if let Some(bytes) = card
-                                    .background_preset
-                                    .as_deref()
-                                    .and_then(rank_card::preset_png)
+                                if let Some(bytes) = rank_card::image(
+                                    card,
+                                    &message.author,
+                                    self.store
+                                        .level_rank(&guild_text, &user_text)
+                                        .ok()
+                                        .flatten(),
+                                    after_level,
+                                    after,
+                                )
+                                .await
                                 {
                                     announcement = announcement.add_file(CreateAttachment::bytes(
                                         bytes,
                                         "level-up-banner.png",
                                     ));
                                     embed = embed.image("attachment://level-up-banner.png");
+                                } else {
+                                    warn!(%guild_id, "failed to render level-up banner; sending text fallback");
                                 }
                                 announcement = announcement.embed(embed);
                             }
@@ -5958,18 +5967,15 @@ impl Handler {
             self.store.get_setting(&guild_text, "community.rank_card")?,
             premium,
         );
-        let avatar_url = profile.face();
-        let svg =
-            rank_card::render_rank_card(&config, &profile.name, Some(&avatar_url), rank, level, xp);
-        command
-            .edit_response(
-                ctx,
-                EditInteractionResponse::new()
-                    .content(format!("{} · level {} · {} XP", profile.name, level, xp))
-                    .allowed_mentions(CreateAllowedMentions::new())
-                    .new_attachment(CreateAttachment::bytes(svg.into_bytes(), "rank-card.svg")),
-            )
-            .await?;
+        let mut response = EditInteractionResponse::new()
+            .content(format!("{} · level {} · {} XP", profile.name, level, xp))
+            .allowed_mentions(CreateAllowedMentions::new());
+        if let Some(png) = rank_card::image(config, &profile, rank, level, xp).await {
+            response = response.new_attachment(CreateAttachment::bytes(png, "rank-card.png"));
+        } else {
+            warn!(%guild_id, "failed to render rank card; sending text fallback");
+        }
+        command.edit_response(ctx, response).await?;
         Ok(())
     }
 
