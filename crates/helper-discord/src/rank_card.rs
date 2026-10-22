@@ -215,14 +215,15 @@ pub fn level_up_message(
     member: serenity::all::UserId,
 ) -> serenity::all::CreateMessage {
     use serenity::all::{CreateAllowedMentions, CreateAttachment, CreateMessage};
-    let message =
-        CreateMessage::new().allowed_mentions(CreateAllowedMentions::new().users([member]));
+    let message = CreateMessage::new()
+        .content(text)
+        .allowed_mentions(CreateAllowedMentions::new().users([member]));
     match png {
         Some(bytes) => message.add_file(
             CreateAttachment::bytes(bytes, "level-up-banner.png")
                 .description(text.chars().take(1000).collect::<String>()),
         ),
-        None => message.content(text),
+        None => message,
     }
 }
 
@@ -231,14 +232,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn level_up_sends_only_the_card_or_a_text_fallback() {
+    fn level_up_keeps_the_message_above_the_card_without_an_embed() {
         let card = serde_json::to_value(level_up_message(
             Some(vec![1, 2, 3]),
             "Member reached level 15!",
             serenity::all::UserId::new(42),
         ))
         .unwrap();
-        assert!(card.get("content").is_none_or(|value| value.is_null()));
+        assert_eq!(card["content"], "Member reached level 15!");
         assert!(
             card.get("embeds")
                 .is_none_or(|value| value.as_array().is_some_and(Vec::is_empty))
