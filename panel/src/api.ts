@@ -65,6 +65,7 @@ export type WorkflowRecord = {
 export type LeaderboardEntry = {
   rank: number;
   userId: string;
+  displayName?: string;
   xp: number;
 };
 export type ReminderRecord = {

@@ -10165,6 +10165,60 @@ async fn stats(
     })))
 }
 
+async fn leaderboard_member_names(
+    base: &str,
+    token: &str,
+    guild_id: &str,
+    entries: &[LeaderboardEntry],
+) -> BTreeMap<String, String> {
+    let mut names = BTreeMap::new();
+    let Some(guild_id) = guild_id.parse::<u64>().ok().filter(|id| *id > 0) else {
+        return names;
+    };
+    let Ok(client) = Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+    else {
+        return names;
+    };
+    let permits = Arc::new(tokio::sync::Semaphore::new(8));
+    let mut tasks = tokio::task::JoinSet::new();
+    for entry in entries.iter().filter(|entry| !entry.opted_out).take(100) {
+        let Some(id) = entry.user_id.parse::<u64>().ok().filter(|id| *id > 0) else {
+            continue;
+        };
+        let user_id = entry.user_id.clone();
+        let url = format!("{base}/guilds/{guild_id}/members/{id}");
+        let auth = format!("Bot {token}");
+        let client = client.clone();
+        let permits = permits.clone();
+        tasks.spawn(async move {
+            let _permit = permits.acquire_owned().await.ok()?;
+            let member = discord_read::get_json(&client, &auth, &url).await.ok()?;
+            [
+                member.get("nick"),
+                member.pointer("/user/global_name"),
+                member.pointer("/user/username"),
+            ]
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .map(str::trim)
+            .find(|name| !name.is_empty())
+            .map(|name| (user_id, name.chars().take(80).collect::<String>()))
+        });
+    }
+    // Missing members or a slow Discord API must not hide the saved XP ranking.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(4);
+    while let Ok(Some(result)) = tokio::time::timeout_at(deadline, tasks.join_next()).await {
+        if let Ok(Some((id, name))) = result {
+            names.insert(id, name);
+        }
+    }
+    names
+}
+
 async fn leaderboard(
     State(state): State<Arc<ApiState>>,
     headers: HeaderMap,
@@ -10202,9 +10256,26 @@ async fn leaderboard(
         }
     }
     let decision = evaluate_leaderboard(&policy, entries);
-    let entries: Vec<_> = decision.entries.into_iter().enumerate().map(|(index, entry)| {
-        serde_json::json!({"userId": entry.user_id, "xp": entry.xp, "rank": index + 1})
-    }).collect();
+    let names = leaderboard_member_names(
+        DISCORD_API_BASE,
+        &state.discord_token,
+        &claims.guild_id,
+        &decision.entries,
+    )
+    .await;
+    let entries: Vec<_> = decision
+        .entries
+        .into_iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            let mut value =
+                serde_json::json!({"userId": entry.user_id, "xp": entry.xp, "rank": index + 1});
+            if let Some(name) = names.get(&entry.user_id) {
+                value["displayName"] = serde_json::json!(name);
+            }
+            value
+        })
+        .collect();
     Ok(Json(serde_json::json!({
         "guildId": claims.guild_id, "enabled": enabled, "public": decision.public,
         "maxEntries": policy.max_entries, "entries": entries,
@@ -13120,6 +13191,89 @@ mod tests {
                     .iter()
                     .any(|effect| { effect.as_str().is_some_and(|text| text.contains("delete")) }))
         );
+    }
+
+    #[tokio::test]
+    async fn leaderboard_member_names_prefer_nick_then_global_then_username() {
+        use std::sync::Mutex;
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let received = calls.clone();
+        let app = Router::new().route("/guilds/{guild}/members/{user}", get(
+            move |Path((guild, user)): Path<(String, String)>, headers: HeaderMap| {
+                let received = received.clone();
+                async move {
+                    assert_eq!(headers[header::AUTHORIZATION], "Bot fixture-token");
+                    received.lock().unwrap().push((guild, user.clone()));
+                    let body = match user.as_str() {
+                        "1" => serde_json::json!({"nick":"Nome no servidor", "user":{"global_name":"Global", "username":"login"}}),
+                        "2" => serde_json::json!({"nick":"  ", "user":{"global_name":"Nome global", "username":"login"}}),
+                        "3" => serde_json::json!({"user":{"global_name":null, "username":"utilizador"}}),
+                        "5" => serde_json::json!({"nick":null, "user":{"global_name":42, "username":"  "}}),
+                        "6" => serde_json::json!({"nick":"x".repeat(120)}),
+                        _ => return (StatusCode::NOT_FOUND, Json(serde_json::json!({}))),
+                    };
+                    (StatusCode::OK, Json(body))
+                }
+            }
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut entries = ["1", "2", "3", "4", "5", "6", "../invalid"]
+            .map(|id| LeaderboardEntry {
+                user_id: id.into(),
+                xp: 42,
+                opted_out: false,
+            })
+            .to_vec();
+        entries.push(LeaderboardEntry {
+            user_id: "7".into(),
+            xp: 999,
+            opted_out: true,
+        });
+        let names = leaderboard_member_names(&base, "fixture-token", "10", &entries).await;
+        assert_eq!(
+            names,
+            BTreeMap::from([
+                ("1".into(), "Nome no servidor".into()),
+                ("2".into(), "Nome global".into()),
+                ("3".into(), "utilizador".into()),
+                ("6".into(), "x".repeat(80)),
+            ])
+        );
+        assert_eq!(calls.lock().unwrap().len(), 6);
+        assert!(calls.lock().unwrap().iter().all(|(guild, _)| guild == "10"));
+        assert!(
+            leaderboard_member_names(&base, "fixture-token", "../invalid", &entries)
+                .await
+                .is_empty()
+        );
+        assert_eq!(calls.lock().unwrap().len(), 6);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn leaderboard_member_names_stop_waiting_for_a_slow_discord() {
+        let app = Router::new().fallback(get(|| async {
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            Json(serde_json::json!({"nick":"Too late"}))
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let entries = vec![LeaderboardEntry {
+            user_id: "1".into(),
+            xp: 42,
+            opted_out: false,
+        }];
+        let names = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            leaderboard_member_names(&base, "fixture-token", "10", &entries),
+        )
+        .await
+        .unwrap();
+        assert!(names.is_empty());
+        server.abort();
     }
 
     #[tokio::test]

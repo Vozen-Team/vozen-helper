@@ -4875,7 +4875,7 @@ function LeaderboardPreview({
             <div className="template-row" key={`${entry.userId}-${entry.rank}`}>
               <div>
                 <b>
-                  #{entry.rank} · {entry.userId}
+                  #{entry.rank} · {entry.displayName || entry.userId}
                 </b>
                 <small>{entry.xp.toLocaleString()} XP</small>
               </div>
