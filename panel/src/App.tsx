@@ -4864,7 +4864,7 @@ function LeaderboardPreview({
           {error}
         </p>
       )}
-      {!loading && enabled && entries.length === 0 && (
+      {!loading && !error && enabled && entries.length === 0 && (
         <p className="tip">
           No eligible XP data yet. Members can opt out with <code>/leaderboard-privacy</code>.
         </p>

@@ -25,8 +25,9 @@ use helper_contracts::{
 };
 use helper_core::{
     Capability, FEATURE_SCHEMA_VERSION, LeaderboardEntry, ReminderObservation,
-    anti_spam_policy_from_json, evaluate_anti_spam, evaluate_reminder, feature_adapter,
-    feature_maturity, is_known_feature, quota_limit, reminder_policy_from_json,
+    anti_spam_policy_from_json, evaluate_anti_spam, evaluate_leaderboard, evaluate_reminder,
+    feature_adapter, feature_maturity, is_known_feature, leaderboard_policy_from_json, quota_limit,
+    reminder_policy_from_json,
 };
 use helper_modules::{
     BlueskyClient, CoinGeckoClient, EntitlementClient, EthereumRpcClient, GasClient,
@@ -255,6 +256,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/activity", get(activity))
         .route("/api/tickets", get(tickets))
         .route("/api/stats", get(stats))
+        .route("/api/leaderboard", get(leaderboard))
         .route("/api/quotas", get(quotas))
         .route(
             "/api/premium/server",
@@ -10163,6 +10165,52 @@ async fn stats(
     })))
 }
 
+async fn leaderboard(
+    State(state): State<Arc<ApiState>>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
+    let claims = require_auth(&state, &headers)?;
+    let setting = |key: &str| {
+        state
+            .store
+            .get_setting(&claims.guild_id, key)
+            .map_err(|_| client_error(StatusCode::INTERNAL_SERVER_ERROR, "store_error"))
+    };
+    let policy = leaderboard_policy_from_json(&serde_json::json!({
+        "maxEntries": setting("community.leaderboard.max_entries")?
+            .and_then(|value| value.parse::<u64>().ok()).unwrap_or(10),
+        "public": setting("community.leaderboard.public")?
+            .and_then(|value| value.parse::<bool>().ok()).unwrap_or(true),
+    }));
+    let enabled = feature_enabled(&state, &claims.guild_id, "community.leaderboard");
+    let mut entries = Vec::new();
+    if enabled {
+        // Match the command's bounded input before applying privacy and ranking.
+        let rows = state
+            .store
+            .top_levels(&claims.guild_id, 100)
+            .map_err(|_| client_error(StatusCode::INTERNAL_SERVER_ERROR, "store_error"))?;
+        for row in rows {
+            let opted_out = setting(&format!("community.leaderboard.optout.{}", row.user_id))?
+                .and_then(|value| value.parse::<bool>().ok())
+                .unwrap_or(false);
+            entries.push(LeaderboardEntry {
+                user_id: row.user_id,
+                xp: row.xp,
+                opted_out,
+            });
+        }
+    }
+    let decision = evaluate_leaderboard(&policy, entries);
+    let entries: Vec<_> = decision.entries.into_iter().enumerate().map(|(index, entry)| {
+        serde_json::json!({"userId": entry.user_id, "xp": entry.xp, "rank": index + 1})
+    }).collect();
+    Ok(Json(serde_json::json!({
+        "guildId": claims.guild_id, "enabled": enabled, "public": decision.public,
+        "maxEntries": policy.max_entries, "entries": entries,
+    })))
+}
+
 async fn tickets(
     State(state): State<Arc<ApiState>>,
     headers: HeaderMap,
@@ -13071,6 +13119,97 @@ mod tests {
                 .is_some_and(|effects| effects
                     .iter()
                     .any(|effect| { effect.as_str().is_some_and(|text| text.contains("delete")) }))
+        );
+    }
+
+    #[tokio::test]
+    async fn leaderboard_preview_requires_a_valid_session() {
+        for credential in [None, Some("Bearer invalid")] {
+            let mut request = Request::builder().uri("/api/leaderboard");
+            if let Some(value) = credential {
+                request = request.header(header::AUTHORIZATION, value);
+            }
+            let response = router(state(Store::open(":memory:").unwrap()))
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+    }
+
+    #[tokio::test]
+    async fn leaderboard_preview_is_scoped_ranked_and_opt_out_aware() {
+        let store = Store::open(":memory:").unwrap();
+        store.add_xp("guild-a", "hidden", 999).unwrap();
+        store.add_xp("guild-a", "member-b", 42).unwrap();
+        store.add_xp("guild-a", "member-a", 42).unwrap();
+        store.add_xp("guild-a", "member-c", 10).unwrap();
+        store.add_xp("guild-b", "other-guild", 9999).unwrap();
+        for (key, value) in [
+            ("feature.community.leaderboard", "true"),
+            ("community.leaderboard.max_entries", "2"),
+            ("community.leaderboard.public", "false"),
+            ("community.leaderboard.optout.hidden", "true"),
+        ] {
+            store.set_setting("guild-a", key, value).unwrap();
+        }
+        let session = claims("guild-a");
+        store.save_session(&session).unwrap();
+        let token = sign_session(&session, "test-session-secret-with-at-least-32-bytes");
+        let response = router(state(store.clone()))
+            .oneshot(
+                Request::builder()
+                    .uri("/api/leaderboard?guildId=guild-b&limit=9999")
+                    .header(header::COOKIE, format!("vh_session={token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 1_000_000).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "guildId": "guild-a", "enabled": true, "public": false, "maxEntries": 2,
+                "entries": [
+                    {"userId": "member-a", "xp": 42, "rank": 1},
+                    {"userId": "member-b", "xp": 42, "rank": 2}
+                ]
+            })
+        );
+        assert_eq!(store.top_levels("guild-a", 1).unwrap()[0].xp, 999);
+    }
+
+    #[tokio::test]
+    async fn leaderboard_preview_defaults_and_disabled_state_are_explicit() {
+        let store = Store::open(":memory:").unwrap();
+        store.add_xp("guild-a", "member", 42).unwrap();
+        let session = claims("guild-a");
+        store.save_session(&session).unwrap();
+        let token = sign_session(&session, "test-session-secret-with-at-least-32-bytes");
+        let response = router(state(store))
+            .oneshot(
+                Request::builder()
+                    .uri("/api/leaderboard")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 1_000_000).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "guildId": "guild-a", "enabled": false, "public": true,
+                "maxEntries": 10, "entries": []
+            })
         );
     }
 
