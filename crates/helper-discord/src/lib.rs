@@ -57,6 +57,7 @@ use tracing::{info, warn};
 
 pub mod giveaway_card;
 mod giveaway_display;
+pub mod leaderboard_card;
 pub mod poll_card;
 mod poll_display;
 mod private_replies;
@@ -6780,15 +6781,7 @@ impl Handler {
                 if decision.entries.is_empty() {
                     "No eligible XP data yet.".to_string()
                 } else {
-                    decision
-                        .entries
-                        .into_iter()
-                        .enumerate()
-                        .map(|(index, row)| {
-                            format!("{}. <@{}> — {} XP", index + 1, row.user_id, row.xp)
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n")
+                    return leaderboard_card::send(ctx, command, decision.entries).await;
                 }
             }
             "achievements" => {
