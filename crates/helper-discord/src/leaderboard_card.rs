@@ -40,18 +40,49 @@ pub fn render(rows: &[Row], offset: usize) -> Option<Vec<u8>> {
     rasterize(&svg(rows, offset))
 }
 
+fn mention_caption(entries: &[helper_core::LeaderboardEntry]) -> String {
+    let mentions = entries
+        .iter()
+        .take(100)
+        .enumerate()
+        .filter_map(|(index, row)| {
+            row.user_id
+                .parse::<u64>()
+                .ok()
+                .filter(|id| *id > 0)
+                .map(|id| format!("**#{}** <@{id}>", index + 1))
+        })
+        .collect::<Vec<_>>();
+    mentions
+        .chunks(5)
+        .map(|row| row.join(" · "))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn response(
     pages: Option<Vec<Vec<u8>>>,
     labels: &[String],
+    caption: &str,
     fallback: &str,
 ) -> serenity::all::EditInteractionResponse {
-    use serenity::all::{CreateAllowedMentions, CreateAttachment, EditInteractionResponse};
+    use serenity::all::{
+        CreateAllowedMentions, CreateAttachment, CreateEmbed, EditInteractionResponse,
+    };
     let response = EditInteractionResponse::new().allowed_mentions(CreateAllowedMentions::new());
+    // A complete 100-member caption can exceed message content's 2000-character limit.
+    let response = if caption.chars().count() <= 2000 {
+        response.content(caption)
+    } else {
+        response
+            .content("")
+            .embed(CreateEmbed::new().colour(0x8EE5D2).description(caption))
+    };
     if let Some(pages) = pages {
         pages
             .into_iter()
             .enumerate()
-            .fold(response.content(""), |response, (index, png)| {
+            .fold(response, |response, (index, png)| {
                 response.new_attachment(
                     CreateAttachment::bytes(png, format!("leaderboard-{}.png", index + 1))
                         .description(labels[index].chars().take(1000).collect::<String>()),
@@ -60,12 +91,10 @@ fn response(
     } else if fallback.chars().count() <= 2000 {
         response.content(fallback)
     } else {
-        response
-            .content("/leaderboard")
-            .new_attachment(CreateAttachment::bytes(
-                fallback.as_bytes().to_vec(),
-                "leaderboard.txt",
-            ))
+        response.new_attachment(CreateAttachment::bytes(
+            fallback.as_bytes().to_vec(),
+            "leaderboard.txt",
+        ))
     }
 }
 
@@ -75,6 +104,7 @@ pub(super) async fn send(
     entries: Vec<helper_core::LeaderboardEntry>,
 ) -> anyhow::Result<()> {
     let entries = &entries[..entries.len().min(100)];
+    let caption = mention_caption(entries);
     let fallback = entries
         .iter()
         .enumerate()
@@ -138,7 +168,7 @@ pub(super) async fn send(
         tracing::warn!("leaderboard rendering failed; sending text fallback");
     }
     command
-        .edit_response(ctx, response(pages, &labels, &fallback))
+        .edit_response(ctx, response(pages, &labels, &caption, &fallback))
         .await?;
     Ok(())
 }
@@ -198,10 +228,11 @@ mod tests {
         let image = serde_json::to_value(response(
             Some(vec![vec![1], vec![2]]),
             &["#1 Member — 1620 XP".into(), "#11 Other".into()],
+            "**#1** <@123> · **#11** <@456>",
             "unused",
         ))
         .unwrap();
-        assert_eq!(image["content"], "");
+        assert_eq!(image["content"], "**#1** <@123> · **#11** <@456>");
         assert!(image.get("embeds").is_none());
         assert_eq!(image["attachments"].as_array().unwrap().len(), 2);
         assert_eq!(image["attachments"][0]["filename"], "leaderboard-1.png");
@@ -210,9 +241,64 @@ mod tests {
             "#1 Member — 1620 XP"
         );
         assert_eq!(image["allowed_mentions"]["parse"], serde_json::json!([]));
-        let fallback = serde_json::to_value(response(None, &[], "1. <@123> — 1620 XP")).unwrap();
+        let fallback =
+            serde_json::to_value(response(None, &[], "**#1** <@123>", "1. <@123> — 1620 XP"))
+                .unwrap();
         assert_eq!(fallback["content"], "1. <@123> — 1620 XP");
-        let long = serde_json::to_value(response(None, &[], &"a".repeat(2500))).unwrap();
+        let long =
+            serde_json::to_value(response(None, &[], "**#1** <@123>", &"a".repeat(2500))).unwrap();
+        assert_eq!(long["content"], "**#1** <@123>");
         assert_eq!(long["attachments"][0]["filename"], "leaderboard.txt");
+    }
+
+    #[test]
+    fn captions_keep_all_100_mentions_within_discord_limits_without_pings() {
+        let entries = (0..101)
+            .map(|i| helper_core::LeaderboardEntry {
+                user_id: (u64::MAX - i).to_string(),
+                xp: 1000 - i as i64,
+                opted_out: false,
+            })
+            .collect::<Vec<_>>();
+        let caption = mention_caption(&entries);
+        assert!(caption.chars().count() > 2000);
+        assert!(caption.chars().count() <= 4096);
+        assert!(caption.contains(&format!("**#100** <@{}>", u64::MAX - 99)));
+        assert!(!caption.contains(&format!("<@{}>", u64::MAX - 100)));
+        for png in [Some(vec![vec![1]]), None] {
+            let message =
+                serde_json::to_value(response(png, &["page".into()], &caption, &"a".repeat(2500)))
+                    .unwrap();
+            assert_eq!(message["content"], "");
+            assert_eq!(message["embeds"][0]["description"], caption);
+            assert_eq!(message["allowed_mentions"]["parse"], serde_json::json!([]));
+        }
+    }
+
+    #[test]
+    fn captions_only_include_the_opt_in_ranking_and_numeric_user_ids() {
+        let rows = vec![
+            helper_core::LeaderboardEntry {
+                user_id: "123".into(),
+                xp: 2000,
+                opted_out: true,
+            },
+            helper_core::LeaderboardEntry {
+                user_id: "456".into(),
+                xp: 1000,
+                opted_out: false,
+            },
+            helper_core::LeaderboardEntry {
+                user_id: "@everyone".into(),
+                xp: 0,
+                opted_out: false,
+            },
+        ];
+        let policy = helper_core::leaderboard_policy_from_json(
+            &serde_json::json!({"maxEntries":100,"public":false}),
+        );
+        let ranking = helper_core::evaluate_leaderboard(&policy, rows);
+        assert!(!ranking.public);
+        assert_eq!(mention_caption(&ranking.entries), "**#1** <@456>");
     }
 }
