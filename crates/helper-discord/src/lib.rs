@@ -5946,7 +5946,7 @@ impl Handler {
             premium,
         );
         let mut response = EditInteractionResponse::new()
-            .content(format!("{} · level {} · {} XP", profile.name, level, xp))
+            .content(format!("<@{user_id}> · level {level} · {xp} XP"))
             .allowed_mentions(CreateAllowedMentions::new());
         if let Some(png) = rank_card::image(config, &profile, rank, level, xp).await {
             response = response.new_attachment(CreateAttachment::bytes(png, "rank-card.png"));
