@@ -24,7 +24,13 @@ pub(super) fn medal_icon(id: &str) -> &'static str {
     }
 }
 
-pub fn svg(name: &str, avatar: Option<(&str, &[u8])>, rows: &[AchievementProgress]) -> String {
+pub fn svg(
+    name: &str,
+    guild: &str,
+    locale: &str,
+    avatar: Option<(&str, &[u8])>,
+    rows: &[AchievementProgress],
+) -> String {
     let score: f64 = rows
         .iter()
         .map(|row| {
@@ -38,6 +44,14 @@ pub fn svg(name: &str, avatar: Option<(&str, &[u8])>, rows: &[AchievementProgres
             .take(32)
             .collect::<String>(),
     );
+    let guild = escape(
+        &guild
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(36)
+            .collect::<String>(),
+    );
+    let label = heading(locale);
     let image = avatar.map(|(mime, bytes)| format!(r#"<image href="data:{mime};base64,{}" x="40" y="36" width="92" height="92" clip-path="url(#avatar)"/>"#,STANDARD.encode(bytes))).unwrap_or_default();
     let mut badges = String::new();
     for (index, row) in rows
@@ -50,24 +64,30 @@ pub fn svg(name: &str, avatar: Option<(&str, &[u8])>, rows: &[AchievementProgres
         let tier = row.unlocked.iter().filter(|v| **v).count();
         let color = medal_color(tier);
         let icon = medal_icon(&row.id);
-        badges.push_str(&format!(r##"<g transform="translate({x} 228)"><path d="M0-48L42-24V24L0 48L-42 24V-24Z" fill="{color}" fill-opacity=".18" stroke="{color}" stroke-width="3"/><path d="M0-40L35-20V20L0 40L-35 20V-20Z" fill="none" stroke="{color}" opacity=".35"/><path d="{icon}" fill="none" stroke="{color}" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></g>"##));
+        badges.push_str(&format!(r##"<g transform="translate({x} 244)"><path d="M0-48L42-24V24L0 48L-42 24V-24Z" fill="{color}" fill-opacity=".18" stroke="{color}" stroke-width="3"/><path d="M0-40L35-20V20L0 40L-35 20V-20Z" fill="none" stroke="{color}" opacity=".35"/><path d="{icon}" fill="none" stroke="{color}" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></g>"##));
     }
     let total = rows.len();
     let width = (score / total.max(1) as f64 * 576.0).clamp(0.0, 576.0);
     format!(
-        r##"<svg xmlns="http://www.w3.org/2000/svg" width="900" height="344" viewBox="0 0 900 344"><defs><clipPath id="avatar"><circle cx="86" cy="82" r="46"/></clipPath></defs><rect x="2" y="2" width="896" height="340" rx="22" fill="#101A29" stroke="#8EE5D2" stroke-width="2"/><path d="M450 2L730 342M570 2L850 342" stroke="#192A3B" stroke-width="34" opacity=".45"/><circle cx="86" cy="82" r="48" fill="#263C4B" stroke="#8EE5D2" stroke-width="2"/>{image}<g font-family="sans-serif"><text x="160" y="66" fill="#F4F7FB" font-size="30" font-weight="700">{name}</text><text x="160" y="99" fill="#8EE5D2" font-size="20">{score:.2} / {total}</text><rect x="160" y="118" width="576" height="8" rx="4" fill="#263346"/><rect x="160" y="118" width="{width:.1}" height="8" rx="4" fill="#8EE5D2"/>{badges}<text x="858" y="323" text-anchor="end" fill="#AAB8CB" font-size="13">Vozen Helper</text></g></svg>"##
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="900" height="344" viewBox="0 0 900 344"><defs><clipPath id="avatar"><circle cx="86" cy="82" r="46"/></clipPath></defs><rect x="2" y="2" width="896" height="340" rx="22" fill="#101A29" stroke="#8EE5D2" stroke-width="2"/><path d="M450 2L730 342M570 2L850 342" stroke="#192A3B" stroke-width="34" opacity=".45"/><circle cx="86" cy="82" r="48" fill="#263C4B" stroke="#8EE5D2" stroke-width="2"/>{image}<g font-family="sans-serif"><text x="160" y="58" fill="#F4F7FB" font-size="30" font-weight="700">{name}</text><text x="160" y="86" fill="#AAB8CB" font-size="18">{guild}</text><text x="160" y="116" fill="#8EE5D2" font-size="20">{score:.2} / {total}</text><rect x="160" y="135" width="576" height="8" rx="4" fill="#263346"/><rect x="160" y="135" width="{width:.1}" height="8" rx="4" fill="#8EE5D2"/><text x="42" y="176" fill="#AAB8CB" font-size="14">{label}</text>{badges}</g></svg>"##
     )
 }
 
 pub(super) async fn image(
     user: &serenity::all::User,
     rows: Vec<AchievementProgress>,
+    guild: &str,
+    locale: &str,
 ) -> Option<Vec<u8>> {
     let avatar = super::starboard_display::avatar(user).await;
+    let guild = guild.to_owned();
+    let locale = locale.to_owned();
     let name = user.global_name.as_deref().unwrap_or(&user.name).to_owned();
     tokio::task::spawn_blocking(move || {
         rasterize(&svg(
             &name,
+            &guild,
+            &locale,
             avatar
                 .as_ref()
                 .map(|(mime, bytes)| (mime.as_str(), bytes.as_slice())),
@@ -77,6 +97,42 @@ pub(super) async fn image(
     .await
     .ok()
     .flatten()
+}
+
+fn heading(locale: &str) -> &'static str {
+    match locale {
+        "pt-BR" | "pt" => "Conquistas",
+        "id" => "Pencapaian",
+        "da" => "Præstationer",
+        "de" => "Erfolge",
+        "es-ES" | "es-419" => "Logros",
+        "fr" => "Succès",
+        "hr" => "Postignuća",
+        "it" => "Obiettivi",
+        "lt" => "Pasiekimai",
+        "hu" => "Eredmények",
+        "nl" => "Prestaties",
+        "no" => "Prestasjoner",
+        "pl" => "Osiągnięcia",
+        "ro" => "Realizări",
+        "fi" => "Saavutukset",
+        "sv-SE" => "Prestationer",
+        "vi" => "Thành tích",
+        "tr" => "Başarımlar",
+        "cs" => "Úspěchy",
+        "el" => "Επιτεύγματα",
+        "bg" => "Постижения",
+        "ru" => "Достижения",
+        "uk" => "Досягнення",
+        "hi" => "उपलब्धियाँ",
+        "th" => "ความสำเร็จ",
+        "zh-CN" => "成就",
+        "ja" => "実績",
+        "zh-TW" => "成就",
+        "ko" => "업적",
+        "ar" => "الإنجازات",
+        _ => "Achievements",
+    }
 }
 
 pub(super) fn button_labels(locale: &str) -> (&'static str, &'static str) {
@@ -129,19 +185,19 @@ mod tests {
                 unlocked: (1..=4).map(|threshold| threshold <= tier).collect(),
             })
             .collect();
-        let empty = svg("Member", None, &rows[..1]);
+        let empty = svg("Member", "Test server", "en-US", None, &rows[..1]);
         assert!(
             !empty.contains("<g transform="),
             "locked medals stay hidden"
         );
-        let source = svg("Member", None, &rows);
+        let source = svg("Member", "Test server", "en-US", None, &rows);
         assert_eq!(source.matches("<g transform=").count(), 4);
         for (index, color) in ["#E1A578", "#CCD5E4", "#FFD170", "#82DBF7"]
             .iter()
             .enumerate()
         {
             let x = 84 + index * 122;
-            assert!(source.contains(&format!(r#"translate({x} 228)"#)));
+            assert!(source.contains(&format!(r#"translate({x} 244)"#)));
             assert!(source.contains(&format!(r#"stroke="{color}""#)));
         }
         assert!(!source.contains("<text y="), "medals have no tier counters");
@@ -157,12 +213,17 @@ mod tests {
                 .unwrap();
         }
         let rows = store.achievement_progress("g", "u", 0).unwrap();
-        let source = svg("Member <&>", None, &rows);
+        let source = svg("Member <&>", "Server <&>", "en-US", None, &rows);
         assert!(source.contains("Member &lt;&amp;&gt;"));
+        assert!(source.contains("Server &lt;&amp;&gt;"));
+        assert!(source.contains(">Achievements</text>"));
+        assert!(!source.contains("Vozen Helper"));
         assert!(source.contains("0.25 / 7"));
         let avatar = rasterize(r##"<svg xmlns="http://www.w3.org/2000/svg" width="96" height="96"><rect width="96" height="96" fill="#243F52"/><text x="48" y="66" text-anchor="middle" fill="#8EE5D2" font-family="sans-serif" font-size="48">M</text></svg>"##).unwrap();
         let png = rasterize(&svg(
             "Membro de exemplo",
+            "Servidor de exemplo",
+            "pt-BR",
             Some(("image/png", &avatar)),
             &rows,
         ))
@@ -188,9 +249,11 @@ mod tests {
         }
         for locale in super::super::private_replies::DISCORD_LOCALES {
             let labels = button_labels(locale);
+            assert!(!heading(locale).is_empty());
             assert!(!labels.0.is_empty() && labels.0.chars().count() <= 80);
             if !locale.starts_with("en-") {
                 assert_ne!(labels.0, "Your achievements");
+                assert_ne!(heading(locale), "Achievements");
             }
         }
     }

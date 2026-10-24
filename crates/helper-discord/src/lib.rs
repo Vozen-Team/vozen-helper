@@ -7057,8 +7057,10 @@ impl Handler {
                 let rows = self.store.achievement_progress(&guild_text,&user,now)?;
                 let name = command.user.global_name.as_deref().unwrap_or(&command.user.name);
                 let token = self.store.create_achievement_link(&guild_text,&user,name,&command.user.static_face(),now)?;
+                let mut guild_name = self.store.get_setting(&guild_text,"community.achievements.guild_name")?.unwrap_or_default();
                 if let Ok(Ok(guild)) = tokio::time::timeout(Duration::from_secs(2),guild_id.to_partial_guild(&ctx.http)).await {
                     self.store.set_setting(&guild_text,"community.achievements.guild_name",&guild.name)?;
+                    guild_name = guild.name;
                 }
                 let (personal,list) = achievement_card::button_labels(&command.locale);
                 let locale = if command.locale.starts_with("pt") {"pt"} else {"en"};
@@ -7068,7 +7070,7 @@ impl Handler {
                     CreateButton::new_link(format!("{base}/{token}?lang={locale}")).label(personal),
                     CreateButton::new_link(format!("{base}?lang={locale}")).label(list),
                 ])]);
-                if let Some(png) = achievement_card::image(&command.user,rows).await {
+                if let Some(png) = achievement_card::image(&command.user,rows,&guild_name,&command.locale).await {
                     response=response.content("").new_attachment(CreateAttachment::bytes(png,"achievements.png").description(&caption));
                 } else {
                     response=response.content(&caption);
