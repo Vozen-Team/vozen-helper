@@ -49,7 +49,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -57,6 +57,7 @@ use tracing::{info, warn};
 
 mod achievement_announcement;
 pub mod achievement_card;
+mod activity_observer;
 pub mod giveaway_card;
 mod giveaway_display;
 pub mod leaderboard_card;
@@ -382,6 +383,7 @@ impl TopggGuilds {
 
 #[derive(Clone)]
 struct Handler {
+    bot_id: Arc<AtomicU64>,
     store: Store,
     spam: Arc<Mutex<HashMap<String, VecDeque<Instant>>>>,
     duplicate_messages: DuplicateMessageCache,
@@ -449,6 +451,7 @@ impl EventHandler for Handler {
     }
 
     async fn ready(&self, ctx: Context, ready: Ready) {
+        self.bot_id.store(ready.user.id.get(), Ordering::Relaxed);
         info!(user = %ready.user.name, "helper gateway ready");
         if let (Some(guilds), Some(trigger)) = (&self.topgg_guilds, &self.topgg_trigger) {
             guilds.set_ready(ready.guilds.iter().map(|guild| guild.id.get()));
@@ -2135,6 +2138,26 @@ impl EventHandler for Handler {
         _new: Option<serenity::all::Member>,
         event: serenity::all::GuildMemberUpdateEvent,
     ) {
+        if let Some(until) = event
+            .communication_disabled_until
+            .filter(|until| until.unix_timestamp() > Utc::now().timestamp())
+        {
+            let detail = serde_json::json!({"until":until.unix_timestamp()});
+            let _ = self.store.record_observed_activity(
+                &event.guild_id.to_string(),
+                "member_timeout",
+                &event.user.id.to_string(),
+                Some(
+                    event
+                        .user
+                        .global_name
+                        .as_deref()
+                        .unwrap_or(&event.user.name),
+                ),
+                None,
+                &detail.to_string(),
+            );
+        }
         if !event.user.bot && event.premium_since.is_some() {
             self.track_achievement(&ctx, event.guild_id, event.user.id, "boost", "boost", None)
                 .await;
@@ -2155,15 +2178,31 @@ impl EventHandler for Handler {
                     )
                     .await
                 {
+                    activity_observer::command(
+                        &self.store,
+                        &command,
+                        self.bot_id.load(Ordering::Relaxed),
+                        "failed",
+                    );
                     warn!(%error, "command acknowledgement failed");
                     return;
                 }
-                if let Err(error) = private_replies::with_locale(
+                let command_result = private_replies::with_locale(
                     ephemeral.then(|| command.locale.clone()),
                     self.handle_command(&ctx, &command),
                 )
-                .await
-                {
+                .await;
+                activity_observer::command(
+                    &self.store,
+                    &command,
+                    self.bot_id.load(Ordering::Relaxed),
+                    if command_result.is_ok() {
+                        "processed"
+                    } else {
+                        "failed"
+                    },
+                );
+                if let Err(error) = command_result {
                     tracing::error!(%error, command = %command.data.name, "command failed");
                     let _ = command
                         .edit_response(
@@ -2227,32 +2266,31 @@ impl EventHandler for Handler {
         let day = chrono::Utc::now().format("%Y-%m-%d").to_string();
         let _ = self.store.record_join(&guild_id.to_string(), &day);
         let guild_text = guild_id.to_string();
-        if feature_enabled(&self.store, &guild_text, "management.audit", None) {
-            let detail = serde_json::json!({
-                "event": "member_join",
-                "contentAvailable": false,
-            })
-            .to_string();
-            let _ = self.store.record_activity(
-                &guild_text,
-                "member_join",
-                &new_member.user.id.to_string(),
-                Some(&new_member.user.name),
-                None,
-                &detail,
-            );
-            if let Some(raw_channel) =
+        let detail = serde_json::json!({
+            "event": "member_join",
+            "contentAvailable": false,
+        })
+        .to_string();
+        let _ = self.store.record_activity(
+            &guild_text,
+            "member_join",
+            &new_member.user.id.to_string(),
+            Some(&new_member.user.name),
+            None,
+            &detail,
+        );
+        if feature_enabled(&self.store, &guild_text, "management.audit", None)
+            && let Some(raw_channel) =
                 setting_string(&self.store, &guild_text, "management.audit.log_channel")
                     .filter(|value| !value.trim().is_empty())
-                && let Ok(log_channel) = raw_channel.parse::<u64>()
-            {
-                let _ = ChannelId::new(log_channel)
-                    .say(
-                        &ctx.http,
-                        format!("Audit: <@{}> joined the server.", new_member.user.id),
-                    )
-                    .await;
-            }
+            && let Ok(log_channel) = raw_channel.parse::<u64>()
+        {
+            let _ = ChannelId::new(log_channel)
+                .say(
+                    &ctx.http,
+                    format!("Audit: <@{}> joined the server.", new_member.user.id),
+                )
+                .await;
         }
         // Discord's member-add event does not carry an invite code. When the
         // invite tracker is enabled, compare the current usage counters with
@@ -2728,29 +2766,28 @@ impl EventHandler for Handler {
         let day = chrono::Utc::now().format("%Y-%m-%d").to_string();
         let guild_text = guild_id.to_string();
         let _ = self.store.record_leave(&guild_text, &day);
-        if feature_enabled(&self.store, &guild_text, "management.audit", None) {
-            let detail = serde_json::json!({
-                "event": "member_leave",
-                "contentAvailable": false,
-            })
-            .to_string();
-            let _ = self.store.record_activity(
-                &guild_text,
-                "member_leave",
-                &user.id.to_string(),
-                Some(&user.name),
-                None,
-                &detail,
-            );
-            if let Some(raw_channel) =
+        let detail = serde_json::json!({
+            "event": "member_leave",
+            "contentAvailable": false,
+        })
+        .to_string();
+        let _ = self.store.record_activity(
+            &guild_text,
+            "member_leave",
+            &user.id.to_string(),
+            Some(&user.name),
+            None,
+            &detail,
+        );
+        if feature_enabled(&self.store, &guild_text, "management.audit", None)
+            && let Some(raw_channel) =
                 setting_string(&self.store, &guild_text, "management.audit.log_channel")
                     .filter(|value| !value.trim().is_empty())
-                && let Ok(log_channel) = raw_channel.parse::<u64>()
-            {
-                let _ = ChannelId::new(log_channel)
-                    .say(&ctx.http, format!("Audit: <@{}> left the server.", user.id))
-                    .await;
-            }
+            && let Ok(log_channel) = raw_channel.parse::<u64>()
+        {
+            let _ = ChannelId::new(log_channel)
+                .say(&ctx.http, format!("Audit: <@{}> left the server.", user.id))
+                .await;
         }
         let (welcome_enabled, welcome) = self
             .store
@@ -2829,12 +2866,49 @@ impl EventHandler for Handler {
         );
     }
 
+    async fn guild_ban_addition(
+        &self,
+        _ctx: Context,
+        guild_id: serenity::all::GuildId,
+        user: serenity::all::User,
+    ) {
+        let _ = self.store.record_observed_activity(
+            &guild_id.to_string(),
+            "member_ban",
+            &user.id.to_string(),
+            Some(user.global_name.as_deref().unwrap_or(&user.name)),
+            None,
+            "{}",
+        );
+    }
+    async fn guild_ban_removal(
+        &self,
+        _ctx: Context,
+        guild_id: serenity::all::GuildId,
+        user: serenity::all::User,
+    ) {
+        let _ = self.store.record_observed_activity(
+            &guild_id.to_string(),
+            "member_unban",
+            &user.id.to_string(),
+            Some(user.global_name.as_deref().unwrap_or(&user.name)),
+            None,
+            "{}",
+        );
+    }
+
     async fn guild_audit_log_entry_create(
         &self,
         ctx: Context,
         entry: serenity::all::AuditLogEntry,
         guild_id: serenity::all::GuildId,
     ) {
+        activity_observer::audit(
+            &self.store,
+            &guild_id.to_string(),
+            &entry,
+            self.bot_id.load(Ordering::Relaxed),
+        );
         let guild_text = guild_id.to_string();
         if !feature_enabled(&self.store, &guild_text, "management.audit", None) {
             return;
@@ -3350,6 +3424,22 @@ impl EventHandler for Handler {
             .or_else(|| new.as_ref().map(|message| message.author.id.to_string()))
             .unwrap_or_else(|| "unknown".into());
         let author_tag = event.author.as_ref().map(|author| author.tag());
+        let helper = event
+            .author
+            .as_ref()
+            .or_else(|| new.as_ref().map(|message| &message.author))
+            .is_some_and(|user| user.id.get() == self.bot_id.load(Ordering::Relaxed));
+        if helper && !feature_enabled(&self.store, &guild_text, "management.audit", None) {
+            let detail = serde_json::json!({"channel_id":event.channel_id.to_string(),"message_id":event.id.to_string()});
+            let _ = self.store.record_activity(
+                &guild_text,
+                "helper_message_edit",
+                &author_id,
+                author_tag.as_deref(),
+                None,
+                &detail.to_string(),
+            );
+        }
         if feature_enabled(&self.store, &guild_text, "management.audit", None) {
             let detail = serde_json::json!({
                 "messageId": event.id.to_string(),
@@ -3362,7 +3452,11 @@ impl EventHandler for Handler {
             .to_string();
             let _ = self.store.record_activity(
                 &guild_text,
-                "message_edit",
+                if helper {
+                    "helper_message_edit"
+                } else {
+                    "message_edit"
+                },
                 &author_id,
                 author_tag.as_deref(),
                 Some(&author_id),
@@ -3502,6 +3596,25 @@ impl EventHandler for Handler {
 
     async fn message(&self, ctx: Context, message: serenity::all::Message) {
         if message.author.bot {
+            if message.author.id.get() == self.bot_id.load(Ordering::Relaxed)
+                && let Some(guild) = message.guild_id
+            {
+                let detail = serde_json::json!({"channel_id":message.channel_id.to_string(),"message_id":message.id.to_string()});
+                let _ = self.store.record_activity(
+                    &guild.to_string(),
+                    "helper_message",
+                    &message.author.id.to_string(),
+                    Some(
+                        message
+                            .author
+                            .global_name
+                            .as_deref()
+                            .unwrap_or(&message.author.name),
+                    ),
+                    None,
+                    &detail.to_string(),
+                );
+            }
             return;
         }
         let Some(guild_id) = message.guild_id else {
@@ -4170,6 +4283,7 @@ pub async fn run(config: &Config) -> Result<()> {
     };
     let mut client = Client::builder(&config.discord_token, intents)
         .event_handler(Handler {
+            bot_id: Arc::new(AtomicU64::new(0)),
             store,
             spam: Arc::new(Mutex::new(HashMap::new())),
             duplicate_messages: Arc::new(Mutex::new(HashMap::new())),

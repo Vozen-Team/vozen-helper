@@ -3,6 +3,7 @@
 #![recursion_limit = "256"]
 
 mod achievements;
+mod activity_feed;
 mod discord_context;
 mod discord_read;
 mod starboard_channel;
@@ -256,6 +257,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/cases", get(cases))
         .route("/api/audit", get(audit))
         .route("/api/activity", get(activity))
+        .route("/api/activity/feed", get(activity_feed::get))
         .route("/api/tickets", get(tickets))
         .route("/api/stats", get(stats))
         .route("/api/leaderboard", get(leaderboard))
@@ -10173,6 +10175,21 @@ async fn leaderboard_member_names(
     guild_id: &str,
     entries: &[LeaderboardEntry],
 ) -> BTreeMap<String, String> {
+    let ids = entries
+        .iter()
+        .filter(|entry| !entry.opted_out)
+        .take(100)
+        .map(|entry| entry.user_id.clone())
+        .collect::<Vec<_>>();
+    discord_member_names(base, token, guild_id, &ids).await
+}
+
+async fn discord_member_names(
+    base: &str,
+    token: &str,
+    guild_id: &str,
+    ids: &[String],
+) -> BTreeMap<String, String> {
     let mut names = BTreeMap::new();
     let Some(guild_id) = guild_id.parse::<u64>().ok().filter(|id| *id > 0) else {
         return names;
@@ -10186,18 +10203,29 @@ async fn leaderboard_member_names(
     };
     let permits = Arc::new(tokio::sync::Semaphore::new(8));
     let mut tasks = tokio::task::JoinSet::new();
-    for entry in entries.iter().filter(|entry| !entry.opted_out).take(100) {
-        let Some(id) = entry.user_id.parse::<u64>().ok().filter(|id| *id > 0) else {
+    for user_id in ids.iter().take(100) {
+        let Some(id) = user_id.parse::<u64>().ok().filter(|id| *id > 0) else {
             continue;
         };
-        let user_id = entry.user_id.clone();
+        let user_id = user_id.clone();
         let url = format!("{base}/guilds/{guild_id}/members/{id}");
         let auth = format!("Bot {token}");
+        let base = base.to_owned();
         let client = client.clone();
         let permits = permits.clone();
         tasks.spawn(async move {
             let _permit = permits.acquire_owned().await.ok()?;
-            let member = discord_read::get_json(&client, &auth, &url).await.ok()?;
+            let member = match discord_read::get_json(&client, &auth, &url).await {
+                Ok(member) => member,
+                Err(error) if error == "discord_http_404" => {
+                    let user =
+                        discord_read::get_json(&client, &auth, &format!("{base}/users/{id}"))
+                            .await
+                            .ok()?;
+                    serde_json::json!({"user":user})
+                }
+                Err(_) => return None,
+            };
             [
                 member.get("nick"),
                 member.pointer("/user/global_name"),
@@ -15115,5 +15143,77 @@ mod tests {
                 .as_deref(),
             Some(message_id)
         );
+    }
+    #[tokio::test]
+    async fn activity_feed_requires_auth_and_filters_the_selected_guild_only() {
+        let store = Store::open(":memory:").unwrap();
+        let unauthorized = router(state(store.clone()))
+            .oneshot(
+                Request::builder()
+                    .uri("/api/activity/feed")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+        store
+            .record_activity(
+                "guild-a",
+                "member_join",
+                "member",
+                Some("Readable name"),
+                None,
+                "{}",
+            )
+            .unwrap();
+        store
+            .record_activity(
+                "guild-b",
+                "member_join",
+                "hidden",
+                Some("Private other guild"),
+                None,
+                "{}",
+            )
+            .unwrap();
+        store
+            .record_case("guild-a", "ban", "banned", "mod", "reason", None)
+            .unwrap();
+        let session = claims("guild-a");
+        store.save_session(&session).unwrap();
+        let token = sign_session(&session, "test-session-secret-with-at-least-32-bytes");
+        let response = router(state(store.clone()))
+            .oneshot(
+                Request::builder()
+                    .uri("/api/activity/feed?category=joins&guildId=guild-b&limit=1")
+                    .header(header::COOKIE, format!("vh_session={token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 1000000).await.unwrap())
+                .unwrap();
+        assert_eq!(body["guildId"], "guild-a");
+        assert_eq!(body["events"].as_array().unwrap().len(), 1);
+        assert_eq!(body["events"][0]["memberName"], "Readable name");
+        assert!(!body.to_string().contains("Private other guild"));
+        for query in ["category=invalid", "before=1:9:1", "before=invalid"] {
+            let response = router(state(store.clone()))
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/api/activity/feed?{query}"))
+                        .header(header::COOKIE, format!("vh_session={token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
     }
 }

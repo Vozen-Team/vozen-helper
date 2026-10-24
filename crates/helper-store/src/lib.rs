@@ -6,6 +6,9 @@ pub use growth_lifecycle::{GrowthDailyMetric, GrowthOverview, growth_source};
 mod topgg_sync;
 pub use topgg_sync::{TopggSyncDetail, TopggSyncStatus};
 
+mod activity_feed;
+pub use activity_feed::ActivityFeedRecord;
+
 mod achievement_activity;
 pub use achievement_activity::AchievementProgress;
 
