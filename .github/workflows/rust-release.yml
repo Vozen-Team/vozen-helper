@@ -36,11 +36,14 @@ jobs:
       - name: Test workspace
         env:
           HELPER_LEVEL_CARD_PREVIEW: ${{ github.workspace }}/level-up-default.png
+          HELPER_ACHIEVEMENTS_PREVIEW: ${{ github.workspace }}/achievements.png
         run: cargo test --workspace
       - uses: actions/upload-artifact@v4
         with:
           name: level-up-preview-${{ github.sha }}
-          path: level-up-default.png
+          path: |
+            level-up-default.png
+            achievements.png
           if-no-files-found: error
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
