@@ -1,6 +1,19 @@
 use super::achievement_card::{medal_color, medal_icon};
 use super::suggestion_card::{escape, rasterize};
 use helper_store::AchievementRecord;
+use serenity::all::ChannelId;
+
+pub(super) fn channel(
+    key: &str,
+    source: Option<ChannelId>,
+    fallback: Option<ChannelId>,
+) -> Option<ChannelId> {
+    if key.starts_with("voice:") || key.starts_with("boost:") {
+        fallback
+    } else {
+        source.or(fallback)
+    }
+}
 
 struct Copy {
     heading: &'static str,
@@ -287,6 +300,26 @@ pub(super) async fn image(svg: String) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn announcements_use_activity_channels_and_voice_uses_the_configured_channel() {
+        let source = Some(ChannelId::new(1));
+        let fallback = Some(ChannelId::new(2));
+        for key in [
+            "messages:1",
+            "reactions:2",
+            "threads_created:1",
+            "threads_joined:1",
+            "regular",
+        ] {
+            assert_eq!(channel(key, source, fallback), source);
+            assert_eq!(channel(key, None, fallback), fallback);
+        }
+        for key in ["voice:1", "boost:1"] {
+            assert_eq!(channel(key, source, fallback), fallback);
+            assert_eq!(channel(key, source, None), None);
+        }
+    }
 
     #[test]
     fn unlock_card_covers_the_site_languages_and_legacy_xp_keys() {

@@ -5728,16 +5728,13 @@ impl Handler {
             return;
         }
         let guild_text = guild.to_string();
-        let channel = source.or_else(|| {
+        let fallback = {
             setting_u64_optional(
                 &self.store,
                 &guild_text,
                 "community.levels.announce_channel",
             )
             .map(ChannelId::new)
-        });
-        let Some(channel) = channel else {
-            return;
         };
         if !feature_enabled(&self.store, &guild_text, "community.achievements", None) {
             return;
@@ -5755,6 +5752,11 @@ impl Handler {
             achievement_card::button_labels(button_locale).1
         };
         for record in records {
+            let channel =
+                achievement_announcement::channel(&record.achievement_key, source, fallback);
+            let Some(channel) = channel else {
+                continue;
+            };
             let Some((caption, svg)) =
                 achievement_announcement::content(&user.to_string(), &record, locale)
             else {
@@ -7031,24 +7033,26 @@ impl Handler {
                     return respond(ctx, command, "Achievements are disabled in this server. Enable them in the dashboard.").await;
                 }
                 let xp = self.store.level_for(&guild_text, &command.user.id.to_string())?;
+                let mut unlocked = Vec::new();
                 for milestone in evaluate_achievements(
                     &achievement_policy_for_store(&self.store, &guild_text),
                     xp,
                 ) {
-                    let _ = self.store.unlock_achievement(
+                    let at = Utc::now().timestamp_millis();
+                    if self.store.unlock_achievement(
                         &guild_text,
                         &command.user.id.to_string(),
                         milestone.key,
                         milestone.threshold,
-                        Utc::now().timestamp_millis(),
-                    );
+                        at,
+                    )? { unlocked.push(AchievementRecord { guild_id: guild_text.clone(), user_id: command.user.id.to_string(), achievement_key: milestone.key.into(), threshold: milestone.threshold, unlocked_at: at }); }
                 }
                 let user = command.user.id.to_string();
                 let now = Utc::now().timestamp();
                 if command.member.as_ref().is_some_and(|member| member.premium_since.is_some()) {
                     let _ = self.store.record_achievement_event(&guild_text, &user, "boost", "boost");
                 }
-                let unlocked = self.store.sync_activity_achievements(&guild_text,&user,now)?;
+                unlocked.extend(self.store.sync_activity_achievements(&guild_text,&user,now)?);
                 self.send_achievement_unlocks(ctx, guild_id, command.user.id, unlocked, Some(command.channel_id)).await;
                 let rows = self.store.achievement_progress(&guild_text,&user,now)?;
                 let name = command.user.global_name.as_deref().unwrap_or(&command.user.name);
