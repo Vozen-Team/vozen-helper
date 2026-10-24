@@ -249,7 +249,13 @@ impl Store {
         Ok(rows)
     }
 
-    pub fn sync_activity_achievements(&self, guild: &str, user: &str, now: i64) -> Result<()> {
+    pub fn sync_activity_achievements(
+        &self,
+        guild: &str,
+        user: &str,
+        now: i64,
+    ) -> Result<Vec<AchievementRecord>> {
+        let mut unlocked = Vec::new();
         for row in self
             .achievement_progress(guild, user, now)?
             .iter()
@@ -261,16 +267,25 @@ impl Store {
                 .enumerate()
                 .filter(|(_, threshold)| row.value >= **threshold)
             {
-                self.unlock_achievement(
+                let key = format!("{}:{}", row.id, index + 1);
+                if self.unlock_achievement(
                     guild,
                     user,
-                    &format!("{}:{}", row.id, index + 1),
+                    &key,
                     *threshold,
                     now.saturating_mul(1000),
-                )?;
+                )? {
+                    unlocked.push(AchievementRecord {
+                        guild_id: guild.into(),
+                        user_id: user.into(),
+                        achievement_key: key,
+                        threshold: *threshold,
+                        unlocked_at: now.saturating_mul(1000),
+                    });
+                }
             }
         }
-        Ok(())
+        Ok(unlocked)
     }
 
     /// The personal link is scoped to one member, expires after an hour and rotates.
@@ -335,7 +350,15 @@ mod tests {
                 .record_achievement_event("g", "u", "messages", "0")
                 .unwrap()
         );
-        store.sync_activity_achievements("g", "u", 30).unwrap();
+        let unlocked = store.sync_activity_achievements("g", "u", 30).unwrap();
+        assert_eq!(unlocked.len(), 1);
+        assert_eq!(unlocked[0].achievement_key, "messages:1");
+        assert!(
+            store
+                .sync_activity_achievements("g", "u", 31)
+                .unwrap()
+                .is_empty()
+        );
         let rows = store.achievement_progress("g", "u", 30).unwrap();
         assert_eq!(rows[0].value, 20);
         assert_eq!(rows[0].unlocked, vec![true, false, false, false]);
@@ -351,6 +374,43 @@ mod tests {
                 .is_err()
         );
     }
+    #[test]
+    fn activity_unlocks_only_return_new_tiers_with_their_original_thresholds() {
+        let store = Store::open(":memory:").unwrap();
+        for i in 0..100 {
+            store
+                .record_achievement_event("g", "u", "messages", &i.to_string())
+                .unwrap();
+        }
+        let unlocked = store.sync_activity_achievements("g", "u", 7).unwrap();
+        assert_eq!(
+            unlocked
+                .iter()
+                .map(|row| (row.achievement_key.as_str(), row.threshold, row.unlocked_at))
+                .collect::<Vec<_>>(),
+            vec![("messages:1", 20, 7000), ("messages:2", 100, 7000)]
+        );
+        assert!(
+            store
+                .sync_activity_achievements("g", "u", 8)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .sync_activity_achievements("other", "u", 8)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .sync_activity_achievements("g", "other", 8)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(store.level_for("g", "u").unwrap(), 0);
+    }
+
     #[test]
     fn voice_moves_keep_seconds_and_duplicate_leaves_do_not_count_twice() {
         let store = Store::open(":memory:").unwrap();

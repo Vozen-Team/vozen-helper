@@ -27,9 +27,9 @@ use helper_modules::{
     tiktok_runtime_allowed,
 };
 use helper_store::{
-    BlueskySubscriptionRecord, InstagramSubscriptionRecord, KickSubscriptionRecord,
-    RssSubscriptionRecord, Store, TikTokSubscriptionRecord, TopggSyncDetail,
-    TwitchSubscriptionRecord, YouTubeSubscriptionRecord,
+    AchievementRecord, BlueskySubscriptionRecord, InstagramSubscriptionRecord,
+    KickSubscriptionRecord, RssSubscriptionRecord, Store, TikTokSubscriptionRecord,
+    TopggSyncDetail, TwitchSubscriptionRecord, YouTubeSubscriptionRecord,
 };
 use rand::seq::SliceRandom;
 use reqwest::Client as HttpClient;
@@ -55,6 +55,7 @@ use std::{
 };
 use tracing::{info, warn};
 
+mod achievement_announcement;
 pub mod achievement_card;
 pub mod giveaway_card;
 mod giveaway_display;
@@ -1877,11 +1878,14 @@ impl EventHandler for Handler {
             ) {
                 warn!(%error, "achievement voice tracking failed");
             }
-            let _ = self.store.sync_activity_achievements(
+            if let Ok(unlocked) = self.store.sync_activity_achievements(
                 &guild_text,
                 &user_text,
                 Utc::now().timestamp(),
-            );
+            ) {
+                self.send_achievement_unlocks(&ctx, guild_id, new.user_id, unlocked, None)
+                    .await;
+            }
         }
 
         if feature_enabled(&self.store, &guild_text, "management.audit", None) {
@@ -2074,11 +2078,14 @@ impl EventHandler for Handler {
             && !user.bot
         {
             self.track_achievement(
+                &ctx,
                 thread.guild_id,
                 owner,
                 "threads_created",
                 &thread.id.to_string(),
-            );
+                Some(thread.id),
+            )
+            .await;
         }
     }
 
@@ -2100,7 +2107,7 @@ impl EventHandler for Handler {
 
     async fn thread_members_update(
         &self,
-        _ctx: Context,
+        ctx: Context,
         event: serenity::all::ThreadMembersUpdateEvent,
     ) {
         for member in event.added_members.iter().filter(|member| {
@@ -2110,23 +2117,27 @@ impl EventHandler for Handler {
                 .is_some_and(|member| !member.user.bot)
         }) {
             self.track_achievement(
+                &ctx,
                 event.guild_id,
                 member.user_id,
                 "threads_joined",
                 &event.id.to_string(),
-            );
+                Some(event.id),
+            )
+            .await;
         }
     }
 
     async fn guild_member_update(
         &self,
-        _ctx: Context,
+        ctx: Context,
         _old: Option<serenity::all::Member>,
         _new: Option<serenity::all::Member>,
         event: serenity::all::GuildMemberUpdateEvent,
     ) {
         if !event.user.bot && event.premium_since.is_some() {
-            self.track_achievement(event.guild_id, event.user.id, "boost", "boost");
+            self.track_achievement(&ctx, event.guild_id, event.user.id, "boost", "boost", None)
+                .await;
         }
     }
 
@@ -3003,11 +3014,14 @@ impl EventHandler for Handler {
         };
         if let Some(member) = reaction.member.as_ref().filter(|member| !member.user.bot) {
             self.track_achievement(
+                &ctx,
                 guild_id,
                 member.user.id,
                 "reactions",
                 &format!("{}:{}", reaction.message_id, reaction.emoji),
-            );
+                Some(reaction.channel_id),
+            )
+            .await;
         }
         if !feature_enabled(
             &self.store,
@@ -3496,22 +3510,28 @@ impl EventHandler for Handler {
         let guild_text = guild_id.to_string();
         let user_text = message.author.id.to_string();
         self.track_achievement(
+            &ctx,
             guild_id,
             message.author.id,
             "messages",
             &message.id.to_string(),
-        );
+            Some(message.channel_id),
+        )
+        .await;
         let is_thread = self
             .store
             .is_achievement_thread(&guild_text, &message.channel_id.to_string())
             .unwrap_or(false);
         if is_thread {
             self.track_achievement(
+                &ctx,
                 guild_id,
                 message.author.id,
                 "threads_joined",
                 &message.channel_id.to_string(),
-            );
+                Some(message.channel_id),
+            )
+            .await;
         }
         let _ = self.store.record_message(
             &guild_text,
@@ -5659,30 +5679,97 @@ fn achievement_reward_role_for_store(
 }
 
 impl Handler {
-    fn track_achievement(
+    async fn track_achievement(
         &self,
+        ctx: &Context,
         guild: serenity::all::GuildId,
         user: serenity::all::UserId,
         kind: &str,
         event: &str,
+        channel: Option<ChannelId>,
     ) {
-        let guild = guild.to_string();
-        if !feature_enabled(&self.store, &guild, "community.achievements", None) {
+        let guild_text = guild.to_string();
+        if !feature_enabled(&self.store, &guild_text, "community.achievements", None) {
             return;
         }
-        let user = user.to_string();
-        if let Err(error) = self
+        let user_text = user.to_string();
+        let unlocked = self
             .store
-            .record_achievement_event(&guild, &user, kind, event)
+            .record_achievement_event(&guild_text, &user_text, kind, event)
             .and_then(|changed| {
                 if changed {
-                    self.store
-                        .sync_activity_achievements(&guild, &user, Utc::now().timestamp())?;
+                    self.store.sync_activity_achievements(
+                        &guild_text,
+                        &user_text,
+                        Utc::now().timestamp(),
+                    )
+                } else {
+                    Ok(Vec::new())
                 }
-                Ok(())
-            })
-        {
-            warn!(%error, "achievement activity tracking failed");
+            });
+        match unlocked {
+            Ok(rows) => {
+                self.send_achievement_unlocks(ctx, guild, user, rows, channel)
+                    .await
+            }
+            Err(error) => warn!(%error, "achievement activity tracking failed"),
+        }
+    }
+
+    async fn send_achievement_unlocks(
+        &self,
+        ctx: &Context,
+        guild: serenity::all::GuildId,
+        user: serenity::all::UserId,
+        records: Vec<AchievementRecord>,
+        source: Option<ChannelId>,
+    ) {
+        if records.is_empty() {
+            return;
+        }
+        let guild_text = guild.to_string();
+        let channel = source.or_else(|| {
+            setting_u64_optional(
+                &self.store,
+                &guild_text,
+                "community.levels.announce_channel",
+            )
+            .map(ChannelId::new)
+        });
+        let Some(channel) = channel else {
+            return;
+        };
+        if !feature_enabled(&self.store, &guild_text, "community.achievements", None) {
+            return;
+        }
+        let locale =
+            helper_locale_for_guild(&self.store, &guild_text).unwrap_or(DEFAULT_HELPER_LOCALE);
+        let button_locale = match locale {
+            "zh" => "zh-TW",
+            "es" => "es-ES",
+            other => other,
+        };
+        let list = if locale == "ar" {
+            "قائمة الإنجازات"
+        } else {
+            achievement_card::button_labels(button_locale).1
+        };
+        for record in records {
+            let Some((caption, svg)) =
+                achievement_announcement::content(&user.to_string(), &record, locale)
+            else {
+                continue;
+            };
+            let mut message = CreateMessage::new().content(caption.as_str())
+                .allowed_mentions(CreateAllowedMentions::new().users(vec![user]))
+                .components(vec![CreateActionRow::Buttons(vec![CreateButton::new_link(format!("https://vozen.org/panel/helper-tracker/#/achievements/{guild}?lang={locale}")).label(list)])]);
+            if let Some(png) = achievement_announcement::image(svg).await {
+                message = message
+                    .add_file(CreateAttachment::bytes(png, "achievement.png").description(caption));
+            }
+            if let Err(error) = channel.send_message(&ctx.http, message).await {
+                warn!(%error, %guild, %user, achievement = %record.achievement_key, "achievement announcement failed");
+            }
         }
     }
     /// Reconcile an existing starboard entry after the source message changes.
@@ -5863,7 +5950,13 @@ impl Handler {
                 )
                 .unwrap_or(false)
             {
-                newly_unlocked.push(format!("{} ({} XP)", milestone.label, milestone.threshold));
+                newly_unlocked.push(AchievementRecord {
+                    guild_id: guild_text.clone(),
+                    user_id: user_id.into(),
+                    achievement_key: milestone.key.into(),
+                    threshold: milestone.threshold,
+                    unlocked_at: Utc::now().timestamp_millis(),
+                });
                 if let Some(role_id) =
                     achievement_reward_role_for_store(&self.store, &guild_text, milestone.key)
                 {
@@ -5872,26 +5965,16 @@ impl Handler {
                 }
             }
         }
-        if newly_unlocked.is_empty() {
-            return;
-        }
-        let channel = source_channel.or_else(|| {
-            setting_u64_optional(
-                &self.store,
-                &guild_text,
-                "community.levels.announce_channel",
-            )
-            .map(ChannelId::new)
-        });
-        let Some(channel) = channel else {
-            return;
-        };
-        let _ = channel
-            .say(
-                &ctx.http,
-                format!("🏆 <@{user_id}> unlocked: {}", newly_unlocked.join(", ")),
+        if let Ok(user) = user_id.parse::<u64>() {
+            self.send_achievement_unlocks(
+                ctx,
+                guild_id,
+                serenity::all::UserId::new(user),
+                newly_unlocked,
+                source_channel,
             )
             .await;
+        }
     }
 
     /// Assign an optional achievement reward role after the unlock has been
@@ -6963,9 +7046,10 @@ impl Handler {
                 let user = command.user.id.to_string();
                 let now = Utc::now().timestamp();
                 if command.member.as_ref().is_some_and(|member| member.premium_since.is_some()) {
-                    self.track_achievement(guild_id,command.user.id,"boost","boost");
+                    let _ = self.store.record_achievement_event(&guild_text, &user, "boost", "boost");
                 }
-                self.store.sync_activity_achievements(&guild_text,&user,now)?;
+                let unlocked = self.store.sync_activity_achievements(&guild_text,&user,now)?;
+                self.send_achievement_unlocks(ctx, guild_id, command.user.id, unlocked, Some(command.channel_id)).await;
                 let rows = self.store.achievement_progress(&guild_text,&user,now)?;
                 let name = command.user.global_name.as_deref().unwrap_or(&command.user.name);
                 let token = self.store.create_achievement_link(&guild_text,&user,name,&command.user.static_face(),now)?;

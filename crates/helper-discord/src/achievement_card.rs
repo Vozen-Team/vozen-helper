@@ -2,6 +2,28 @@ use super::suggestion_card::{escape, rasterize};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use helper_store::AchievementProgress;
 
+pub(super) fn medal_color(tier: usize) -> &'static str {
+    match tier {
+        1 => "#E1A578",
+        2 => "#CCD5E4",
+        3 => "#FFD170",
+        4 => "#82DBF7",
+        _ => "#526278",
+    }
+}
+
+pub(super) fn medal_icon(id: &str) -> &'static str {
+    match id {
+        "messages" => "M-15-12H15V7H-4L-13 15V7H-15Z",
+        "voice" => "M-16 5V-5A16 16 0 0 1 16-5V5M-16 0H-9V13H-16ZM9 0H16V13H9Z",
+        "reactions" => "M-15 0A15 15 0 1 0 15 0A15 15 0 1 0-15 0M-7-4H-5M5-4H7M-7 5Q0 13 7 5",
+        "threads_created" => "M-7-16L-11 16M8-16L4 16M-17-6H17M-17 7H17",
+        "threads_joined" => "M-15-10H15V13H-15ZM-6-15V-5M6-15V-5M-7 4L-1 10L10-1",
+        "boost" => "M2-19L-12 3H0L-3 20L14-4H3Z",
+        _ => "M-15-12L-5 0L-15 12M15-12L5 0L15 12",
+    }
+}
+
 pub fn svg(name: &str, avatar: Option<(&str, &[u8])>, rows: &[AchievementProgress]) -> String {
     let score: f64 = rows
         .iter()
@@ -26,22 +48,8 @@ pub fn svg(name: &str, avatar: Option<(&str, &[u8])>, rows: &[AchievementProgres
     {
         let x = 84 + index * 122;
         let tier = row.unlocked.iter().filter(|v| **v).count();
-        let color = match tier {
-            1 => "#E1A578",
-            2 => "#CCD5E4",
-            3 => "#FFD170",
-            4 => "#82DBF7",
-            _ => "#526278",
-        };
-        let icon = match row.id.as_str() {
-            "messages" => "M-15-12H15V7H-4L-13 15V7H-15Z",
-            "voice" => "M-16 5V-5A16 16 0 0 1 16-5V5M-16 0H-9V13H-16ZM9 0H16V13H9Z",
-            "reactions" => "M-15 0A15 15 0 1 0 15 0A15 15 0 1 0-15 0M-7-4H-5M5-4H7M-7 5Q0 13 7 5",
-            "threads_created" => "M-7-16L-11 16M8-16L4 16M-17-6H17M-17 7H17",
-            "threads_joined" => "M-15-10H15V13H-15ZM-6-15V-5M6-15V-5M-7 4L-1 10L10-1",
-            "boost" => "M2-19L-12 3H0L-3 20L14-4H3Z",
-            _ => "M-15-12L-5 0L-15 12M15-12L5 0L15 12",
-        };
+        let color = medal_color(tier);
+        let icon = medal_icon(&row.id);
         badges.push_str(&format!(r##"<g transform="translate({x} 228)"><path d="M0-48L42-24V24L0 48L-42 24V-24Z" fill="{color}" fill-opacity=".18" stroke="{color}" stroke-width="3"/><path d="M0-40L35-20V20L0 40L-35 20V-20Z" fill="none" stroke="{color}" opacity=".35"/><path d="{icon}" fill="none" stroke="{color}" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></g>"##));
     }
     let total = rows.len();

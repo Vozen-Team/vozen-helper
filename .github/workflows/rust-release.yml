@@ -27,6 +27,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.97.1
         with:
           components: rustfmt, clippy
+      - name: Install achievement card fonts
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends fonts-noto-cjk
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked --version 0.22.2
       - name: Audit Rust dependencies
@@ -36,6 +38,7 @@ jobs:
       - name: Test workspace
         env:
           HELPER_LEVEL_CARD_PREVIEW: ${{ github.workspace }}/level-up-default.png
+          HELPER_ACHIEVEMENT_UNLOCK_PREVIEW: ${{ github.workspace }}/achievement-unlocked.png
           HELPER_ACHIEVEMENTS_PREVIEW: ${{ github.workspace }}/achievements.png
         run: cargo test --workspace
       - uses: actions/upload-artifact@v4
@@ -44,6 +47,7 @@ jobs:
           path: |
             level-up-default.png
             achievements.png
+            achievement-unlocked*.png
           if-no-files-found: error
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
