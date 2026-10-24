@@ -11792,7 +11792,7 @@ fn command_feature_key(name: &str) -> Option<&'static str> {
         | "unquarantine" | "slowmode" | "lockdown" | "unlock" => "management.moderation",
         "afk" | "remind" => "utility.reminders",
         "tag" | "tags" | "tag-set" | "tag-delete" => "management.custom_commands",
-        "rank" => "studio.rank_card",
+        "rank" => "community.levels",
         "leaderboard" | "leaderboard-privacy" => "community.leaderboard",
         "achievements" => "community.achievements",
         "serverstats" => "insights.stats",
@@ -11832,6 +11832,7 @@ fn feature_title(key: &str) -> &'static str {
         "utility.reminders" => "Reminders",
         "management.custom_commands" => "Custom commands",
         "studio.rank_card" => "XP card",
+        "community.levels" => "Levels & XP",
         "community.leaderboard" => "Leaderboard",
         "community.achievements" => "Achievements",
         "insights.stats" => "Server statistics",
@@ -14305,7 +14306,7 @@ mod tests {
             ("lockdown", "management.moderation"),
             ("unlock", "management.moderation"),
             ("tag-set", "management.custom_commands"),
-            ("rank", "studio.rank_card"),
+            ("rank", "community.levels"),
             ("leaderboard", "community.leaderboard"),
             ("crypto", "web3.crypto_queries"),
             ("giveaway-start", "community.giveaways"),
@@ -14325,6 +14326,57 @@ mod tests {
         }
         assert_eq!(command_feature_key("ping"), None);
         assert_eq!(command_feature_key("dashboard"), None);
+    }
+
+    #[test]
+    fn rank_uses_levels_even_when_the_card_editor_is_disabled() {
+        let key = command_feature_key("rank").unwrap();
+        for canonical in [false, true] {
+            for levels_enabled in [false, true] {
+                for editor_enabled in [false, true] {
+                    let store = Store::open(":memory:").unwrap();
+                    assert!(!feature_enabled(&store, "guild", key, None));
+                    store
+                        .set_setting(
+                            "guild",
+                            "feature.studio.rank_card",
+                            &editor_enabled.to_string(),
+                        )
+                        .unwrap();
+                    store
+                        .set_setting(
+                            "guild",
+                            "feature.community.levels",
+                            &if canonical {
+                                !levels_enabled
+                            } else {
+                                levels_enabled
+                            }
+                            .to_string(),
+                        )
+                        .unwrap();
+                    if canonical {
+                        store
+                            .publish_feature_setting(
+                                "guild",
+                                "community.levels",
+                                levels_enabled,
+                                "{}",
+                                None,
+                                "test",
+                                &[],
+                            )
+                            .unwrap();
+                    }
+                    assert_eq!(
+                        feature_enabled(&store, "guild", key, None),
+                        levels_enabled,
+                        "canonical={canonical}, levels={levels_enabled}, editor={editor_enabled}"
+                    );
+                }
+            }
+        }
+        assert_eq!(feature_title(key), "Levels & XP");
     }
 
     #[test]
