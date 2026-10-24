@@ -18,7 +18,12 @@ pub fn svg(name: &str, avatar: Option<(&str, &[u8])>, rows: &[AchievementProgres
     );
     let image = avatar.map(|(mime, bytes)| format!(r#"<image href="data:{mime};base64,{}" x="40" y="36" width="92" height="92" clip-path="url(#avatar)"/>"#,STANDARD.encode(bytes))).unwrap_or_default();
     let mut badges = String::new();
-    for (index, row) in rows.iter().take(7).enumerate() {
+    for (index, row) in rows
+        .iter()
+        .filter(|row| row.unlocked.iter().any(|unlocked| *unlocked))
+        .take(7)
+        .enumerate()
+    {
         let x = 84 + index * 122;
         let tier = row.unlocked.iter().filter(|v| **v).count();
         let color = match tier {
@@ -37,7 +42,7 @@ pub fn svg(name: &str, avatar: Option<(&str, &[u8])>, rows: &[AchievementProgres
             "boost" => "M2-19L-12 3H0L-3 20L14-4H3Z",
             _ => "M-15-12L-5 0L-15 12M15-12L5 0L15 12",
         };
-        badges.push_str(&format!(r##"<g transform="translate({x} 228)"><path d="M0-48L42-24V24L0 48L-42 24V-24Z" fill="#192A3B" stroke="{color}" stroke-width="3"/><path d="M0-40L35-20V20L0 40L-35 20V-20Z" fill="none" stroke="{color}" opacity=".35"/><path d="{icon}" fill="none" stroke="{color}" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/><text y="72" text-anchor="middle" font-size="16" fill="{color}">{tier} / {}</text></g>"##,row.thresholds.len()));
+        badges.push_str(&format!(r##"<g transform="translate({x} 228)"><path d="M0-48L42-24V24L0 48L-42 24V-24Z" fill="{color}" fill-opacity=".18" stroke="{color}" stroke-width="3"/><path d="M0-40L35-20V20L0 40L-35 20V-20Z" fill="none" stroke="{color}" opacity=".35"/><path d="{icon}" fill="none" stroke="{color}" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></g>"##));
     }
     let total = rows.len();
     let width = (score / total.max(1) as f64 * 576.0).clamp(0.0, 576.0);
@@ -104,6 +109,37 @@ pub(super) fn button_labels(locale: &str) -> (&'static str, &'static str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn only_unlocked_medals_are_shown_with_their_highest_tier_color() {
+        let rows: Vec<_> = (0..=4)
+            .map(|tier| AchievementProgress {
+                id: "messages".into(),
+                name: String::new(),
+                description: String::new(),
+                value: tier,
+                thresholds: vec![1, 2, 3, 4],
+                unlocked: (1..=4).map(|threshold| threshold <= tier).collect(),
+            })
+            .collect();
+        let empty = svg("Member", None, &rows[..1]);
+        assert!(
+            !empty.contains("<g transform="),
+            "locked medals stay hidden"
+        );
+        let source = svg("Member", None, &rows);
+        assert_eq!(source.matches("<g transform=").count(), 4);
+        for (index, color) in ["#E1A578", "#CCD5E4", "#FFD170", "#82DBF7"]
+            .iter()
+            .enumerate()
+        {
+            let x = 84 + index * 122;
+            assert!(source.contains(&format!(r#"translate({x} 228)"#)));
+            assert!(source.contains(&format!(r#"stroke="{color}""#)));
+        }
+        assert!(!source.contains("<text y="), "medals have no tier counters");
+        assert!(!source.contains("#526278"));
+    }
+
     #[test]
     fn achievement_card_is_a_readable_png_and_escapes_profile_text() {
         let store = helper_store::Store::open(":memory:").unwrap();
