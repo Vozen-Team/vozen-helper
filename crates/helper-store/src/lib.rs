@@ -6,6 +6,9 @@ pub use growth_lifecycle::{GrowthDailyMetric, GrowthOverview, growth_source};
 mod topgg_sync;
 pub use topgg_sync::{TopggSyncDetail, TopggSyncStatus};
 
+mod achievement_activity;
+pub use achievement_activity::AchievementProgress;
+
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Duration, Utc};
 use helper_contracts::{EntitlementSnapshot, SessionClaims, is_valid_workflow_reaction};
@@ -1038,6 +1041,8 @@ impl Store {
         let tx = conn.unchecked_transaction()?;
         growth_lifecycle::backfill_growth_retention(&tx)?;
         tx.commit()?;
+        drop(conn);
+        self.migrate_achievement_activity()?;
         Ok(())
     }
 
@@ -2097,6 +2102,17 @@ impl Store {
         }
         let next_revision = current_revision.saturating_add(1);
         let now = Utc::now().timestamp_millis();
+        if key == "community.achievements" && !enabled {
+            tx.execute("INSERT INTO achievement_activity(guild_id,user_id,kind,value) SELECT guild_id,user_id,'voice',MIN(36000,MAX(0,?2-started_at)) FROM achievement_voice WHERE guild_id=?1 ON CONFLICT(guild_id,user_id,kind) DO UPDATE SET value=MIN(36000,value+excluded.value)",params![guild_id,now/1000])?;
+            tx.execute(
+                "DELETE FROM achievement_voice WHERE guild_id=?1",
+                params![guild_id],
+            )?;
+            tx.execute(
+                "DELETE FROM achievement_links WHERE guild_id=?1",
+                params![guild_id],
+            )?;
+        }
         if key == "support.welcome" {
             tx.execute("INSERT INTO settings(guild_id,key,value,updated_at) VALUES(?1,'support.welcome.unified','true',?2) ON CONFLICT(guild_id,key) DO UPDATE SET value='true',updated_at=excluded.updated_at", params![guild_id, now])?;
         }
@@ -4225,6 +4241,8 @@ impl Store {
              UNION ALL SELECT 'economy' AS kind, CAST(balance AS TEXT), created_at FROM economy_accounts WHERE guild_id=?1 AND user_id=?2
              UNION ALL SELECT 'economy_transaction' AS kind, printf('%+d %s', amount, reason), created_at FROM economy_ledger WHERE guild_id=?1 AND user_id=?2
              UNION ALL SELECT 'xp_event' AS kind, printf('%+d %s', amount, source), created_at FROM xp_events WHERE guild_id=?1 AND user_id=?2
+             UNION ALL SELECT 'achievement_activity' AS kind, printf('%s: %d', kind, value), 0 FROM achievement_activity WHERE guild_id=?1 AND user_id=?2
+             UNION ALL SELECT 'achievement' AS kind, achievement_key, unlocked_at FROM achievements WHERE guild_id=?1 AND user_id=?2
              ORDER BY kind",
         )?;
         for row in stmt.query_map(params![guild_id, user_id], |row| {
@@ -4318,6 +4336,26 @@ impl Store {
                 "DELETE FROM event_registrations WHERE guild_id=?2 AND user_id=?1",
             ),
             ("afk", "DELETE FROM afk WHERE guild_id=?2 AND user_id=?1"),
+            (
+                "achievements",
+                "DELETE FROM achievements WHERE guild_id=?2 AND user_id=?1",
+            ),
+            (
+                "achievement_activity",
+                "DELETE FROM achievement_activity WHERE guild_id=?2 AND user_id=?1",
+            ),
+            (
+                "achievement_events",
+                "DELETE FROM achievement_events WHERE guild_id=?2 AND user_id=?1",
+            ),
+            (
+                "achievement_voice",
+                "DELETE FROM achievement_voice WHERE guild_id=?2 AND user_id=?1",
+            ),
+            (
+                "achievement_links",
+                "DELETE FROM achievement_links WHERE guild_id=?2 AND user_id=?1",
+            ),
             (
                 "levels",
                 "DELETE FROM levels WHERE guild_id=?2 AND user_id=?1",
@@ -4606,6 +4644,11 @@ impl Store {
             "DELETE FROM levels WHERE guild_id=?1",
             "DELETE FROM xp_events WHERE guild_id=?1",
             "DELETE FROM achievements WHERE guild_id=?1",
+            "DELETE FROM achievement_activity WHERE guild_id=?1",
+            "DELETE FROM achievement_events WHERE guild_id=?1",
+            "DELETE FROM achievement_voice WHERE guild_id=?1",
+            "DELETE FROM achievement_links WHERE guild_id=?1",
+            "DELETE FROM achievement_threads WHERE guild_id=?1",
             "DELETE FROM welcome_delivery_claims WHERE guild_id=?1",
             "DELETE FROM voice_sessions WHERE guild_id=?1",
             "DELETE FROM birthdays WHERE guild_id=?1",

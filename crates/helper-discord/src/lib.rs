@@ -55,6 +55,7 @@ use std::{
 };
 use tracing::{info, warn};
 
+pub mod achievement_card;
 pub mod giveaway_card;
 mod giveaway_display;
 pub mod leaderboard_card;
@@ -1859,6 +1860,30 @@ impl EventHandler for Handler {
         let guild_text = guild_id.to_string();
         let user_text = new.user_id.to_string();
 
+        if feature_enabled(&self.store, &guild_text, "community.achievements", None)
+            && (new
+                .member
+                .as_ref()
+                .or_else(|| old.as_ref().and_then(|state| state.member.as_ref()))
+                .is_some_and(|member| !member.user.bot)
+                || new_channel_id.is_none())
+        {
+            let channel = new_channel_id.map(|channel| channel.to_string());
+            if let Err(error) = self.store.update_achievement_voice(
+                &guild_text,
+                &user_text,
+                channel.as_deref(),
+                Utc::now().timestamp(),
+            ) {
+                warn!(%error, "achievement voice tracking failed");
+            }
+            let _ = self.store.sync_activity_achievements(
+                &guild_text,
+                &user_text,
+                Utc::now().timestamp(),
+            );
+        }
+
         if feature_enabled(&self.store, &guild_text, "management.audit", None) {
             let detail = serde_json::json!({
                 "oldChannelId": old_channel_id.map(|channel| channel.to_string()),
@@ -2025,6 +2050,83 @@ impl EventHandler for Handler {
                     }
                 }
             }
+        }
+    }
+
+    async fn thread_create(&self, ctx: Context, thread: serenity::all::GuildChannel) {
+        if !feature_enabled(
+            &self.store,
+            &thread.guild_id.to_string(),
+            "community.achievements",
+            None,
+        ) {
+            return;
+        }
+        let _ = self
+            .store
+            .remember_achievement_thread(&thread.guild_id.to_string(), &thread.id.to_string());
+        // Discord also sends ThreadCreate when the bot discovers an old private thread.
+        if (Utc::now().timestamp() - thread.id.created_at().unix_timestamp()).abs() > 300 {
+            return;
+        }
+        if let Some(owner) = thread.owner_id
+            && let Ok(user) = owner.to_user(&ctx.http).await
+            && !user.bot
+        {
+            self.track_achievement(
+                thread.guild_id,
+                owner,
+                "threads_created",
+                &thread.id.to_string(),
+            );
+        }
+    }
+
+    async fn thread_list_sync(&self, _ctx: Context, event: serenity::all::ThreadListSyncEvent) {
+        if feature_enabled(
+            &self.store,
+            &event.guild_id.to_string(),
+            "community.achievements",
+            None,
+        ) {
+            for thread in event.threads {
+                let _ = self.store.remember_achievement_thread(
+                    &event.guild_id.to_string(),
+                    &thread.id.to_string(),
+                );
+            }
+        }
+    }
+
+    async fn thread_members_update(
+        &self,
+        _ctx: Context,
+        event: serenity::all::ThreadMembersUpdateEvent,
+    ) {
+        for member in event.added_members.iter().filter(|member| {
+            member
+                .member
+                .as_ref()
+                .is_some_and(|member| !member.user.bot)
+        }) {
+            self.track_achievement(
+                event.guild_id,
+                member.user_id,
+                "threads_joined",
+                &event.id.to_string(),
+            );
+        }
+    }
+
+    async fn guild_member_update(
+        &self,
+        _ctx: Context,
+        _old: Option<serenity::all::Member>,
+        _new: Option<serenity::all::Member>,
+        event: serenity::all::GuildMemberUpdateEvent,
+    ) {
+        if !event.user.bot && event.premium_since.is_some() {
+            self.track_achievement(event.guild_id, event.user.id, "boost", "boost");
         }
     }
 
@@ -2899,6 +3001,14 @@ impl EventHandler for Handler {
         let Some(guild_id) = reaction.guild_id else {
             return;
         };
+        if let Some(member) = reaction.member.as_ref().filter(|member| !member.user.bot) {
+            self.track_achievement(
+                guild_id,
+                member.user.id,
+                "reactions",
+                &format!("{}:{}", reaction.message_id, reaction.emoji),
+            );
+        }
         if !feature_enabled(
             &self.store,
             &guild_id.to_string(),
@@ -3369,9 +3479,10 @@ impl EventHandler for Handler {
         }
     }
 
-    async fn reaction_remove(&self, ctx: Context, reaction: serenity::all::Reaction) {
+    async fn reaction_remove(&self, ctx: Context, mut reaction: serenity::all::Reaction) {
         // The board reconciler reads the current reaction users, so the same
         // path safely handles additions, removals and Discord retries.
+        reaction.member = None; // Removals must not count as added reactions.
         self.reaction_add(ctx, reaction).await;
     }
 
@@ -3384,6 +3495,24 @@ impl EventHandler for Handler {
         };
         let guild_text = guild_id.to_string();
         let user_text = message.author.id.to_string();
+        self.track_achievement(
+            guild_id,
+            message.author.id,
+            "messages",
+            &message.id.to_string(),
+        );
+        let is_thread = self
+            .store
+            .is_achievement_thread(&guild_text, &message.channel_id.to_string())
+            .unwrap_or(false);
+        if is_thread {
+            self.track_achievement(
+                guild_id,
+                message.author.id,
+                "threads_joined",
+                &message.channel_id.to_string(),
+            );
+        }
         let _ = self.store.record_message(
             &guild_text,
             &chrono::Utc::now().format("%Y-%m-%d").to_string(),
@@ -5530,6 +5659,32 @@ fn achievement_reward_role_for_store(
 }
 
 impl Handler {
+    fn track_achievement(
+        &self,
+        guild: serenity::all::GuildId,
+        user: serenity::all::UserId,
+        kind: &str,
+        event: &str,
+    ) {
+        let guild = guild.to_string();
+        if !feature_enabled(&self.store, &guild, "community.achievements", None) {
+            return;
+        }
+        let user = user.to_string();
+        if let Err(error) = self
+            .store
+            .record_achievement_event(&guild, &user, kind, event)
+            .and_then(|changed| {
+                if changed {
+                    self.store
+                        .sync_activity_achievements(&guild, &user, Utc::now().timestamp())?;
+                }
+                Ok(())
+            })
+        {
+            warn!(%error, "achievement activity tracking failed");
+        }
+    }
     /// Reconcile an existing starboard entry after the source message changes.
     /// Reaction events are not emitted for edits, so without this pass the
     /// board would keep stale text/attachments until the next reaction.
@@ -6805,22 +6960,33 @@ impl Handler {
                         Utc::now().timestamp_millis(),
                     );
                 }
-                let unlocked = self
-                    .store
-                    .achievements_for(&guild_text, &command.user.id.to_string())?;
-                let achievements = configured_achievement_milestones(&self.store, &guild_text)
-                    .into_iter()
-                    .map(|(key, label, threshold)| {
-                        let label = private_replies::system_word(label);
-                        let persisted = unlocked.iter().any(|entry| entry.achievement_key == key);
-                        if persisted {
-                            format!("✅ {label} ({threshold} XP)")
-                        } else {
-                            format!("🔒 {label} ({threshold} XP)")
-                        }
-                    })
-                    .collect::<Vec<_>>();
-                format!("Your achievements ({xp} XP):\n{}", achievements.join("\n"))
+                let user = command.user.id.to_string();
+                let now = Utc::now().timestamp();
+                if command.member.as_ref().is_some_and(|member| member.premium_since.is_some()) {
+                    self.track_achievement(guild_id,command.user.id,"boost","boost");
+                }
+                self.store.sync_activity_achievements(&guild_text,&user,now)?;
+                let rows = self.store.achievement_progress(&guild_text,&user,now)?;
+                let name = command.user.global_name.as_deref().unwrap_or(&command.user.name);
+                let token = self.store.create_achievement_link(&guild_text,&user,name,&command.user.static_face(),now)?;
+                if let Ok(Ok(guild)) = tokio::time::timeout(Duration::from_secs(2),guild_id.to_partial_guild(&ctx.http)).await {
+                    self.store.set_setting(&guild_text,"community.achievements.guild_name",&guild.name)?;
+                }
+                let (personal,list) = achievement_card::button_labels(&command.locale);
+                let locale = if command.locale.starts_with("pt") {"pt"} else {"en"};
+                let base = format!("https://vozen.org/panel/helper-tracker/#/achievements/{guild_text}");
+                let caption = format!("{personal} · {xp} XP");
+                let mut response = EditInteractionResponse::new().allowed_mentions(CreateAllowedMentions::new()).components(vec![CreateActionRow::Buttons(vec![
+                    CreateButton::new_link(format!("{base}/{token}?lang={locale}")).label(personal),
+                    CreateButton::new_link(format!("{base}?lang={locale}")).label(list),
+                ])]);
+                if let Some(png) = achievement_card::image(&command.user,rows).await {
+                    response=response.content("").new_attachment(CreateAttachment::bytes(png,"achievements.png").description(&caption));
+                } else {
+                    response=response.content(&caption);
+                }
+                command.edit_response(ctx,response).await?;
+                return Ok(());
             }
             "search" => {
                 let Some(guild_id) = command.guild_id else {

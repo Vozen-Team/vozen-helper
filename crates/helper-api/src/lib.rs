@@ -2,6 +2,7 @@
 
 #![recursion_limit = "256"]
 
+mod achievements;
 mod discord_context;
 mod discord_read;
 mod starboard_channel;
@@ -122,6 +123,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/oauth/callback", get(oauth_callback))
         .route("/api/logout", post(logout))
         .route("/api/me", get(me))
+        .route("/api/achievements/{guild}", get(achievements::page))
         .route("/api/starboard/channel", post(starboard_channel::create))
         .route(
             "/api/birthdays/channel",
@@ -12291,7 +12293,7 @@ mod tests {
         );
     }
 
-    fn state(store: Store) -> ApiState {
+    pub(super) fn state(store: Store) -> ApiState {
         ApiState {
             store,
             discord_token: "test-token".into(),
