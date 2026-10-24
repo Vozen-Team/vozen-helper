@@ -400,6 +400,9 @@ mod tests {
                 render_rank_card(&config, "member", None, None, 1, 25)
                     .contains("data:image/png;base64,")
             );
+            let rendered = render_png(&config, "member", None, None, 1, 25)
+                .expect("every curated preset rasterizes");
+            assert!(rendered.starts_with(b"\x89PNG\r\n\x1a\n"));
         }
         let config = RankCardConfig {
             background_preset: Some("aurora-lake".into()),

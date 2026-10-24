@@ -572,21 +572,21 @@ fn recover_eth_address(message: &str, signature: &str) -> anyhow::Result<String>
     };
     let signature =
         Signature::try_from(&bytes[..64]).map_err(|_| anyhow::anyhow!("siwe_signature_invalid"))?;
+    // Recovery no longer verifies low-S in k256 0.14; preserve the previous rejection.
+    if signature != signature.normalize_s() {
+        anyhow::bail!("siwe_signature_invalid");
+    }
     let recovery =
         RecoveryId::try_from(recovery).map_err(|_| anyhow::anyhow!("siwe_recovery_id_invalid"))?;
     let mut payload = format!("\x19Ethereum Signed Message:\n{}", message.len()).into_bytes();
     payload.extend_from_slice(message.as_bytes());
-    let key = VerifyingKey::recover_from_digest(
-        Keccak256::new_with_prefix(payload),
-        &signature,
-        recovery,
-    )
-    .map_err(|_| anyhow::anyhow!("siwe_signature_invalid"))?;
+    let key = VerifyingKey::recover_from_prehash(&Keccak256::digest(payload), &signature, recovery)
+        .map_err(|_| anyhow::anyhow!("siwe_signature_invalid"))?;
     Ok(eth_address_from_key(&key))
 }
 
 fn eth_address_from_key(key: &VerifyingKey) -> String {
-    let point = key.to_encoded_point(false);
+    let point = key.to_sec1_point(false);
     let digest = Keccak256::digest(&point.as_bytes()[1..]);
     format!("0x{}", hex::encode(&digest[12..]))
 }
@@ -2912,6 +2912,49 @@ mod tests {
     }
 
     #[test]
+    fn ethereum_recovery_matches_external_personal_sign_vector() {
+        // ethers.js v3 Wallet.verifyMessage example: https://docs.ethers.org/v3/api-wallet.html
+        let signature = concat!(
+            "ddd0a7290af9526056b4e35a077b9a11b513aa0028ec6c9880948544508f3c63",
+            "265e99e47ad31bb2cab9646c504576b3abc6939a1710afc08cbf3034d73214b8",
+            "1c"
+        );
+        let address = "0x14791697260e4c9a71f18484c9f997b308e59325";
+        assert_eq!(
+            recover_eth_address("hello world", signature).unwrap(),
+            address
+        );
+        let prefixed = format!("0x{signature}");
+        assert_eq!(
+            recover_eth_address("hello world", &prefixed).unwrap(),
+            address
+        );
+        let raw_recovery = format!("{}01", &signature[..128]);
+        assert_eq!(
+            recover_eth_address("hello world", &raw_recovery).unwrap(),
+            address
+        );
+        assert_ne!(
+            recover_eth_address("hello world!", signature).unwrap(),
+            address
+        );
+        let high_s = concat!(
+            "ddd0a7290af9526056b4e35a077b9a11b513aa0028ec6c9880948544508f3c63",
+            "d9a1661b852ce44d35469b93afba894b0ee8494c9837f07b33132e57f9042c89",
+            "1b"
+        );
+        assert!(recover_eth_address("hello world", high_s).is_err());
+        for invalid in [
+            "zz".to_owned(),
+            "00".repeat(65),
+            format!("{}02", &signature[..128]),
+            signature[..128].to_owned(),
+        ] {
+            assert!(recover_eth_address("hello world", &invalid).is_err());
+        }
+    }
+
+    #[test]
     fn siwe_rejects_wrong_context_and_recovers_ethereum_address() {
         use k256::ecdsa::SigningKey;
 
@@ -2937,9 +2980,8 @@ mod tests {
         );
         let mut payload = format!("\x19Ethereum Signed Message:\n{}", message.len()).into_bytes();
         payload.extend_from_slice(message.as_bytes());
-        let (signature, recovery) = signing_key
-            .sign_digest_recoverable(Keccak256::new_with_prefix(payload))
-            .unwrap();
+        let (signature, recovery) =
+            signing_key.sign_prehash_recoverable(&Keccak256::digest(payload));
         let encoded = format!(
             "0x{}{:02x}",
             hex::encode(signature.to_bytes()),
