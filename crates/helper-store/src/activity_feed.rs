@@ -44,12 +44,14 @@ impl Store {
               created_at, (type GLOB 'helper_*' OR CASE WHEN json_valid(detail) THEN COALESCE(json_extract(detail,'$.by_helper'),0) ELSE 0 END) AS helper
             FROM activity_log WHERE guild_id=?1
             UNION ALL
-            SELECT id, 1, type, target_id, NULL, moderator_id, reason,
+            SELECT id, 1, type, target_id, NULL, moderator_id, CASE WHEN duration_ms IS NOT NULL THEN json_object('reason',reason,'duration_ms',duration_ms) ELSE reason END,
               CASE WHEN type IN ('anti-spam','anti-scam','anti_nuke_audit') THEN 'detected' ELSE 'recorded' END, created_at, 1
             FROM cases WHERE guild_id=?1
             UNION ALL
             SELECT id, 2, action, actor_id, NULL, actor_id, reason, outcome, created_at, 1
-            FROM audit_events WHERE guild_id=?1
+            FROM audit_events a WHERE guild_id=?1
+              AND NOT EXISTS (SELECT 1 FROM cases c WHERE c.guild_id=?1 AND c.type=a.action AND a.outcome='recorded'
+                AND c.id=CASE WHEN json_valid(a.after_json) THEN json_extract(a.after_json,'$.caseId') END)
           ), classified AS (
             SELECT *, CASE
               WHEN kind IN ('member_join','join') THEN 'joins'
