@@ -5012,9 +5012,9 @@ impl Store {
     pub fn top_levels(&self, guild_id: &str, limit: u32) -> Result<Vec<LevelRecord>> {
         let conn = self.conn.lock().expect("store mutex poisoned");
         let mut stmt = conn.prepare(
-            "SELECT guild_id,user_id,xp FROM levels WHERE guild_id=?1 ORDER BY xp DESC LIMIT ?2",
+            "SELECT guild_id,user_id,xp FROM levels WHERE guild_id=?1 ORDER BY xp DESC,user_id ASC LIMIT ?2",
         )?;
-        let rows = stmt.query_map(params![guild_id, i64::from(limit.min(25))], |row| {
+        let rows = stmt.query_map(params![guild_id, i64::from(limit.min(100))], |row| {
             Ok(LevelRecord {
                 guild_id: row.get(0)?,
                 user_id: row.get(1)?,
@@ -6469,6 +6469,25 @@ mod tests {
                 .consume_quota("guild", "user", "workflow_runs", 1, Utc::now())
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn leaderboard_query_honors_the_configurable_hundred_member_limit() {
+        let store = Store::open(":memory:").unwrap();
+        for index in 0..110 {
+            store
+                .add_xp("guild", &format!("member-{index:03}"), 100)
+                .unwrap();
+        }
+        store.add_xp("other-guild", "outsider", 9999).unwrap();
+        let rows = store.top_levels("guild", 100).unwrap();
+        assert_eq!(rows.len(), 100);
+        assert_eq!(rows[0].user_id, "member-000");
+        assert_eq!(rows[99].user_id, "member-099");
+        assert!(rows.iter().all(|row| row.guild_id == "guild"));
+        assert_eq!(store.top_levels("guild", 10).unwrap().len(), 10);
+        assert_eq!(store.top_levels("guild", 1000).unwrap().len(), 100);
+        assert!(store.top_levels("guild", 0).unwrap().is_empty());
     }
 
     #[test]
