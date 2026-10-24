@@ -206,6 +206,12 @@ pub const RANK_CARD_BACKGROUND_PRESETS: &[(&str, &str)] = &[
     ("moonlit-village", "Moonlit Village"),
     ("starship-hangar", "Starship Hangar"),
     ("lavender-storm", "Lavender Storm"),
+    ("crystal-cavern", "Crystal Cavern"),
+    ("sakura-shrine", "Sakura Shrine"),
+    ("cosmic-nebula", "Cosmic Nebula"),
+    ("frost-citadel", "Frost Citadel"),
+    ("tropical-lagoon", "Tropical Lagoon"),
+    ("clockwork-library", "Clockwork Library"),
 ];
 
 /// Guild-scoped visual configuration used by the `/rank` card and its panel

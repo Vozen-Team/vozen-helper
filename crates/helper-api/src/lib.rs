@@ -14162,6 +14162,19 @@ mod tests {
         assert!(store.load_session(session.session_id).unwrap().is_none());
     }
 
+    #[test]
+    fn all_curated_backgrounds_pass_rank_card_validation() {
+        assert_eq!(RANK_CARD_BACKGROUND_PRESETS.len(), 16);
+        for (id, _) in RANK_CARD_BACKGROUND_PRESETS {
+            let config = RankCardConfig {
+                background_preset: Some((*id).into()),
+                ..RankCardConfig::default()
+            };
+            assert!(valid_rank_card_config(&config), "preset {id}");
+        }
+        assert!(!valid_rank_card_preset(Some("untrusted-background")));
+    }
+
     #[tokio::test]
     async fn rank_card_config_is_guild_scoped_and_validated() {
         let store = Store::open(":memory:").unwrap();

@@ -69,6 +69,24 @@ pub fn preset_png(preset: &str) -> Option<&'static [u8]> {
         "lavender-storm" => {
             include_bytes!("../../../assets/rank-card-banners/banner-10-lavender-storm.png")
         }
+        "crystal-cavern" => {
+            include_bytes!("../../../assets/rank-card-banners/banner-11-crystal-cavern.png")
+        }
+        "sakura-shrine" => {
+            include_bytes!("../../../assets/rank-card-banners/banner-12-sakura-shrine.png")
+        }
+        "cosmic-nebula" => {
+            include_bytes!("../../../assets/rank-card-banners/banner-13-cosmic-nebula.png")
+        }
+        "frost-citadel" => {
+            include_bytes!("../../../assets/rank-card-banners/banner-14-frost-citadel.png")
+        }
+        "tropical-lagoon" => {
+            include_bytes!("../../../assets/rank-card-banners/banner-15-tropical-lagoon.png")
+        }
+        "clockwork-library" => {
+            include_bytes!("../../../assets/rank-card-banners/banner-16-clockwork-library.png")
+        }
         _ => return None,
     };
     Some(bytes)
@@ -370,6 +388,19 @@ mod tests {
 
     #[test]
     fn renders_only_curated_background_presets() {
+        assert_eq!(helper_contracts::RANK_CARD_BACKGROUND_PRESETS.len(), 16);
+        for (id, _) in helper_contracts::RANK_CARD_BACKGROUND_PRESETS {
+            let png = preset_png(id).expect("every curated preset has an embedded image");
+            assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
+            let config = RankCardConfig {
+                background_preset: Some((*id).into()),
+                ..RankCardConfig::default()
+            };
+            assert!(
+                render_rank_card(&config, "member", None, None, 1, 25)
+                    .contains("data:image/png;base64,")
+            );
+        }
         let config = RankCardConfig {
             background_preset: Some("aurora-lake".into()),
             background_url: Some("https://untrusted.example/image.png".into()),
