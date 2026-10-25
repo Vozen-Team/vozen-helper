@@ -10292,6 +10292,31 @@ impl FeatureAdapter for EmbedsAdapter {
     }
 }
 
+pub fn shop_role_permissions_safe(bits: u64) -> bool {
+    // A purchasable reward must not grant moderation or server administration.
+    const PRIVILEGED: u64 = (1 << 1)
+        | (1 << 2)
+        | 8
+        | 16
+        | 32
+        | (1 << 7)
+        | (1 << 13)
+        | (1 << 17)
+        | (1 << 22)
+        | (1 << 23)
+        | (1 << 24)
+        | (1 << 27)
+        | (1 << 28)
+        | (1 << 29)
+        | (1 << 30)
+        | (1 << 33)
+        | (1 << 34)
+        | (1 << 40)
+        | (1 << 43)
+        | (1 << 44);
+    bits & PRIVILEGED == 0
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct EconomyAdapter;
 

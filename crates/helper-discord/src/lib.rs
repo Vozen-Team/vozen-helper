@@ -58,6 +58,7 @@ use tracing::{info, warn};
 mod achievement_announcement;
 pub mod achievement_card;
 mod activity_observer;
+mod economy_shop;
 pub mod giveaway_card;
 mod giveaway_display;
 pub mod leaderboard_card;
@@ -65,6 +66,7 @@ pub mod poll_card;
 mod poll_display;
 mod private_replies;
 mod rank_card;
+mod shop_i18n;
 pub mod starboard_card;
 mod starboard_display;
 pub mod suggestion_card;
@@ -1125,6 +1127,7 @@ impl EventHandler for Handler {
                 ),
             CreateCommand::new("emojis").description("List this server's custom emojis"),
             CreateCommand::new("invites").description("Show current server invite usage"),
+            CreateCommand::new("shop").description("Browse and buy community rewards"),
             CreateCommand::new("balance").description("Show your community balance"),
             CreateCommand::new("daily").description("Claim your daily community reward"),
             CreateCommand::new("work").description("Claim a cooldown-based community work reward"),
@@ -7540,6 +7543,7 @@ impl Handler {
                     format!("{invite_text}\n\nTracked joins:\n{tracked_text}")
                 }
             }
+            "shop" => return economy_shop::show(&self.store, ctx, command).await,
             "balance" => {
                 let Some(guild_id) = command.guild_id else {
                     return respond(ctx, command, "This command can only be used in a server.").await;
@@ -9185,6 +9189,9 @@ impl Handler {
         ctx: &Context,
         component: &serenity::all::ComponentInteraction,
     ) -> Result<()> {
+        if component.data.custom_id.starts_with("shop:") {
+            return economy_shop::handle(&self.store, ctx, component).await;
+        }
         let Some(guild_id) = component.guild_id else {
             return respond_component(ctx, component, "Este botão só funciona num servidor.").await;
         };
@@ -12171,7 +12178,7 @@ fn command_feature_key(name: &str) -> Option<&'static str> {
         "search" => "utility.search",
         "emojis" => "utility.emojis",
         "invites" => "management.invite_tracker",
-        "balance" | "daily" | "work" | "economy-top" => "community.economy",
+        "shop" | "balance" | "daily" | "work" | "economy-top" => "community.economy",
         "temp-channel" => "utility.temp_channels",
         "embed" => "utility.embeds",
         "starboard-set" => "community.starboard",
@@ -14670,6 +14677,7 @@ mod tests {
     #[test]
     fn command_feature_map_covers_mutating_and_provider_commands() {
         let expected = [
+            ("shop", "community.economy"),
             ("join-gate", "protection.join_gate"),
             ("anti-raid", "protection.anti_raid"),
             ("anti-nuke", "management.audit"),

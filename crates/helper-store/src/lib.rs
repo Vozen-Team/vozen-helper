@@ -1,5 +1,7 @@
 //! SQLite persistence with an intentionally small, auditable surface.
 
+mod economy_shop;
+pub use economy_shop::{ShopOrder, ShopProduct, ShopProductInput};
 mod growth_lifecycle;
 mod welcome;
 pub use growth_lifecycle::{GrowthDailyMetric, GrowthOverview, growth_source};
@@ -966,6 +968,7 @@ impl Store {
         // different sources may legitimately overlap in fixtures/imports.
         conn.execute_batch("CREATE TABLE IF NOT EXISTS xp_events (guild_id TEXT NOT NULL, user_id TEXT NOT NULL, event_key TEXT NOT NULL, source TEXT NOT NULL, amount INTEGER NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY(guild_id,event_key)); CREATE INDEX IF NOT EXISTS idx_xp_events_user_time ON xp_events(guild_id,user_id,created_at DESC);")?;
         conn.execute_batch("CREATE TABLE IF NOT EXISTS birthdays (guild_id TEXT NOT NULL, user_id TEXT NOT NULL, month INTEGER NOT NULL, day INTEGER NOT NULL, last_announced_year INTEGER, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY(guild_id,user_id)); CREATE INDEX IF NOT EXISTS idx_birthdays_day ON birthdays(month,day,last_announced_year); CREATE TABLE IF NOT EXISTS economy_accounts (guild_id TEXT NOT NULL, user_id TEXT NOT NULL, balance INTEGER NOT NULL DEFAULT 0, last_daily_at INTEGER, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY(guild_id,user_id)); CREATE INDEX IF NOT EXISTS idx_economy_guild_balance ON economy_accounts(guild_id,balance DESC); CREATE TABLE IF NOT EXISTS economy_ledger (id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id TEXT NOT NULL, user_id TEXT NOT NULL, amount INTEGER NOT NULL, reason TEXT NOT NULL, idempotency_key TEXT NOT NULL UNIQUE, created_at INTEGER NOT NULL); CREATE INDEX IF NOT EXISTS idx_economy_ledger_account ON economy_ledger(guild_id,user_id,created_at DESC); CREATE TABLE IF NOT EXISTS temp_channels (guild_id TEXT NOT NULL, channel_id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, created_at INTEGER NOT NULL); CREATE INDEX IF NOT EXISTS idx_temp_channels_guild ON temp_channels(guild_id); CREATE TABLE IF NOT EXISTS voice_sessions (guild_id TEXT NOT NULL, user_id TEXT NOT NULL, channel_id TEXT NOT NULL, started_at INTEGER NOT NULL, PRIMARY KEY(guild_id,user_id)); CREATE INDEX IF NOT EXISTS idx_voice_sessions_guild ON voice_sessions(guild_id,started_at);")?;
+        economy_shop::migrate(&conn)?;
         conn.execute_batch("CREATE TABLE IF NOT EXISTS economy_cooldowns (guild_id TEXT NOT NULL, user_id TEXT NOT NULL, kind TEXT NOT NULL, last_claim_at INTEGER NOT NULL, PRIMARY KEY(guild_id,user_id,kind)); CREATE INDEX IF NOT EXISTS idx_economy_cooldowns_kind ON economy_cooldowns(guild_id,kind,last_claim_at);")?;
         conn.execute_batch("CREATE TABLE IF NOT EXISTS provider_events (provider TEXT NOT NULL, event_id TEXT NOT NULL, payload TEXT NOT NULL, received_at INTEGER NOT NULL, PRIMARY KEY(provider,event_id));")?;
         // Acquisition data is deliberately separate from member/server content.
@@ -1561,6 +1564,10 @@ impl Store {
             (
                 "birthdays",
                 "DELETE FROM birthdays WHERE guild_id=?2 AND user_id=?1",
+            ),
+            (
+                "economy_orders",
+                "DELETE FROM economy_orders WHERE guild_id=?2 AND user_id=?1",
             ),
             (
                 "economy_accounts",
@@ -4242,6 +4249,7 @@ impl Store {
              UNION ALL SELECT 'tag' AS kind, name, created_at FROM tags WHERE guild_id=?1 AND author_id=?2
              UNION ALL SELECT 'birthday' AS kind, printf('%02d-%02d', month, day), created_at FROM birthdays WHERE guild_id=?1 AND user_id=?2
              UNION ALL SELECT 'economy' AS kind, CAST(balance AS TEXT), created_at FROM economy_accounts WHERE guild_id=?1 AND user_id=?2
+             UNION ALL SELECT 'shop_order' AS kind, printf('%s: %d (%s)', product_name, price, status), created_at FROM economy_orders WHERE guild_id=?1 AND user_id=?2
              UNION ALL SELECT 'economy_transaction' AS kind, printf('%+d %s', amount, reason), created_at FROM economy_ledger WHERE guild_id=?1 AND user_id=?2
              UNION ALL SELECT 'xp_event' AS kind, printf('%+d %s', amount, source), created_at FROM xp_events WHERE guild_id=?1 AND user_id=?2
              UNION ALL SELECT 'achievement_activity' AS kind, printf('%s: %d', kind, value), 0 FROM achievement_activity WHERE guild_id=?1 AND user_id=?2
@@ -4374,6 +4382,10 @@ impl Store {
             (
                 "birthdays",
                 "DELETE FROM birthdays WHERE guild_id=?2 AND user_id=?1",
+            ),
+            (
+                "economy_orders",
+                "DELETE FROM economy_orders WHERE guild_id=?2 AND user_id=?1",
             ),
             (
                 "economy_accounts",
@@ -4655,6 +4667,8 @@ impl Store {
             "DELETE FROM welcome_delivery_claims WHERE guild_id=?1",
             "DELETE FROM voice_sessions WHERE guild_id=?1",
             "DELETE FROM birthdays WHERE guild_id=?1",
+            "DELETE FROM economy_orders WHERE guild_id=?1",
+            "DELETE FROM economy_products WHERE guild_id=?1",
             "DELETE FROM economy_accounts WHERE guild_id=?1",
             "DELETE FROM economy_cooldowns WHERE guild_id=?1",
             "DELETE FROM economy_ledger WHERE guild_id=?1",

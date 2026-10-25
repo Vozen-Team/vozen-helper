@@ -6,6 +6,7 @@ mod achievements;
 mod activity_feed;
 mod discord_context;
 mod discord_read;
+mod economy_shop;
 mod starboard_channel;
 mod ticket_panel;
 
@@ -106,6 +107,13 @@ pub struct Health {
 pub fn router(state: ApiState) -> Router {
     let allowed_origin = state.allowed_origin.clone();
     let router = Router::new()
+        .route("/api/economy/shop", get(economy_shop::get))
+        .route("/api/economy/products", post(economy_shop::create))
+        .route(
+            "/api/economy/products/{id}",
+            put(economy_shop::update).delete(economy_shop::remove),
+        )
+        .route("/api/economy/orders/{id}", put(economy_shop::resolve))
         .route("/health", get(health))
         .route("/api/v1/health", get(health))
         .route("/api/session", post(create_session))
@@ -15142,6 +15150,92 @@ mod tests {
                 .pending_event_id
                 .as_deref(),
             Some(message_id)
+        );
+    }
+    #[tokio::test]
+    async fn shop_routes_bind_guild_enforce_csrf_and_preserve_order_history() {
+        let store = Store::open(":memory:").unwrap();
+        let session = claims("guild-a");
+        store.save_session(&session).unwrap();
+        let token = sign_session(&session, "test-session-secret-with-at-least-32-bytes");
+        let mut test_state = state(store.clone());
+        test_state.allowed_origin = Some("https://vozen.org".into());
+        let app = router(test_state);
+        let body = serde_json::json!({"name":"Physical item","price":80,"delivery":"manual","roleId":null});
+        for (authenticated, origin, guild, price, expected) in [
+            (false, true, "guild-a", 80, StatusCode::UNAUTHORIZED),
+            (true, false, "guild-a", 80, StatusCode::FORBIDDEN),
+            (true, true, "guild-b", 80, StatusCode::CONFLICT),
+            (true, true, "guild-a", 0, StatusCode::BAD_REQUEST),
+            (true, true, "guild-a", 80, StatusCode::OK),
+        ] {
+            let mut value = body.clone();
+            value["price"] = serde_json::json!(price);
+            let mut request = Request::builder()
+                .method("POST")
+                .uri(format!("/api/economy/products?guildId={guild}"))
+                .header(header::CONTENT_TYPE, "application/json");
+            if authenticated {
+                request = request.header(header::COOKIE, format!("vh_session={token}"));
+            }
+            if origin {
+                request = request.header(header::ORIGIN, "https://vozen.org");
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(Body::from(value.to_string())).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+        }
+        let product = store.shop_products("guild-a").unwrap().remove(0);
+        assert!(store.shop_products("guild-b").unwrap().is_empty());
+        store.claim_daily("guild-a", "member", 100).unwrap();
+        let order = store
+            .buy_shop_product(
+                "guild-a",
+                "member",
+                "Display Name",
+                product.id,
+                product.version,
+                "purchase",
+            )
+            .unwrap();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/economy/shop?guildId=guild-a")
+                    .header(header::COOKIE, format!("vh_session={token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        let result: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 100000).await.unwrap()).unwrap();
+        assert_eq!(result["orders"][0]["displayName"], "Display Name");
+        for _ in 0..2 {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("PUT")
+                        .uri(format!("/api/economy/orders/{}?guildId=guild-a", order.id))
+                        .header(header::COOKIE, format!("vh_session={token}"))
+                        .header(header::ORIGIN, "https://vozen.org")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(r#"{"status":"refunded"}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        assert_eq!(
+            store.economy_account("guild-a", "member").unwrap().balance,
+            100
         );
     }
     #[tokio::test]
