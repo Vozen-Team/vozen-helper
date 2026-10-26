@@ -14220,7 +14220,7 @@ mod tests {
         // (handler, command or provider worker). This is intentionally a
         // source-level guard: it catches a new field being persisted without
         // silently becoming a no-op in production.
-        let source = include_str!("lib.rs");
+        let source = concat!(include_str!("lib.rs"), include_str!("temp_channels.rs"));
         let api_source = include_str!("../../helper-api/src/lib.rs");
         let store_source = include_str!("../../helper-store/src/lib.rs");
         for key in helper_core::FEATURE_KEYS {

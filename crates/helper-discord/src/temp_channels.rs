@@ -363,7 +363,7 @@ mod tests {
         );
         assert_eq!(store.active_temp_channels("1").unwrap(), 0);
         let requests = task.await.unwrap();
-        assert!(requests[1].starts_with("POST /guilds/1/channels "));
+        assert!(requests[1].starts_with("POST /api/v10/guilds/1/channels "));
         let body: Value =
             serde_json::from_str(requests[1].split("\r\n\r\n").nth(1).unwrap()).unwrap();
         assert_eq!(body["name"], "➕ Creator Channel");
@@ -373,7 +373,7 @@ mod tests {
     #[tokio::test]
     async fn joins_create_and_move_using_display_name_and_only_last_member_departure_deletes() {
         let (state, store, voice) = fixture();
-        let (http, task) = mock_http(vec![(200, json!([voice_channel(3)])), (200, voice_channel(4)), (200, json!({"user":{"id":"10","username":"rexy0345","discriminator":"0"},"roles":[],"joined_at":null,"deaf":false,"mute":false})), (200, voice_channel(4))]).await;
+        let (http, task) = mock_http(vec![(200, json!([voice_channel(3)])), (200, voice_channel(4)), (200, json!({"user":{"id":"10","username":"rexy0345","discriminator":"0"},"roles":[],"joined_at":null,"deaf":false,"mute":false,"flags":0})), (200, voice_channel(4))]).await;
         state.update(&http, &store, GuildId::new(1), &voice).await;
         assert_eq!(store.active_temp_channels("1").unwrap(), 1);
         assert_eq!(
@@ -395,9 +395,9 @@ mod tests {
         assert_eq!(store.active_temp_channels("1").unwrap(), 0);
         let requests = task.await.unwrap();
         assert!(requests[1].contains("Rexy's room"));
-        assert!(requests[2].starts_with("PATCH /guilds/1/members/10 "));
+        assert!(requests[2].starts_with("PATCH /api/v10/guilds/1/members/10 "));
         assert!(requests[2].contains("\"channel_id\":\"4\""));
-        assert!(requests[3].starts_with("DELETE /channels/4 "));
+        assert!(requests[3].starts_with("DELETE /api/v10/channels/4 "));
         assert_eq!(creator(&store, GuildId::new(1)), Some(ChannelId::new(3)));
     }
 
@@ -439,7 +439,7 @@ mod tests {
         state.seed(&http, &store, &guild).await;
         assert!(store.temp_channel("4").unwrap().is_some());
         assert!(store.temp_channel("5").unwrap().is_none());
-        assert!(task.await.unwrap()[0].starts_with("DELETE /channels/5 "));
+        assert!(task.await.unwrap()[0].starts_with("DELETE /api/v10/channels/5 "));
     }
 
     #[tokio::test]
