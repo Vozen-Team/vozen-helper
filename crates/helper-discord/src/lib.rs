@@ -67,6 +67,7 @@ mod poll_display;
 mod private_replies;
 mod rank_card;
 mod shop_i18n;
+mod shop_notice;
 pub mod starboard_card;
 mod starboard_display;
 pub mod suggestion_card;
@@ -12242,6 +12243,7 @@ fn scheduled_action_feature(action_type: &str) -> Option<&'static str> {
         "giveaway_end" => Some("community.giveaways"),
         "poll_end" => Some("management.polls"),
         "ticket_sla" => Some("support.tickets"),
+        "shop_notice" => Some("community.economy"),
         "event_reminder" => Some("community.events"),
         _ => None,
     }
@@ -13116,6 +13118,21 @@ async fn deliver_scheduled_action(
         // delivering anything so a later re-enable cannot replay stale notices.
         store.delete_scheduled_action(id)?;
         return Ok(());
+    }
+    if action_type == "shop_notice" {
+        return shop_notice::deliver(
+            "https://discord.com/api/v10",
+            http.token(),
+            store,
+            &(
+                id,
+                guild_id.into(),
+                action_type.into(),
+                target_id.into(),
+                payload.into(),
+            ),
+        )
+        .await;
     }
     if action_type == "unban" {
         let guild = guild_id

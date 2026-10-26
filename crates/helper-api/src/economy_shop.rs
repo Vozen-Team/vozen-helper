@@ -60,7 +60,16 @@ pub(super) async fn get(
     } else {
         None
     };
-    Ok(([(header::CACHE_CONTROL,"no-store")],Json(json!({"guildId":claims.guild_id,"products":products,"orders":orders,"nextCursor":next}))).into_response())
+    let staff_channel = state
+        .store
+        .get_setting(&claims.guild_id, "community.economy.staff_channel")
+        .map_err(error)?
+        .unwrap_or_default();
+    let failed_notices = state
+        .store
+        .failed_shop_notices(&claims.guild_id)
+        .map_err(error)?;
+    Ok(([(header::CACHE_CONTROL,"no-store")],Json(json!({"guildId":claims.guild_id,"products":products,"orders":orders,"nextCursor":next,"staffChannel":staff_channel,"failedNotices":failed_notices}))).into_response())
 }
 
 async fn validate_role(
@@ -164,4 +173,112 @@ pub(super) async fn resolve(
         .resolve_shop_order(&claims.guild_id, id, &input.status, &claims.user_id)
         .map_err(error)?;
     Ok(Json(json!({"ok":true})))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct NoticeSettings {
+    channel_id: String,
+}
+fn notice_channel_allowed(snapshot: &DiscordGuildSnapshot, guild: &str, id: &str) -> bool {
+    let Some(channel) = snapshot
+        .channels
+        .iter()
+        .find(|channel| channel["id"].as_str() == Some(id))
+    else {
+        return false;
+    };
+    if !matches!(channel["type"].as_u64(), Some(0 | 5)) {
+        return false;
+    }
+    let Some(base) = effective_bot_permissions(guild, &snapshot.roles, &snapshot.bot_role_ids)
+    else {
+        return false;
+    };
+    if base & 8 != 0 {
+        return true;
+    }
+    snapshot
+        .bot_user_id
+        .as_deref()
+        .and_then(|bot| {
+            channel_bot_permissions(
+                base,
+                guild,
+                bot,
+                &snapshot.bot_role_ids,
+                &channel["permission_overwrites"],
+            )
+        })
+        .is_some_and(|bits| {
+            [10, 11, 14]
+                .into_iter()
+                .all(|bit| permission_bitfield_has(bits, bit))
+        })
+}
+pub(super) async fn settings(
+    State(state): State<Arc<ApiState>>,
+    headers: HeaderMap,
+    Query(query): Query<PageQuery>,
+    Json(input): Json<NoticeSettings>,
+) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
+    let claims = require_mutation_auth(&state, &headers)?;
+    scope(&claims, &query)?;
+    if !input.channel_id.is_empty() {
+        if !input.channel_id.parse::<u64>().is_ok_and(|id| id > 0) {
+            return Err(client_error(
+                StatusCode::BAD_REQUEST,
+                "shop_invalid_channel",
+            ));
+        }
+        let snapshot = fetch_discord_guild_snapshot(&claims.guild_id, &state.discord_token).await;
+        if !snapshot.channels_ready || !snapshot.roles_ready || !snapshot.bot_ready {
+            return Err(client_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "discord_context_unavailable",
+            ));
+        }
+        if !notice_channel_allowed(&snapshot, &claims.guild_id, &input.channel_id) {
+            return Err(client_error(
+                StatusCode::BAD_REQUEST,
+                "shop_invalid_channel",
+            ));
+        }
+    }
+    state
+        .store
+        .set_setting(
+            &claims.guild_id,
+            "community.economy.staff_channel",
+            &input.channel_id,
+        )
+        .map_err(error)?;
+    Ok(Json(json!({"ok":true})))
+}
+#[cfg(test)]
+mod notice_tests {
+    use super::*;
+    #[test]
+    fn staff_channel_checks_type_membership_and_channel_overwrites() {
+        let bits = (1u64 << 10) | (1 << 11) | (1 << 14);
+        let mut snapshot = DiscordGuildSnapshot {
+            channels: vec![json!({"id":"20","type":0,"permission_overwrites":[]})],
+            roles: vec![json!({"id":"10","permissions":bits.to_string()})],
+            bot_user_id: Some("30".into()),
+            bot_role_ids: vec![],
+            channels_ready: true,
+            roles_ready: true,
+            bot_ready: true,
+            bot_reason: None,
+            stale_reason: None,
+        };
+        assert!(notice_channel_allowed(&snapshot, "10", "20"));
+        assert!(!notice_channel_allowed(&snapshot, "10", "21"));
+        snapshot.channels[0]["type"] = json!(2);
+        assert!(!notice_channel_allowed(&snapshot, "10", "20"));
+        snapshot.channels[0]["type"] = json!(0);
+        snapshot.channels[0]["permission_overwrites"] =
+            json!([{"id":"30","type":1,"allow":"0","deny":(1u64<<11).to_string()}]);
+        assert!(!notice_channel_allowed(&snapshot, "10", "20"));
+    }
 }

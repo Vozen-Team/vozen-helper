@@ -107,6 +107,7 @@ pub struct Health {
 pub fn router(state: ApiState) -> Router {
     let allowed_origin = state.allowed_origin.clone();
     let router = Router::new()
+        .route("/api/economy/notifications", put(economy_shop::settings))
         .route("/api/economy/shop", get(economy_shop::get))
         .route("/api/economy/products", post(economy_shop::create))
         .route(
@@ -15184,6 +15185,33 @@ mod tests {
             let response = app
                 .clone()
                 .oneshot(request.body(Body::from(value.to_string())).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+        }
+        for (origin, guild, channel, expected) in [
+            (false, "guild-a", "", StatusCode::FORBIDDEN),
+            (true, "guild-b", "", StatusCode::CONFLICT),
+            (true, "guild-a", "bad", StatusCode::BAD_REQUEST),
+            (true, "guild-a", "", StatusCode::OK),
+        ] {
+            let mut request = Request::builder()
+                .method("PUT")
+                .uri(format!("/api/economy/notifications?guildId={guild}"))
+                .header(header::COOKIE, format!("vh_session={token}"))
+                .header(header::CONTENT_TYPE, "application/json");
+            if origin {
+                request = request.header(header::ORIGIN, "https://vozen.org");
+            }
+            let response = app
+                .clone()
+                .oneshot(
+                    request
+                        .body(Body::from(
+                            serde_json::json!({"channelId":channel}).to_string(),
+                        ))
+                        .unwrap(),
+                )
                 .await
                 .unwrap();
             assert_eq!(response.status(), expected);

@@ -81,6 +81,24 @@ const ORDER_COLUMNS: &str =
     "id,user_id,display_name,product_name,price,delivery,role_id,status,created_at";
 
 impl Store {
+    pub fn shop_order(&self, guild: &str, id: i64) -> Result<Option<ShopOrder>> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        Ok(conn
+            .query_row(
+                &format!("SELECT {ORDER_COLUMNS} FROM economy_orders WHERE guild_id=?1 AND id=?2"),
+                params![guild, id],
+                order,
+            )
+            .optional()?)
+    }
+    pub fn shop_notice_state(&self, id: i64, payload: &str, next: i64) -> Result<bool> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        Ok(conn.execute("UPDATE scheduled_actions SET payload=?2,execute_at=?3 WHERE id=?1 AND type='shop_notice'",params![id,payload,next])?==1)
+    }
+    pub fn failed_shop_notices(&self, guild: &str) -> Result<i64> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        Ok(conn.query_row("SELECT count(*) FROM scheduled_actions a JOIN economy_orders o ON CAST(o.id AS TEXT)=a.target_id AND o.guild_id=a.guild_id WHERE a.guild_id=?1 AND a.type='shop_notice' AND o.status='pending' AND CASE WHEN json_valid(a.payload) THEN json_extract(a.payload,'$.failed') ELSE 0 END=1",[guild],|row|row.get(0))?)
+    }
     pub fn shop_products(&self, guild: &str) -> Result<Vec<ShopProduct>> {
         let conn = self.conn.lock().expect("store mutex poisoned");
         let mut stmt=conn.prepare("SELECT id,name,price,delivery,role_id,version FROM economy_products WHERE guild_id=?1 AND active=1 ORDER BY id LIMIT 20")?;
@@ -178,6 +196,15 @@ impl Store {
         tx.execute("INSERT INTO economy_orders(guild_id,user_id,display_name,product_id,product_name,price,delivery,role_id,request_id,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",params![guild,user,display_name.chars().take(80).collect::<String>(),id,item.name,item.price,item.delivery,item.role_id,request,now])?;
         let order_id = tx.last_insert_rowid();
         tx.execute("INSERT INTO economy_ledger(guild_id,user_id,amount,reason,idempotency_key,created_at) VALUES(?1,?2,?3,?4,?5,?6)",params![guild,user,-item.price,format!("shop:{order_id}"),format!("shop:{request}"),now])?;
+        if item.delivery == "manual" {
+            let channel:Option<String>=tx.query_row("SELECT value FROM settings WHERE guild_id=?1 AND key='community.economy.staff_channel'",[guild],|row|row.get(0)).optional()?;
+            if channel
+                .as_deref()
+                .is_some_and(|id| id.parse::<u64>().is_ok_and(|id| id > 0))
+            {
+                tx.execute("INSERT INTO scheduled_actions(guild_id,type,target_id,execute_at,payload) VALUES(?1,'shop_notice',?2,?3,'{}')",params![guild,order_id.to_string(),now])?;
+            }
+        }
         let result = tx.query_row(
             &format!("SELECT {ORDER_COLUMNS} FROM economy_orders WHERE id=?1"),
             [order_id],
@@ -218,6 +245,7 @@ impl Store {
             tx.execute("INSERT INTO economy_ledger(guild_id,user_id,amount,reason,idempotency_key,created_at) VALUES(?1,?2,?3,?4,?5,?6)",params![guild,order.user_id,order.price,format!("refund:{id}"),format!("shop-refund:{id}"),now])?;
         }
         tx.execute("UPDATE economy_orders SET status=?3,resolved_by=?4 WHERE guild_id=?1 AND id=?2 AND status='pending'",params![guild,id,status,actor])?;
+        tx.execute("DELETE FROM scheduled_actions WHERE guild_id=?1 AND type='shop_notice' AND target_id=?2",params![guild,id.to_string()])?;
         tx.commit()?;
         Ok(())
     }
@@ -346,5 +374,64 @@ mod tests {
         store.delete_member_voluntary_data("g", "u").unwrap();
         assert!(store.shop_orders("g", i64::MAX).unwrap().is_empty());
         assert_eq!(store.shop_products("g").unwrap().len(), 1);
+    }
+    #[test]
+    fn only_new_manual_purchases_queue_one_notice_and_resolution_cancels_it() {
+        let store = Store::open(":memory:").unwrap();
+        store.claim_daily("g", "u", 1000).unwrap();
+        store.save_shop_product("g", None, 0, &item()).unwrap();
+        let p = store.shop_products("g").unwrap().remove(0);
+        store
+            .buy_shop_product("g", "u", "Name", p.id, p.version, "old")
+            .unwrap();
+        assert!(
+            store
+                .due_scheduled_actions(i64::MAX, 100)
+                .unwrap()
+                .is_empty()
+        );
+        store
+            .set_setting("g", "community.economy.staff_channel", "20")
+            .unwrap();
+        let order = store
+            .buy_shop_product("g", "u", "Name", p.id, p.version, "new")
+            .unwrap();
+        store
+            .buy_shop_product("g", "u", "Name", p.id, p.version, "new")
+            .unwrap();
+        let jobs = store.due_scheduled_actions(i64::MAX, 100).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].2, "shop_notice");
+        store
+            .shop_notice_state(jobs[0].0, r#"{"failed":true}"#, i64::MAX)
+            .unwrap();
+        assert_eq!(store.failed_shop_notices("g").unwrap(), 1);
+        assert_eq!(store.failed_shop_notices("other").unwrap(), 0);
+        store
+            .resolve_shop_order("g", order.id, "refunded", "staff")
+            .unwrap();
+        assert!(
+            store
+                .due_scheduled_actions(i64::MAX, 100)
+                .unwrap()
+                .is_empty()
+        );
+        let role = ShopProductInput {
+            name: "Role".into(),
+            price: 10,
+            delivery: "role".into(),
+            role_id: Some("123".into()),
+        };
+        store.save_shop_product("g", None, 0, &role).unwrap();
+        let p = store.shop_products("g").unwrap().remove(1);
+        store
+            .buy_shop_product("g", "u", "Name", p.id, p.version, "role")
+            .unwrap();
+        assert!(
+            store
+                .due_scheduled_actions(i64::MAX, 100)
+                .unwrap()
+                .is_empty()
+        );
     }
 }

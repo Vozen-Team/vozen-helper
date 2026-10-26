@@ -1566,6 +1566,10 @@ impl Store {
                 "DELETE FROM birthdays WHERE guild_id=?2 AND user_id=?1",
             ),
             (
+                "shop_notifications",
+                "DELETE FROM scheduled_actions WHERE guild_id=?2 AND type='shop_notice' AND target_id IN (SELECT CAST(id AS TEXT) FROM economy_orders WHERE guild_id=?2 AND user_id=?1)",
+            ),
+            (
                 "economy_orders",
                 "DELETE FROM economy_orders WHERE guild_id=?2 AND user_id=?1",
             ),
@@ -4382,6 +4386,10 @@ impl Store {
             (
                 "birthdays",
                 "DELETE FROM birthdays WHERE guild_id=?2 AND user_id=?1",
+            ),
+            (
+                "shop_notifications",
+                "DELETE FROM scheduled_actions WHERE guild_id=?2 AND type='shop_notice' AND target_id IN (SELECT CAST(id AS TEXT) FROM economy_orders WHERE guild_id=?2 AND user_id=?1)",
             ),
             (
                 "economy_orders",

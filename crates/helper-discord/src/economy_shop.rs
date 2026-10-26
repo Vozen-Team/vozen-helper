@@ -3,7 +3,7 @@ use crate::shop_i18n::text;
 use helper_store::{ShopOrder, ShopProduct};
 use serenity::all::ComponentInteraction;
 
-fn safe(value: &str) -> String {
+pub(super) fn safe(value: &str) -> String {
     value
         .chars()
         .flat_map(|c| {
