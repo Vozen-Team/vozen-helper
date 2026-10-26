@@ -8,7 +8,10 @@ pub(super) struct PageQuery {
     before: Option<i64>,
     guild_id: Option<String>,
 }
-fn scope(claims: &SessionClaims, query: &PageQuery) -> Result<(), (StatusCode, Json<ApiError>)> {
+pub(super) fn scope(
+    claims: &SessionClaims,
+    query: &PageQuery,
+) -> Result<(), (StatusCode, Json<ApiError>)> {
     if query.guild_id.as_deref() != Some(&claims.guild_id) {
         return Err(client_error(StatusCode::CONFLICT, "guild_changed"));
     }

@@ -135,6 +135,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/me", get(me))
         .route("/api/achievements/{guild}", get(achievements::page))
         .route("/api/starboard/channel", post(starboard_channel::create))
+        .route("/api/economy/channel", post(starboard_channel::create_shop))
         .route(
             "/api/birthdays/channel",
             post(starboard_channel::create_birthday),
@@ -12176,6 +12177,7 @@ mod tests {
             "/api/tickets/channel",
             "/api/tickets/category",
             "/api/birthdays/channel",
+            "/api/economy/channel?guildId=guild-a",
         ] {
             let store = Store::open(":memory:").unwrap();
             let session = claims("guild-a");
@@ -12253,6 +12255,8 @@ mod tests {
             for key in [
                 "community.birthdays.created_channel",
                 "community.birthdays.channel_id",
+                "community.economy.created_channel",
+                "community.economy.staff_channel",
             ] {
                 assert!(store.get_setting("guild-a", key).unwrap().is_none());
             }
@@ -15216,6 +15220,21 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), expected);
         }
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/economy/channel?guildId=guild-b")
+                    .header(header::COOKIE, format!("vh_session={token}"))
+                    .header(header::ORIGIN, "https://vozen.org")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"name":"shop-orders"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
         let product = store.shop_products("guild-a").unwrap().remove(0);
         assert!(store.shop_products("guild-b").unwrap().is_empty());
         store.claim_daily("guild-a", "member", 100).unwrap();

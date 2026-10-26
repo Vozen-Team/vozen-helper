@@ -9,6 +9,7 @@ enum ChannelPurpose {
     TicketPanel,
     TicketCategory,
     Birthday,
+    Shop,
 }
 
 impl ChannelPurpose {
@@ -18,6 +19,7 @@ impl ChannelPurpose {
             Self::TicketPanel => "support.tickets.created_panel_channel",
             Self::TicketCategory => "support.tickets.created_category",
             Self::Birthday => "community.birthdays.created_channel",
+            Self::Shop => "community.economy.created_channel",
         }
     }
     fn channel_type(self) -> u64 {
@@ -30,11 +32,25 @@ impl ChannelPurpose {
     fn required_permissions(self) -> u64 {
         if matches!(self, Self::TicketCategory) {
             CATEGORY_BOT_ALLOW | (1 << 28)
+        } else if matches!(self, Self::Shop) {
+            BOT_ALLOW | 16 | (1 << 28)
         } else {
             CREATE_REQUIRED
         }
     }
     fn payload(self, guild: &str, bot: &str, name: &str, staff: &[String]) -> Value {
+        if matches!(self, Self::Shop) {
+            let mut overwrites = vec![
+                json!({"id":guild,"type":0,"allow":"0","deny":(1_u64 << 10).to_string()}),
+                json!({"id":bot,"type":1,"allow":BOT_ALLOW.to_string(),"deny":"0"}),
+            ];
+            overwrites.extend(
+                staff.iter().map(
+                    |id| json!({"id":id,"type":0,"allow":(READ | SEND).to_string(),"deny":"0"}),
+                ),
+            );
+            return json!({"name":name,"type":0,"topic":"Vozen Helper - Manual shop orders. Private for staff.","permission_overwrites":overwrites});
+        }
         if matches!(self, Self::TicketCategory) {
             return json!({"name":name,"type":4,"permission_overwrites":[
                 {"id":guild,"type":0,"allow":"0","deny":(1_u64 << 10).to_string()},
@@ -46,7 +62,7 @@ impl ChannelPurpose {
             bot,
             name,
             match self {
-                Self::Starboard => staff,
+                Self::Starboard | Self::Shop => staff,
                 Self::TicketPanel | Self::TicketCategory | Self::Birthday => &[],
             },
         );
@@ -85,6 +101,39 @@ pub(super) struct CreateRequest {
 #[serde(deny_unknown_fields)]
 pub(super) struct TicketCreateRequest {
     name: String,
+}
+
+pub(super) async fn create_shop(
+    State(state): State<Arc<ApiState>>,
+    headers: HeaderMap,
+    Query(query): Query<economy_shop::PageQuery>,
+    Json(request): Json<TicketCreateRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
+    let claims = require_mutation_auth(&state, &headers)?;
+    economy_shop::scope(&claims, &query)?;
+    let result = create_for(
+        state.clone(),
+        headers,
+        CreateRequest {
+            name: request.name,
+            moderator_role_ids: vec![],
+        },
+        ChannelPurpose::Shop,
+    )
+    .await?;
+    let id = result.0["channel"]["id"]
+        .as_str()
+        .ok_or_else(|| client_error(StatusCode::BAD_GATEWAY, "starboard_creation_uncertain"))?;
+    state
+        .store
+        .set_setting(&claims.guild_id, "community.economy.staff_channel", id)
+        .map_err(|_| {
+            client_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "starboard_channel_created_not_recorded",
+            )
+        })?;
+    Ok(result)
 }
 
 pub(super) async fn create_birthday(
@@ -300,7 +349,8 @@ async fn create_for(
             "starboard_everyone_administrator",
         ));
     }
-    let staff: Vec<String> = if !matches!(purpose, ChannelPurpose::Starboard) {
+    let staff: Vec<String> = if !matches!(purpose, ChannelPurpose::Starboard | ChannelPurpose::Shop)
+    {
         vec![]
     } else if request.moderator_role_ids.is_empty() {
         snapshot
@@ -380,6 +430,7 @@ async fn create_for(
                 ChannelPurpose::TicketPanel => "Vozen%20Tickets%20public%20panel%20channel",
                 ChannelPurpose::TicketCategory => "Vozen%20Tickets%20private%20category",
                 ChannelPurpose::Birthday => "Vozen%20Birthdays%20announcement%20channel",
+                ChannelPurpose::Shop => "Vozen%20Shop%20private%20staff%20channel",
             },
         )
         .json(&payload)
@@ -448,6 +499,7 @@ async fn create_for(
             ChannelPurpose::TicketPanel => "ticket_panel_channel_created",
             ChannelPurpose::TicketCategory => "ticket_category_created",
             ChannelPurpose::Birthday => "birthday_channel_created",
+            ChannelPurpose::Shop => "shop_channel_created",
         },
         &claims.user_id,
         Some(id),
@@ -462,6 +514,31 @@ async fn create_for(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn shop_channel_is_private_for_staff_and_separate_from_other_resources() {
+        let purpose = ChannelPurpose::Shop;
+        assert_eq!(purpose.record(), "community.economy.created_channel");
+        let payload = purpose.payload("guild", "bot", "shop-orders", &["staff".into()]);
+        let overwrites = &payload["permission_overwrites"];
+        assert_eq!(payload["type"], 0);
+        let member =
+            channel_bot_permissions(READ | SEND, "guild", "member", &[], overwrites).unwrap();
+        assert_eq!(member & (1 << 10), 0);
+        for (user, roles) in [("bot", vec![]), ("mod", vec!["staff".into()])] {
+            let bits = channel_bot_permissions(0, "guild", user, &roles, overwrites).unwrap();
+            assert_eq!(bits & (READ | SEND), READ | SEND);
+        }
+        assert!(matching_permissions(&payload, &payload));
+        assert!(!matching_permissions(
+            &json!({"permission_overwrites":[]}),
+            &payload
+        ));
+        for item in overwrites.as_array().unwrap() {
+            let bits = item["allow"].as_str().unwrap().parse::<u64>().unwrap()
+                | item["deny"].as_str().unwrap().parse::<u64>().unwrap();
+            assert_eq!(bits & !purpose.required_permissions(), 0);
+        }
+    }
     #[test]
     fn birthday_channel_is_read_only_and_has_an_independent_creation_record() {
         let purpose = ChannelPurpose::Birthday;
