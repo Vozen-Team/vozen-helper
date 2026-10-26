@@ -335,9 +335,11 @@ mod tests {
             .insert(GuildId::new(1), HashMap::new());
         let mut member = serenity::all::Member::default();
         member.nick = Some("Rexy".into());
-        let mut voice = VoiceState::default();
-        voice.user_id = UserId::new(10);
-        voice.channel_id = Some(ChannelId::new(3));
+        let mut voice: VoiceState = serde_json::from_value(json!({
+            "user_id":"10", "guild_id":"1", "channel_id":"3", "session_id":"fixture",
+            "deaf":false,"mute":false,"self_deaf":false,"self_mute":false,"suppress":false
+        }))
+        .unwrap();
         voice.member = Some(member);
         (state, store, voice)
     }
