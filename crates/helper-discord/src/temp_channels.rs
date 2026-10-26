@@ -337,7 +337,7 @@ mod tests {
         member.nick = Some("Rexy".into());
         let mut voice: VoiceState = serde_json::from_value(json!({
             "user_id":"10", "guild_id":"1", "channel_id":"3", "session_id":"fixture",
-            "deaf":false,"mute":false,"self_deaf":false,"self_mute":false,"suppress":false
+            "deaf":false,"mute":false,"self_deaf":false,"self_mute":false,"self_video":false,"suppress":false
         }))
         .unwrap();
         voice.member = Some(member);
@@ -424,6 +424,45 @@ mod tests {
             .await;
         assert_eq!(store.active_temp_channels("1").unwrap(), 0);
         assert_eq!(task.await.unwrap().len(), 5);
+    }
+
+    #[tokio::test]
+    async fn reconnect_preserves_occupied_rooms_and_deletes_only_registered_empty_rooms() {
+        let (state, store, mut voice) = fixture();
+        store.register_temp_channel("1", "4", "10").unwrap();
+        store.register_temp_channel("1", "5", "11").unwrap();
+        voice.channel_id = Some(ChannelId::new(4));
+        let mut guild = Guild::default();
+        guild.id = GuildId::new(1);
+        guild.voice_states.insert(voice.user_id, voice);
+        let (http, task) = mock_http(vec![(200, voice_channel(5))]).await;
+        state.seed(&http, &store, &guild).await;
+        assert!(store.temp_channel("4").unwrap().is_some());
+        assert!(store.temp_channel("5").unwrap().is_none());
+        assert!(task.await.unwrap()[0].starts_with("DELETE /channels/5 "));
+    }
+
+    #[tokio::test]
+    async fn active_limit_blocks_new_rooms_without_counting_or_deleting_creator() {
+        let (state, store, voice) = fixture();
+        store
+            .set_setting("1", "utility.temp_channels.max_active", "1")
+            .unwrap();
+        store.register_temp_channel("1", "4", "11").unwrap();
+        state.observe(GuildId::new(1), UserId::new(11), Some(ChannelId::new(4)));
+        let (http, task) = mock_http(vec![(200, json!([voice_channel(3)]))]).await;
+        state.update(&http, &store, GuildId::new(1), &voice).await;
+        state.update(&http, &store, GuildId::new(1), &voice).await;
+        assert_eq!(store.active_temp_channels("1").unwrap(), 1);
+        assert_eq!(
+            state.channel(GuildId::new(1), voice.user_id),
+            Some(ChannelId::new(3))
+        );
+        assert_eq!(
+            task.await.unwrap().len(),
+            1,
+            "no POST or duplicate event request"
+        );
     }
 
     #[test]
