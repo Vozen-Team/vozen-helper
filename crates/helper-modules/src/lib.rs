@@ -1,6 +1,8 @@
 //! Module registry for Core, Studio, Security, Support, Events, Community,
 //! Automate and Insights. Feature handlers are added behind these boundaries.
 
+pub mod temp_creator;
+
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::Utc;
 use helper_contracts::{EntitlementSnapshot, Plan};

@@ -129,8 +129,8 @@ pub(super) async fn create_temp_category(
     if request.guild_id != claims.guild_id {
         return Err(client_error(StatusCode::CONFLICT, "guild_changed"));
     }
-    create_for(
-        state,
+    let result = create_for(
+        state.clone(),
         headers,
         CreateRequest {
             name: request.name,
@@ -143,7 +143,42 @@ pub(super) async fn create_temp_category(
         error.code = error.code.replace("starboard_", "temp_category_");
         error.message = error.message.replace("starboard_", "temp_category_");
         (status, Json(error))
-    })
+    })?;
+    let category_id = result.0["channel"]["id"]
+        .as_str()
+        .ok_or_else(|| client_error(StatusCode::BAD_GATEWAY, "temp_category_creation_uncertain"))?
+        .to_owned();
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+        .map_err(|_| client_error(StatusCode::SERVICE_UNAVAILABLE, "discord_unavailable"))?;
+    let creator = helper_modules::temp_creator::setup(
+        &state.store,
+        &client,
+        DISCORD_API_BASE,
+        &format!("Bot {}", state.discord_token),
+        &claims.guild_id,
+        Some(&category_id),
+    )
+    .await;
+    Ok(Json(temp_category_setup_result(result.0, creator)))
+}
+
+fn temp_category_setup_result(mut result: Value, creator: Result<Value, &'static str>) -> Value {
+    match creator {
+        Ok(creator) => {
+            result["creatorChannel"] = json!({
+                "id":creator["id"], "name":creator["name"], "type":creator["type"],
+                "parentId":creator["parent_id"], "guildId":result["guildId"],
+            })
+        }
+        Err(code) => {
+            // Keep the category in the response so partial setup can be selected and retried.
+            result["creatorChannel"] = Value::Null;
+            result["creatorError"] = json!(code);
+        }
+    }
+    result
 }
 
 pub(super) async fn create_shop(
@@ -559,6 +594,29 @@ async fn create_for(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn temporary_setup_distinguishes_ready_from_partial_without_discarding_the_category() {
+        let category =
+            serde_json::json!({"guildId":"1","channel":{"id":"4","type":4},"reused":true});
+        let ready = super::temp_category_setup_result(
+            category.clone(),
+            Ok(serde_json::json!({
+                "id":"9","type":2,"name":"Creator Channel","parent_id":"4"
+            })),
+        );
+        assert_eq!(ready["creatorChannel"]["guildId"], "1");
+        assert_eq!(ready["creatorChannel"]["parentId"], "4");
+        assert!(ready.get("creatorError").is_none());
+        let partial = super::temp_category_setup_result(
+            category.clone(),
+            Err("temp_creator_permissions_required"),
+        );
+        assert_eq!(partial["channel"], category["channel"]);
+        assert_eq!(partial["reused"], true);
+        assert!(partial["creatorChannel"].is_null());
+        assert_eq!(partial["creatorError"], "temp_creator_permissions_required");
+    }
+
     use super::*;
     #[test]
     fn temporary_voice_category_inherits_permissions_and_never_adopts_ticket_categories() {

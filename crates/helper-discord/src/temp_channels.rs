@@ -202,45 +202,31 @@ impl TempChannels {
         guild: GuildId,
     ) -> Result<ChannelId> {
         let _guard = self.operations.lock().await;
-        let channels = guild.channels(http).await?;
-        if let Some(id) = creator(store, guild)
-            && let Some(channel) = channels.get(&id)
-        {
-            anyhow::ensure!(
-                channel.kind == ChannelType::Voice,
-                "recorded creator is not a voice channel"
-            );
-            return Ok(id);
-        }
         let category = setting_string(
             store,
             &guild.to_string(),
             "utility.temp_channels.category_id",
         )
-        .filter(|id| !id.is_empty())
-        .map(|id| id.parse::<u64>())
-        .transpose()?
-        .map(ChannelId::new);
-        let mut create = CreateChannel::new("➕ Creator Channel").kind(ChannelType::Voice);
-        if let Some(id) = category {
-            let category = channels
-                .get(&id)
-                .filter(|channel| channel.kind == ChannelType::Category)
-                .ok_or_else(|| anyhow::anyhow!("configured temporary voice category missing"))?;
-            create = create
-                .category(id)
-                .permissions(category.permission_overwrites.clone());
-        }
-        let channel = guild.create_channel(http, create).await?;
-        if let Err(error) = store.set_setting(
+        .filter(|id| !id.is_empty());
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(8))
+            .build()?;
+        let base = http
+            .proxy
+            .as_ref()
+            .map(|proxy| format!("{}/api/v10", proxy.trim_end_matches('/')))
+            .unwrap_or_else(|| "https://discord.com/api/v10".into());
+        let channel = helper_modules::temp_creator::setup(
+            store,
+            &client,
+            &base,
+            http.token(),
             &guild.to_string(),
-            "utility.temp_channels.creator_channel_id",
-            &channel.id.to_string(),
-        ) {
-            let _ = channel.id.delete(http).await;
-            return Err(error);
-        }
-        Ok(channel.id)
+            category.as_deref(),
+        )
+        .await
+        .map_err(anyhow::Error::msg)?;
+        Ok(ChannelId::new(channel["id"].as_str().unwrap().parse()?))
     }
 }
 
@@ -316,7 +302,7 @@ mod tests {
     }
 
     fn voice_channel(id: u64) -> Value {
-        json!({"id":id.to_string(),"guild_id":"1","name":"room","type":2,"permission_overwrites":[]})
+        json!({"id":id.to_string(),"guild_id":"1","name":"room","type":2,"parent_id":null,"permission_overwrites":[]})
     }
 
     fn fixture() -> (TempChannels, Store, VoiceState) {
