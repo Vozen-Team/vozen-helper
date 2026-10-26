@@ -10,6 +10,7 @@ enum ChannelPurpose {
     TicketCategory,
     Birthday,
     Shop,
+    TempCategory,
 }
 
 impl ChannelPurpose {
@@ -20,16 +21,20 @@ impl ChannelPurpose {
             Self::TicketCategory => "support.tickets.created_category",
             Self::Birthday => "community.birthdays.created_channel",
             Self::Shop => "community.economy.created_channel",
+            Self::TempCategory => "utility.temp_channels.created_category",
         }
     }
     fn channel_type(self) -> u64 {
-        if matches!(self, Self::TicketCategory) {
+        if matches!(self, Self::TicketCategory | Self::TempCategory) {
             4
         } else {
             0
         }
     }
     fn required_permissions(self) -> u64 {
+        if matches!(self, Self::TempCategory) {
+            return 16;
+        }
         if matches!(self, Self::TicketCategory) {
             CATEGORY_BOT_ALLOW | (1 << 28)
         } else if matches!(self, Self::Shop) {
@@ -39,6 +44,9 @@ impl ChannelPurpose {
         }
     }
     fn payload(self, guild: &str, bot: &str, name: &str, staff: &[String]) -> Value {
+        if matches!(self, Self::TempCategory) {
+            return json!({"name":name,"type":4,"permission_overwrites":[]});
+        }
         if matches!(self, Self::Shop) {
             let mut overwrites = vec![
                 json!({"id":guild,"type":0,"allow":"0","deny":(1_u64 << 10).to_string()}),
@@ -63,7 +71,9 @@ impl ChannelPurpose {
             name,
             match self {
                 Self::Starboard | Self::Shop => staff,
-                Self::TicketPanel | Self::TicketCategory | Self::Birthday => &[],
+                Self::TicketPanel | Self::TicketCategory | Self::Birthday | Self::TempCategory => {
+                    &[]
+                }
             },
         );
         if matches!(self, Self::TicketPanel) {
@@ -101,6 +111,39 @@ pub(super) struct CreateRequest {
 #[serde(deny_unknown_fields)]
 pub(super) struct TicketCreateRequest {
     name: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct TempCategoryRequest {
+    name: String,
+    guild_id: String,
+}
+
+pub(super) async fn create_temp_category(
+    State(state): State<Arc<ApiState>>,
+    headers: HeaderMap,
+    Json(request): Json<TempCategoryRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
+    let claims = require_mutation_auth(&state, &headers)?;
+    if request.guild_id != claims.guild_id {
+        return Err(client_error(StatusCode::CONFLICT, "guild_changed"));
+    }
+    create_for(
+        state,
+        headers,
+        CreateRequest {
+            name: request.name,
+            moderator_role_ids: vec![],
+        },
+        ChannelPurpose::TempCategory,
+    )
+    .await
+    .map_err(|(status, Json(mut error))| {
+        error.code = error.code.replace("starboard_", "temp_category_");
+        error.message = error.message.replace("starboard_", "temp_category_");
+        (status, Json(error))
+    })
 }
 
 pub(super) async fn create_shop(
@@ -215,8 +258,7 @@ fn channel_name(name: &str) -> Option<String> {
 fn name_exists(channels: &[Value], name: &str, purpose: ChannelPurpose) -> bool {
     channels.iter().any(|channel| {
         channel["name"].as_str() == Some(name)
-            && (!matches!(purpose, ChannelPurpose::TicketCategory)
-                || channel["type"].as_u64() == Some(4))
+            && (purpose.channel_type() != 4 || channel["type"].as_u64() == Some(4))
     })
 }
 
@@ -340,10 +382,12 @@ async fn create_for(
             "starboard_bot_permissions_required",
         ));
     }
-    if snapshot.roles.iter().any(|role| {
-        role["id"].as_str() == Some(&claims.guild_id)
-            && parse_permission_bits(role).is_none_or(|bits| bits & 8 != 0)
-    }) {
+    if !matches!(purpose, ChannelPurpose::TempCategory)
+        && snapshot.roles.iter().any(|role| {
+            role["id"].as_str() == Some(&claims.guild_id)
+                && parse_permission_bits(role).is_none_or(|bits| bits & 8 != 0)
+        })
+    {
         return Err(client_error(
             StatusCode::CONFLICT,
             "starboard_everyone_administrator",
@@ -431,6 +475,7 @@ async fn create_for(
                 ChannelPurpose::TicketCategory => "Vozen%20Tickets%20private%20category",
                 ChannelPurpose::Birthday => "Vozen%20Birthdays%20announcement%20channel",
                 ChannelPurpose::Shop => "Vozen%20Shop%20private%20staff%20channel",
+                ChannelPurpose::TempCategory => "Vozen%20Temporary%20voice%20category",
             },
         )
         .json(&payload)
@@ -500,6 +545,7 @@ async fn create_for(
             ChannelPurpose::TicketCategory => "ticket_category_created",
             ChannelPurpose::Birthday => "birthday_channel_created",
             ChannelPurpose::Shop => "shop_channel_created",
+            ChannelPurpose::TempCategory => "temp_category_created",
         },
         &claims.user_id,
         Some(id),
@@ -514,6 +560,41 @@ async fn create_for(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn temporary_voice_category_inherits_permissions_and_never_adopts_ticket_categories() {
+        let purpose = ChannelPurpose::TempCategory;
+        assert_eq!(purpose.channel_type(), 4);
+        assert_eq!(purpose.required_permissions(), 16);
+        assert_ne!(purpose.record(), ChannelPurpose::TicketCategory.record());
+        let payload = purpose.payload("guild", "bot", "voice-rooms", &[]);
+        assert_eq!(payload["type"], 4);
+        assert_eq!(payload["permission_overwrites"], json!([]));
+        assert!(payload.get("topic").is_none());
+        assert!(matching_permissions(&payload, &payload));
+        assert!(!matching_permissions(
+            &ChannelPurpose::TicketCategory.payload("guild", "bot", "voice-rooms", &[]),
+            &payload
+        ));
+        assert!(name_exists(
+            &[json!({"name":"voice-rooms","type":4})],
+            "voice-rooms",
+            purpose
+        ));
+        assert!(!name_exists(
+            &[json!({"name":"voice-rooms","type":0})],
+            "voice-rooms",
+            purpose
+        ));
+        let bits = channel_bot_permissions(
+            1 << 10,
+            "guild",
+            "member",
+            &[],
+            &payload["permission_overwrites"],
+        )
+        .unwrap();
+        assert_eq!(bits, 1 << 10);
+    }
     #[test]
     fn shop_channel_is_private_for_staff_and_separate_from_other_resources() {
         let purpose = ChannelPurpose::Shop;

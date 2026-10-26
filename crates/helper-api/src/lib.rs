@@ -137,6 +137,10 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/starboard/channel", post(starboard_channel::create))
         .route("/api/economy/channel", post(starboard_channel::create_shop))
         .route(
+            "/api/temp-channels/category",
+            post(starboard_channel::create_temp_category),
+        )
+        .route(
             "/api/birthdays/channel",
             post(starboard_channel::create_birthday),
         )
@@ -12169,6 +12173,104 @@ mod tests {
             .expect("response");
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn temp_category_creation_checks_auth_origin_scope_and_input() {
+        let store = Store::open(":memory:").unwrap();
+        let session = claims("guild-a");
+        store.save_session(&session).unwrap();
+        store
+            .set_setting("guild-a", "utility.temp_channels.category_id", "existing")
+            .unwrap();
+        let token = sign_session(&session, "test-session-secret-with-at-least-32-bytes");
+        for (cookie, origin, body, expected) in [
+            (
+                false,
+                None,
+                r#"{"name":"voice-rooms","guildId":"guild-a"}"#,
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                true,
+                None,
+                r#"{"name":"voice-rooms","guildId":"guild-a"}"#,
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                true,
+                Some("https://evil.test"),
+                r#"{"name":"voice-rooms","guildId":"guild-a"}"#,
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                true,
+                Some("https://vozen.org"),
+                r#"{"name":"voice-rooms","guildId":"guild-b"}"#,
+                StatusCode::CONFLICT,
+            ),
+            (
+                true,
+                Some("https://vozen.org"),
+                r#"{"name":"../bad","guildId":"guild-a"}"#,
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                true,
+                Some("https://vozen.org"),
+                r#"{"name":"voice-rooms","guildId":"guild-a","permission_overwrites":[]}"#,
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                true,
+                Some("https://vozen.org"),
+                r#"{"name":"voice-rooms","guildId":"guild-a","moderatorRoleIds":["other"]}"#,
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                true,
+                Some("https://vozen.org"),
+                r#"{"name":"voice-rooms","guildId":"guild-a"}"#,
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+        ] {
+            let mut api_state = state(store.clone());
+            api_state.allowed_origin = Some("https://vozen.org".into());
+            let mut request = Request::builder()
+                .method("POST")
+                .uri("/api/temp-channels/category")
+                .header(header::CONTENT_TYPE, "application/json");
+            if cookie {
+                request = request.header(header::COOKIE, format!("vh_session={token}"));
+            }
+            if let Some(origin) = origin {
+                request = request.header(header::ORIGIN, origin);
+            }
+            let response = router(api_state)
+                .oneshot(request.body(Body::from(body)).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+        }
+        assert!(
+            store
+                .get_setting("guild-a", "utility.temp_channels.created_category")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .get_setting("guild-b", "utility.temp_channels.created_category")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .get_setting("guild-a", "utility.temp_channels.category_id")
+                .unwrap()
+                .as_deref(),
+            Some("existing")
+        );
     }
 
     #[tokio::test]
