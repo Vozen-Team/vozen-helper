@@ -5454,6 +5454,9 @@ fn permission_bitfield_has(permissions: u64, bit: u8) -> bool {
 fn dependency_permission(dependency: &str) -> Option<(u8, &'static str)> {
     Some(match dependency {
         "manage_channels" | "Manage Channels" => (4, "Manage Channels"),
+        "move_members" | "Move Members" => (24, "Move Members"),
+        "connect" | "Connect" => (20, "Connect"),
+        "view_channel" | "View Channel" => (10, "View Channel"),
         "manage_guild" | "Manage Server" => (5, "Manage Server"),
         "manage_messages" | "Manage Messages" => (13, "Manage Messages"),
         "embed_links" | "Embed Links" => (14, "Embed Links"),

@@ -72,6 +72,7 @@ pub mod starboard_card;
 mod starboard_display;
 pub mod suggestion_card;
 mod suggestion_display;
+mod temp_channels;
 mod topgg_metrics;
 
 use crate::topgg_metrics::{
@@ -394,6 +395,7 @@ struct Handler {
     joins: Arc<Mutex<HashMap<String, VecDeque<Instant>>>>,
     nuke_events: Arc<Mutex<HashMap<String, VecDeque<Instant>>>>,
     xp_awarded_at: Arc<Mutex<HashMap<String, Instant>>>,
+    temp_channels: Arc<temp_channels::TempChannels>,
     scheduler_started: Arc<AtomicBool>,
     topgg_trigger: Option<TopggMetricsTrigger>,
     topgg_guilds: Option<TopggGuilds>,
@@ -413,7 +415,8 @@ struct Handler {
 
 #[async_trait]
 impl EventHandler for Handler {
-    async fn guild_create(&self, _ctx: Context, guild: Guild, _is_new: Option<bool>) {
+    async fn guild_create(&self, ctx: Context, guild: Guild, _is_new: Option<bool>) {
+        self.temp_channels.seed(&ctx, &self.store, &guild).await;
         // The store makes this idempotent, so startup GuildCreate replays do
         // not inflate acquisition. A first observation is intentionally a
         // join: it gives a newly enabled lifecycle table a valid baseline.
@@ -436,6 +439,7 @@ impl EventHandler for Handler {
         incomplete: UnavailableGuild,
         _full: Option<Guild>,
     ) {
+        self.temp_channels.forget(incomplete.id);
         // Discord sends unavailable=true for a temporary outage. It is not a
         // bot removal and must never count as churn.
         if !incomplete.unavailable {
@@ -1134,7 +1138,7 @@ impl EventHandler for Handler {
             CreateCommand::new("work").description("Claim a cooldown-based community work reward"),
             CreateCommand::new("economy-top").description("Show the richest community members"),
             CreateCommand::new("temp-channel")
-                .description("Create a temporary voice channel for yourself"),
+                .description("Set up the Creator Channel for temporary voice rooms"),
             CreateCommand::new("embed")
                 .description("Publish a safe embed in this channel (staff)")
                 .add_option(
@@ -1863,6 +1867,9 @@ impl EventHandler for Handler {
         else {
             return;
         };
+        self.temp_channels
+            .update(&ctx, &self.store, guild_id, &new)
+            .await;
         let old_channel_id = old.as_ref().and_then(|state| state.channel_id);
         let new_channel_id = new.channel_id;
         let guild_text = guild_id.to_string();
@@ -2040,27 +2047,22 @@ impl EventHandler for Handler {
                 warn!(%guild_id, user = %new.user_id, %error, "failed to start voice XP session");
             }
         }
+    }
 
-        // Temporary channel ownership cleanup remains independent from XP. A
-        // member can leave/move through a normal voice channel without there
-        // being a temp-channel record.
-        if let Some(old_channel_id) = old_channel_id {
-            let channel_id = old_channel_id.to_string();
-            if let Ok(Some(record)) = self.store.temp_channel(&channel_id)
-                && user_text == record.owner_id
-            {
-                // Moving the owner must not delete the room.  Without the
-                // optional Serenity cache we cannot prove that a moved room
-                // is empty, so only clean up after a full voice disconnect;
-                // the next disconnect event can retry an orphaned room.
-                if should_cleanup_temp_channel(new_channel_id) {
-                    if let Err(error) = old_channel_id.delete(&ctx.http).await {
-                        warn!(%guild_id, %old_channel_id, %error, "failed to remove ownerless temporary voice channel");
-                    } else if let Err(error) = self.store.remove_temp_channel(&channel_id) {
-                        warn!(%guild_id, %old_channel_id, %error, "failed to remove temporary channel record");
-                    }
-                }
-            }
+    async fn channel_delete(
+        &self,
+        _ctx: Context,
+        channel: serenity::all::GuildChannel,
+        _messages: Option<Vec<serenity::all::Message>>,
+    ) {
+        if self
+            .store
+            .temp_channel(&channel.id.to_string())
+            .ok()
+            .flatten()
+            .is_some_and(|record| record.guild_id == channel.guild_id.to_string())
+        {
+            let _ = self.store.remove_temp_channel(&channel.id.to_string());
         }
     }
 
@@ -4295,6 +4297,7 @@ pub async fn run(config: &Config) -> Result<()> {
             joins: Arc::new(Mutex::new(HashMap::new())),
             nuke_events: Arc::new(Mutex::new(HashMap::new())),
             xp_awarded_at: Arc::new(Mutex::new(HashMap::new())),
+            temp_channels: Arc::new(temp_channels::TempChannels::default()),
             scheduler_started: Arc::new(AtomicBool::new(false)),
             topgg_trigger,
             topgg_guilds,
@@ -7635,56 +7638,8 @@ impl Handler {
                 if !feature_enabled(&self.store, &guild_text, "utility.temp_channels", None) {
                     return respond(ctx, command, "Temporary channels are disabled in this server. Enable them in the dashboard.").await;
                 }
-                let max_active = setting_u64(
-                    &self.store,
-                    &guild_text,
-                    "utility.temp_channels.max_active",
-                    10,
-                )
-                .clamp(1, 50) as i64;
-                let active = self.store.active_temp_channels(&guild_text)?;
-                let template = setting_string(
-                    &self.store,
-                    &guild_text,
-                    "utility.temp_channels.name_template",
-                )
-                .filter(|value| !value.trim().is_empty())
-                .unwrap_or_else(|| "{user}'s room".to_string());
-                let decision = evaluate_temp_channel(
-                    &template,
-                    command.user.name.as_str(),
-                    active.max(0) as u64,
-                    max_active as u64,
-                );
-                if !decision.allowed {
-                    return respond(
-                        ctx,
-                        command,
-                        "This server has reached its temporary room limit. Try again after one is cleaned up.",
-                    )
-                    .await;
-                }
-                let category_id = setting_string(
-                    &self.store,
-                    &guild_text,
-                    "utility.temp_channels.category_id",
-                )
-                .and_then(|value| value.parse::<u64>().ok())
-                .map(serenity::all::ChannelId::new);
-                let mut create = CreateChannel::new(decision.room_name)
-                    .kind(serenity::all::ChannelType::Voice);
-                if let Some(category_id) = category_id {
-                    create = create.category(category_id);
-                }
-                let channel = guild_id
-                    .create_channel(&ctx.http, create)
-                    .await?;
-                self.store.register_temp_channel(
-                    &guild_text,
-                    &channel.id.to_string(),
-                    &command.user.id.to_string(),
-                )?;
-                format!("Temporary voice channel created: <#{}>. It will be removed when everyone leaves.", channel.id)
+                let channel = self.temp_channels.setup(ctx, &self.store, guild_id).await?;
+                format!("Creator Channel: <#{}>. Join it to create your room.", channel)
             }
             "starboard-set" => {
                 let Some(guild_id) = command.guild_id else {
@@ -12263,13 +12218,6 @@ fn should_clear_anti_spam_timeout(
     now_unix >= expected_until_unix && current_until_unix.abs_diff(expected_until_unix) <= 2
 }
 
-fn should_cleanup_temp_channel(new_channel_id: Option<serenity::all::ChannelId>) -> bool {
-    // A move is not an abandonment. Without the optional Serenity cache we
-    // cannot safely inspect the remaining occupants, so defer cleanup until
-    // the owner fully disconnects from voice.
-    new_channel_id.is_none()
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct JoinGateVerificationDecision {
     assign_verified_role: bool,
@@ -13784,9 +13732,8 @@ mod tests {
         is_destructive_audit_action, join_burst_armed, parse_custom_command, parse_duration,
         parse_reminder_delay, parse_scheduled_event_window, permission_passport_message,
         reminder_repeat_interval_ms, render_custom_command, rss_retry_seconds,
-        scheduled_action_feature, shadow_mode_enabled, should_cleanup_temp_channel,
-        should_clear_anti_spam_timeout, ticket_member_is_staff, ticket_opening_message,
-        unified_welcome_text,
+        scheduled_action_feature, shadow_mode_enabled, should_clear_anti_spam_timeout,
+        ticket_member_is_staff, ticket_opening_message, unified_welcome_text,
     };
     use chrono::TimeZone;
     use helper_store::Store;
@@ -14814,14 +14761,6 @@ mod tests {
         assert_eq!(plus_two_delay, 19 * 60 * 60 * 1_000 + 30 * 60 * 1_000);
         assert!(parse_reminder_delay("25:00", "UTC", now).is_none());
         assert!(parse_reminder_delay("09:30", "Europe/Lisbon", now).is_none());
-    }
-
-    #[test]
-    fn temporary_channel_cleanup_waits_for_a_full_disconnect() {
-        assert!(should_cleanup_temp_channel(None));
-        assert!(!should_cleanup_temp_channel(Some(
-            serenity::all::ChannelId::new(42)
-        )));
     }
 
     #[test]

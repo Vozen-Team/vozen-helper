@@ -3156,7 +3156,7 @@ impl FeatureAdapter for TempChannelsAdapter {
                 "source": Self::SOURCE,
                 "sections": [{
                     "title": "Temporary voice rooms",
-                    "description": "Create bounded rooms with a predictable name and optional category.",
+                    "description": "Run /temp-channel once to create the Creator Channel. Join it to get a personal room; empty rooms are deleted.",
                     "fields": [
                         {"key":"categoryId","label":"Category (optional)","kind":"category","help":"New rooms are created inside this category when selected."},
                         {"key":"nameTemplate","label":"Room name template","kind":"text","min":1,"max":80,"help":"Use {user} for the member display name."},
@@ -3165,7 +3165,13 @@ impl FeatureAdapter for TempChannelsAdapter {
                 }]
             }),
             defaults: serde_json::json!({"categoryId":"", "nameTemplate":"{user}'s room", "maxActive": 10}),
-            dependencies: vec!["manage_channels".into(), "voice_states".into()],
+            dependencies: vec![
+                "manage_channels".into(),
+                "move_members".into(),
+                "connect".into(),
+                "view_channel".into(),
+                "voice_states".into(),
+            ],
         }
     }
 
@@ -3270,7 +3276,7 @@ impl FeatureAdapter for TempChannelsAdapter {
         let decision = evaluate_temp_channel(template, display_name, active_rooms, max_active);
         let mut effects = if decision.allowed {
             vec![format!(
-                "Create the temporary voice room `{}` ({}/{} active rooms).",
+                "Join Creator Channel → create `{}` and move the member ({}/{} active rooms). Delete the room after the last member leaves.",
                 decision.room_name, decision.active_rooms, decision.max_active
             )]
         } else {

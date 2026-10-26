@@ -1936,6 +1936,22 @@ impl Store {
             .optional()?)
     }
 
+    pub fn temp_channels(&self, guild_id: &str) -> Result<Vec<TempChannelRecord>> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let mut statement = conn.prepare(
+            "SELECT guild_id,channel_id,owner_id,created_at FROM temp_channels WHERE guild_id=?1",
+        )?;
+        let rows = statement.query_map([guild_id], |row| {
+            Ok(TempChannelRecord {
+                guild_id: row.get(0)?,
+                channel_id: row.get(1)?,
+                owner_id: row.get(2)?,
+                created_at: row.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     pub fn active_temp_channels(&self, guild_id: &str) -> Result<i64> {
         let conn = self.conn.lock().expect("store mutex poisoned");
         conn.query_row(
@@ -8918,6 +8934,8 @@ mod tests {
         store.register_temp_channel("g", "c", "u").unwrap();
         assert_eq!(store.temp_channel("c").unwrap().unwrap().owner_id, "u");
         assert_eq!(store.active_temp_channels("g").unwrap(), 1);
+        assert_eq!(store.temp_channels("g").unwrap().len(), 1);
+        assert!(store.temp_channels("other").unwrap().is_empty());
         assert!(store.remove_temp_channel("c").unwrap());
         assert!(store.temp_channel("c").unwrap().is_none());
         assert_eq!(store.active_temp_channels("g").unwrap(), 0);
