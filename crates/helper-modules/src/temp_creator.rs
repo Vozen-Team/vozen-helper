@@ -88,7 +88,8 @@ pub async fn setup(
             "temp_creator_move_uncertain",
         )
         .await?;
-        if moved["id"] != channel["id"]
+        if moved["guild_id"].as_str().is_some_and(|id| id != guild)
+            || moved["id"] != channel["id"]
             || moved["type"].as_u64() != Some(2)
             || moved["parent_id"] != category_id
             || moved["permission_overwrites"] != channel["permission_overwrites"]
