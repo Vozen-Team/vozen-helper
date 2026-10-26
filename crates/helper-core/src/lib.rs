@@ -3069,9 +3069,7 @@ impl FeatureAdapter for CommunityInteractionAdapter {
     }
 }
 
-/// Settings for temporary voice rooms.  The command already creates and
-/// cleans up rooms in the Discord runtime; exposing these bounded controls
-/// makes the dashboard publish the same values that command handler reads.
+/// Shared settings for join-to-create voice rooms and their dashboard preview.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TempChannelsAdapter;
 
@@ -3156,7 +3154,7 @@ impl FeatureAdapter for TempChannelsAdapter {
                 "source": Self::SOURCE,
                 "sections": [{
                     "title": "Temporary voice rooms",
-                    "description": "Run /temp-channel once to create the Creator Channel. Join it to get a personal room; empty rooms are deleted.",
+                    "description": "Create bounded rooms with a predictable name and optional category.",
                     "fields": [
                         {"key":"categoryId","label":"Category (optional)","kind":"category","help":"New rooms are created inside this category when selected."},
                         {"key":"nameTemplate","label":"Room name template","kind":"text","min":1,"max":80,"help":"Use {user} for the member display name."},
@@ -3168,7 +3166,7 @@ impl FeatureAdapter for TempChannelsAdapter {
             dependencies: vec![
                 "manage_channels".into(),
                 "move_members".into(),
-                "connect".into(),
+                "voice_channels".into(),
                 "view_channel".into(),
                 "voice_states".into(),
             ],

@@ -30,7 +30,7 @@ impl TempChannels {
         self.occupants.lock().unwrap().remove(&guild);
     }
 
-    pub(super) async fn seed(&self, ctx: &Context, store: &Store, guild: &Guild) {
+    pub(super) async fn seed(&self, http: &serenity::http::Http, store: &Store, guild: &Guild) {
         self.occupants.lock().unwrap().insert(
             guild.id,
             guild
@@ -44,13 +44,20 @@ impl TempChannels {
         if let Ok(rooms) = store.temp_channels(&guild.id.to_string()) {
             for room in rooms {
                 if let Ok(id) = room.channel_id.parse::<u64>() {
-                    self.cleanup(ctx, store, guild.id, ChannelId::new(id)).await;
+                    self.cleanup(http, store, guild.id, ChannelId::new(id))
+                        .await;
                 }
             }
         }
     }
 
-    async fn cleanup(&self, ctx: &Context, store: &Store, guild: GuildId, channel: ChannelId) {
+    async fn cleanup(
+        &self,
+        http: &serenity::http::Http,
+        store: &Store,
+        guild: GuildId,
+        channel: ChannelId,
+    ) {
         if !self.empty(guild, channel) {
             return;
         }
@@ -60,7 +67,7 @@ impl TempChannels {
         if record.guild_id != guild.to_string() || creator(store, guild) == Some(channel) {
             return;
         }
-        match channel.delete(&ctx.http).await {
+        match channel.delete(http).await {
             Ok(_) => {
                 let _ = store.remove_temp_channel(&channel.to_string());
             }
@@ -90,7 +97,7 @@ impl TempChannels {
 
     pub(super) async fn update(
         &self,
-        ctx: &Context,
+        http: &serenity::http::Http,
         store: &Store,
         guild: GuildId,
         new: &VoiceState,
@@ -104,7 +111,7 @@ impl TempChannels {
         }
         let _guard = self.operations.lock().await;
         if let Some(channel) = previous {
-            self.cleanup(ctx, store, guild, channel).await;
+            self.cleanup(http, store, guild, channel).await;
         }
         let Some(source) = new.channel_id else {
             return;
@@ -115,14 +122,14 @@ impl TempChannels {
         {
             return;
         }
-        if let Err(error) = self.create_room(ctx, store, guild, source, new).await {
+        if let Err(error) = self.create_room(http, store, guild, source, new).await {
             warn!(%guild, user = %new.user_id, %error, "temporary room creation or move failed");
         }
     }
 
     async fn create_room(
         &self,
-        ctx: &Context,
+        http: &serenity::http::Http,
         store: &Store,
         guild: GuildId,
         source: ChannelId,
@@ -130,13 +137,13 @@ impl TempChannels {
     ) -> Result<()> {
         let member = match &state.member {
             Some(member) => member.clone(),
-            None => guild.member(&ctx.http, state.user_id).await?,
+            None => guild.member(http, state.user_id).await?,
         };
         if member.user.bot {
             return Ok(());
         }
         let guild_text = guild.to_string();
-        let channels = guild.channels(&ctx.http).await?;
+        let channels = guild.channels(http).await?;
         let hub = channels
             .get(&source)
             .filter(|channel| channel.kind == ChannelType::Voice)
@@ -161,22 +168,22 @@ impl TempChannels {
         if let Some(category) = hub.parent_id {
             create = create.category(category);
         }
-        let room = guild.create_channel(&ctx.http, create).await?;
+        let room = guild.create_channel(http, create).await?;
         // Persist before moving: failed moves/deletes remain recoverable after reconnect.
         if let Err(error) = store.register_temp_channel(
             &guild_text,
             &room.id.to_string(),
             &state.user_id.to_string(),
         ) {
-            let _ = room.id.delete(&ctx.http).await;
+            let _ = room.id.delete(http).await;
             return Err(error);
         }
         if self.channel(guild, state.user_id) != Some(source) {
-            self.cleanup(ctx, store, guild, room.id).await;
+            self.cleanup(http, store, guild, room.id).await;
             return Ok(());
         }
-        if let Err(error) = guild.move_member(&ctx.http, state.user_id, room.id).await {
-            self.cleanup(ctx, store, guild, room.id).await;
+        if let Err(error) = guild.move_member(http, state.user_id, room.id).await {
+            self.cleanup(http, store, guild, room.id).await;
             return Err(error.into());
         }
         let mut all = self.occupants.lock().unwrap();
@@ -190,12 +197,12 @@ impl TempChannels {
 
     pub(super) async fn setup(
         &self,
-        ctx: &Context,
+        http: &serenity::http::Http,
         store: &Store,
         guild: GuildId,
     ) -> Result<ChannelId> {
         let _guard = self.operations.lock().await;
-        let channels = guild.channels(&ctx.http).await?;
+        let channels = guild.channels(http).await?;
         if let Some(id) = creator(store, guild)
             && let Some(channel) = channels.get(&id)
         {
@@ -224,13 +231,13 @@ impl TempChannels {
                 .category(id)
                 .permissions(category.permission_overwrites.clone());
         }
-        let channel = guild.create_channel(&ctx.http, create).await?;
+        let channel = guild.create_channel(http, create).await?;
         if let Err(error) = store.set_setting(
             &guild.to_string(),
             "utility.temp_channels.creator_channel_id",
             &channel.id.to_string(),
         ) {
-            let _ = channel.id.delete(&ctx.http).await;
+            let _ = channel.id.delete(http).await;
             return Err(error);
         }
         Ok(channel.id)
@@ -255,6 +262,167 @@ fn missing_channel(error: &serenity::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::{Value, json};
+
+    async fn mock_http(
+        replies: Vec<(u16, Value)>,
+    ) -> (serenity::http::Http, tokio::task::JoinHandle<Vec<String>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for (status, reply) in replies {
+                let (mut socket, _) =
+                    tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut bytes = [0; 4096];
+                    let count = socket.read(&mut bytes).await.unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&bytes[..count]);
+                    if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&request[..end]);
+                        let length = headers
+                            .lines()
+                            .find_map(|line| {
+                                line.to_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .and_then(|v| v.trim().parse::<usize>().ok())
+                            })
+                            .unwrap_or(0);
+                        if request.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
+                    assert!(request.len() < 100_000);
+                }
+                requests.push(String::from_utf8(request).unwrap());
+                let body = reply.to_string();
+                socket.write_all(format!("HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            }
+            requests
+        });
+        (
+            serenity::http::HttpBuilder::new("fixture-only")
+                .proxy(base)
+                .ratelimiter_disabled(true)
+                .build(),
+            task,
+        )
+    }
+
+    fn voice_channel(id: u64) -> Value {
+        json!({"id":id.to_string(),"guild_id":"1","name":"room","type":2,"permission_overwrites":[]})
+    }
+
+    fn fixture() -> (TempChannels, Store, VoiceState) {
+        let state = TempChannels::default();
+        let store = Store::open(":memory:").unwrap();
+        store
+            .set_setting("1", "feature.utility.temp_channels", "true")
+            .unwrap();
+        store
+            .set_setting("1", "utility.temp_channels.creator_channel_id", "3")
+            .unwrap();
+        state
+            .occupants
+            .lock()
+            .unwrap()
+            .insert(GuildId::new(1), HashMap::new());
+        let mut member = serenity::all::Member::default();
+        member.nick = Some("Rexy".into());
+        let mut voice = VoiceState::default();
+        voice.user_id = UserId::new(10);
+        voice.channel_id = Some(ChannelId::new(3));
+        voice.member = Some(member);
+        (state, store, voice)
+    }
+
+    #[tokio::test]
+    async fn creator_setup_is_reused_and_never_registered_as_a_temporary_room() {
+        let (state, store, _) = fixture();
+        let (http, task) = mock_http(vec![
+            (200, json!([])),
+            (200, voice_channel(3)),
+            (200, json!([voice_channel(3)])),
+        ])
+        .await;
+        assert_eq!(
+            state.setup(&http, &store, GuildId::new(1)).await.unwrap(),
+            ChannelId::new(3)
+        );
+        assert_eq!(
+            state.setup(&http, &store, GuildId::new(1)).await.unwrap(),
+            ChannelId::new(3)
+        );
+        assert_eq!(store.active_temp_channels("1").unwrap(), 0);
+        let requests = task.await.unwrap();
+        assert!(requests[1].starts_with("POST /guilds/1/channels "));
+        let body: Value =
+            serde_json::from_str(requests[1].split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(body["name"], "➕ Creator Channel");
+        assert_eq!(body["type"], 2);
+    }
+
+    #[tokio::test]
+    async fn joins_create_and_move_using_display_name_and_only_last_member_departure_deletes() {
+        let (state, store, voice) = fixture();
+        let (http, task) = mock_http(vec![(200, json!([voice_channel(3)])), (200, voice_channel(4)), (200, json!({"user":{"id":"10","username":"rexy0345","discriminator":"0"},"roles":[],"joined_at":null,"deaf":false,"mute":false})), (200, voice_channel(4))]).await;
+        state.update(&http, &store, GuildId::new(1), &voice).await;
+        assert_eq!(store.active_temp_channels("1").unwrap(), 1);
+        assert_eq!(
+            state.channel(GuildId::new(1), voice.user_id),
+            Some(ChannelId::new(4))
+        );
+        state.observe(GuildId::new(1), UserId::new(11), Some(ChannelId::new(4)));
+        let mut leave = voice.clone();
+        leave.channel_id = None;
+        state.update(&http, &store, GuildId::new(1), &leave).await;
+        assert_eq!(
+            store.active_temp_channels("1").unwrap(),
+            1,
+            "guest still inside"
+        );
+        leave.user_id = UserId::new(11);
+        leave.channel_id = Some(ChannelId::new(8));
+        state.update(&http, &store, GuildId::new(1), &leave).await;
+        assert_eq!(store.active_temp_channels("1").unwrap(), 0);
+        let requests = task.await.unwrap();
+        assert!(requests[1].contains("Rexy's room"));
+        assert!(requests[2].starts_with("PATCH /guilds/1/members/10 "));
+        assert!(requests[2].contains("\"channel_id\":\"4\""));
+        assert!(requests[3].starts_with("DELETE /channels/4 "));
+        assert_eq!(creator(&store, GuildId::new(1)), Some(ChannelId::new(3)));
+    }
+
+    #[tokio::test]
+    async fn failed_move_removes_the_new_empty_room_and_delete_failure_keeps_retry_record() {
+        let (state, store, voice) = fixture();
+        let denied = json!({"code":50013,"message":"Missing Permissions"});
+        let (http, task) = mock_http(vec![
+            (200, json!([voice_channel(3)])),
+            (200, voice_channel(4)),
+            (403, denied.clone()),
+            (403, denied),
+            (200, voice_channel(4)),
+        ])
+        .await;
+        state.update(&http, &store, GuildId::new(1), &voice).await;
+        assert_eq!(
+            store.active_temp_channels("1").unwrap(),
+            1,
+            "failed delete remains durable"
+        );
+        state
+            .cleanup(&http, &store, GuildId::new(1), ChannelId::new(4))
+            .await;
+        assert_eq!(store.active_temp_channels("1").unwrap(), 0);
+        assert_eq!(task.await.unwrap().len(), 5);
+    }
 
     #[test]
     fn duplicate_updates_moves_and_missing_snapshots() {

@@ -416,7 +416,9 @@ struct Handler {
 #[async_trait]
 impl EventHandler for Handler {
     async fn guild_create(&self, ctx: Context, guild: Guild, _is_new: Option<bool>) {
-        self.temp_channels.seed(&ctx, &self.store, &guild).await;
+        self.temp_channels
+            .seed(&ctx.http, &self.store, &guild)
+            .await;
         // The store makes this idempotent, so startup GuildCreate replays do
         // not inflate acquisition. A first observation is intentionally a
         // join: it gives a newly enabled lifecycle table a valid baseline.
@@ -1868,7 +1870,7 @@ impl EventHandler for Handler {
             return;
         };
         self.temp_channels
-            .update(&ctx, &self.store, guild_id, &new)
+            .update(&ctx.http, &self.store, guild_id, &new)
             .await;
         let old_channel_id = old.as_ref().and_then(|state| state.channel_id);
         let new_channel_id = new.channel_id;
@@ -7638,7 +7640,7 @@ impl Handler {
                 if !feature_enabled(&self.store, &guild_text, "utility.temp_channels", None) {
                     return respond(ctx, command, "Temporary channels are disabled in this server. Enable them in the dashboard.").await;
                 }
-                let channel = self.temp_channels.setup(ctx, &self.store, guild_id).await?;
+                let channel = self.temp_channels.setup(&ctx.http, &self.store, guild_id).await?;
                 format!("Creator Channel: <#{}>. Join it to create your room.", channel)
             }
             "starboard-set" => {
