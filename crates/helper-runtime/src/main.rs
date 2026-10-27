@@ -71,6 +71,7 @@ async fn main() -> Result<()> {
                 &config.bind_addr,
                 ApiState {
                     store: store.clone(),
+                    oauth_limits: Arc::default(),
                     guild_authorization: Arc::new(helper_api::GuildAuthorization::new()?),
                     discord_token: config.discord_token.clone(),
                     session_secret: config.session_secret.clone(),

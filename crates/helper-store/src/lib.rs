@@ -1105,6 +1105,14 @@ impl Store {
             "DELETE FROM helper_oauth_states WHERE expires_at < ?1 OR used_at < ?1 - 3600",
             [Utc::now().timestamp()],
         )?;
+        let pending: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM helper_oauth_states WHERE used_at IS NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        if pending >= 4096 {
+            bail!("oauth_pending_limit");
+        }
         conn.execute(
             "INSERT OR REPLACE INTO helper_oauth_states(state_hash,expires_at,used_at,code_verifier) VALUES(?1,?2,NULL,?3)",
             params![state_hash, expires_at, code_verifier],
@@ -6674,6 +6682,36 @@ mod tests {
         assert_eq!(rows[0].kind, "message_edit");
         assert_eq!(rows[0].detail.chars().count(), 2_000);
         assert_eq!(rows[0].user_tag.as_deref(), Some("member#0001"));
+    }
+
+    #[test]
+    fn oauth_pending_capacity_preserves_existing_flows() {
+        let store = Store::open(":memory:").unwrap();
+        let now = Utc::now().timestamp();
+        {
+            let connection = store.conn.lock().unwrap();
+            connection.execute(
+                "WITH RECURSIVE sequence(value) AS (SELECT 1 UNION ALL SELECT value+1 FROM sequence WHERE value<4096) INSERT INTO helper_oauth_states(state_hash,expires_at,used_at,code_verifier) SELECT 'state-'||value,?1,NULL,'synthetic-verifier' FROM sequence",
+                [now+600],
+            ).unwrap();
+        }
+        assert_eq!(
+            store
+                .register_oauth_state("overflow", now + 600, "new")
+                .unwrap_err()
+                .to_string(),
+            "oauth_pending_limit"
+        );
+        assert_eq!(
+            store
+                .consume_oauth_state("state-1", now)
+                .unwrap()
+                .as_deref(),
+            Some("synthetic-verifier")
+        );
+        store
+            .register_oauth_state("after-consumption", now + 600, "new")
+            .unwrap();
     }
 
     #[test]
