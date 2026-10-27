@@ -1,15 +1,17 @@
 # Plano — Painel web de controlo do Vozen Helper
 
+> Historical plan: account IDs and CORS origins are generic examples. Fill in PANEL_ALLOWED_USER_ID and the exact HTTPS origin you control; dated test results are historical.
+
 > Planeado em 2026-07-14. Painel atrás do login
 > Discord já existente (site `vozen-helper-bot`, GitHub Pages) que controla A SÉRIO o bot
 > que corre na VPS. **Planeamento only — não se escreve código nesta fase.**
 
 ## Objetivo
 
-Um painel privado (só a conta `1523489275155583056`) onde o Diogo **vê** o estado do bot
+Um painel privado (só a conta `<PANEL_OWNER_DISCORD_ID>`) onde o Diogo **vê** o estado do bot
 (casos, stats, config atual) e **altera** definições de moderação/comunidade **sem
 redeploy**. Requer uma **API HTTP na VPS** ligada à SQLite do bot, com **HTTPS** acessível
-a partir do origin `https://rexy40407.github.io` e **auth real** via Discord OAuth.
+a partir do origin `https://admin.example.com` e **auth real** via Discord OAuth.
 
 **Assunções** (mudam a execução se erradas):
 
@@ -31,7 +33,7 @@ a partir do origin `https://rexy40407.github.io` e **auth real** via Discord OAu
 - **Camada de settings em runtime** no bot: tabela `settings` + resolver que sobrepõe
   overrides da BD sobre os defaults de `modConfig`; módulos passam a ler pelo resolver.
 - Painel (SPA estática) atrás do gate: dashboard, moderação, comunidade, casos, definições.
-- Exposição HTTPS via Cloudflare Tunnel + CORS trancado ao origin `github.io`.
+- Exposição HTTPS via Cloudflare Tunnel + CORS trancado ao origin `https://admin.example.com`.
 - Deploy da API (supervisor + cron `@reboot`) e do túnel.
 
 ### Out
@@ -48,14 +50,14 @@ a partir do origin `https://rexy40407.github.io` e **auth real** via Discord OAu
 ### Fase 0 — Spike de alcance HTTPS (de-risk primeiro) ✅ FEITO (2026-07-14)
 
 Deliverable: um endpoint trivial `GET /health` na VPS, servido por **HTTPS** através do
-Cloudflare Tunnel, chamável do browser a partir de `https://rexy40407.github.io`.
+Cloudflare Tunnel, chamável do browser a partir de `https://admin.example.com`.
 Dependências: nenhuma. **É aqui que se descobre cedo o maior desconhecido.**
 
 - [x] Instalar `cloudflared` como binário de utilizador na VPS (sem sudo) e criar um túnel
       para um mini-servidor local (`GET /health` → `200 {ok:true}`), com CORS a permitir só o
-      origin `github.io`.
+      origin `https://admin.example.com`.
 - [x] Da internet, `curl` ao URL do túnel devolve 200 `{ok:true}` sobre HTTPS; com header
-      `Origin: github.io` responde `Access-Control-Allow-Origin: github.io`; origin não
+      `Origin: https://admin.example.com` responde `Access-Control-Allow-Origin: https://admin.example.com`; origin não
       autorizado → sem esse header (trancado).
 - **Done:** ✅ provado ponta-a-ponta (`https://<x>.trycloudflare.com/health` → `{ok:true}`,
   CORS ok). Spike desligado a seguir; bot intacto.
@@ -83,7 +85,7 @@ Deliverable: serviço HTTP com sessão segura; só a conta permitida entra. Dep.
 - [x] `POST /api/session`: recebe o Bearer token do Discord, chama `/users/@me` **no
       servidor** (`fetchDiscordUser`), confirma `id === PANEL_ALLOWED_USER_ID`, e emite cookie
       de sessão **assinado + httpOnly + Secure + SameSite=None**. Guarda protege `/api/me`.
-- [x] CORS trancado ao `PANEL_ALLOWED_ORIGIN` (github.io) com `credentials`.
+- [x] CORS trancado ao `PANEL_ALLOWED_ORIGIN` (https://admin.example.com) com `credentials`.
 - **Done:** ✅ 16 testes (inject) verdes: conta certa → 200+cookie; outra → 403; token
   inválido → 401; sem token → 400; Discord em baixo → 502; cookie forjado → 401.
   Suite completa 143/143, typecheck+build+lint limpos, boot local confirmado
@@ -203,4 +205,4 @@ stats + config ao vivo da VPS (só-leitura). Já é útil e testável. O control
 (escrita) chega na Fase 4, depois do refactor de settings (Fase 3).
 
 **Próxima ação concreta: instalar o `cloudflared` na VPS e abrir um túnel HTTPS para um
-`GET /health` local, confirmando o `fetch` desde o origin github.io sem erro de CORS (Fase 0).**
+`GET /health` local, confirmando o `fetch` desde o origin https://admin.example.com sem erro de CORS (Fase 0).**
