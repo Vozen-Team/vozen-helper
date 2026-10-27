@@ -5759,7 +5759,7 @@ async fn generic_feature_preflight(
             "feature_merged_into_support.welcome",
         ));
     }
-    let guild = state
+    state
         .store
         .session_guilds(claims.session_id)
         .map_err(|_| client_error(StatusCode::INTERNAL_SERVER_ERROR, "store_error"))?
