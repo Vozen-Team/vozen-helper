@@ -19,6 +19,10 @@ ProtectSystem=strict
 ProtectHome=read-only
 ReadWritePaths=/home/vozen/vozen-helper-rust/shared/data /home/vozen/vozen-helper
 LimitNOFILE=65536
+MemoryHigh=2G
+MemoryMax=3G
+CPUQuota=300%
+TasksMax=512
 
 [Install]
 WantedBy=multi-user.target
