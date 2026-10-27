@@ -33,7 +33,7 @@
   },
   "//overrides": "Correção do advisory high do undici (via discord.js->@discordjs/rest) sem breaking change (mesma major 6.x). NÃO correr `npm audit fix --force` — baixaria o discord.js para v13.",
   "overrides": {
-    "undici": "^6.27.0"
+    "undici": "^6.29.1"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
