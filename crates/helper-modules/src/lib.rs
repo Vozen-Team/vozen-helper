@@ -2816,10 +2816,10 @@ mod tests {
     #[test]
     fn bluesky_handles_are_normalized_and_bounded() {
         assert_eq!(
-            normalize_bluesky_handle("  @Vozen.org ").unwrap(),
-            "vozen.org"
+            normalize_bluesky_handle("  @Example.com ").unwrap(),
+            "example.com"
         );
-        assert!(normalize_bluesky_handle("https://bsky.app/profile/vozen.org").is_err());
+        assert!(normalize_bluesky_handle("https://bsky.app/profile/example.com").is_err());
         assert!(normalize_bluesky_handle(".invalid").is_err());
         assert!(normalize_bluesky_handle("invalid..handle").is_err());
         assert!(normalize_bluesky_handle(&"a".repeat(254)).is_err());
@@ -2961,8 +2961,8 @@ mod tests {
         use k256::ecdsa::SigningKey;
 
         let verifier = SiweVerifier::new(
-            "panel.vozen.org",
-            "https://panel.vozen.org/",
+            "admin.example.com",
+            "https://admin.example.com/",
             "01234567890123456789012345678901",
         )
         .expect("valid SIWE verifier");
@@ -2975,7 +2975,7 @@ mod tests {
         let address = eth_address_from_key(signing_key.verifying_key());
         let now = Utc::now();
         let message = format!(
-            "panel.vozen.org wants you to sign in with your Ethereum account:\n{}\n\nVozen wallet verification\n\nURI: https://panel.vozen.org/\nVersion: 1\nChain ID: 1\nNonce: ABCD1234\nIssued At: {}\nExpiration Time: {}",
+            "admin.example.com wants you to sign in with your Ethereum account:\n{}\n\nVozen wallet verification\n\nURI: https://admin.example.com/\nVersion: 1\nChain ID: 1\nNonce: ABCD1234\nIssued At: {}\nExpiration Time: {}",
             address,
             now.to_rfc3339(),
             (now + chrono::Duration::minutes(5)).to_rfc3339()
@@ -3051,7 +3051,7 @@ mod tests {
         let oauth = TikTokOAuthClient::new(
             "client-key",
             "client-secret",
-            "https://api.vozen.org/rust/api/providers/tiktok/oauth/callback",
+            "https://api.example.com/rust/api/providers/tiktok/oauth/callback",
             "https://www.tiktok.com/v2/auth/authorize/",
             "https://open.tiktokapis.com/v2/oauth/token/",
         )

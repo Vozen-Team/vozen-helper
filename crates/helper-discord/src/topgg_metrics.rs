@@ -218,7 +218,7 @@ mod tests {
             requests: Mutex::new(Vec::new()),
         }
     }
-    const BOT: &str = "1526211106081734666";
+    const BOT: &str = "100000000000000003";
 
     #[tokio::test]
     async fn v1_metrics_use_bearer_auth_and_include_server_and_shard_counts() {

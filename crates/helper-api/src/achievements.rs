@@ -97,7 +97,7 @@ mod tests {
         http::Request,
     };
     use tower::ServiceExt;
-    const GUILD: &str = "1524199248248176751";
+    const GUILD: &str = "100000000000000010";
     #[tokio::test]
     async fn catalog_has_no_member_identifiers_and_profile_needs_scoped_live_token() {
         let store = Store::open(":memory:").unwrap();

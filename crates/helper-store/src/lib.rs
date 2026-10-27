@@ -7209,7 +7209,7 @@ mod tests {
         store
             .create_bluesky_subscription(
                 "guild-bluesky",
-                "vozen.org",
+                "example.com",
                 "123456789012345678",
                 "New post: {url}",
                 "",
@@ -7654,7 +7654,7 @@ mod tests {
         let first = store
             .create_bluesky_subscription(
                 "guild-a",
-                "vozen.org",
+                "example.com",
                 "123456789012345678",
                 "New post: {text} {url}",
                 "",
@@ -7663,7 +7663,7 @@ mod tests {
                 "owner-a",
             )
             .unwrap();
-        assert_eq!(first.source_handle, "vozen.org");
+        assert_eq!(first.source_handle, "example.com");
         assert!(store.bluesky_subscriptions("guild-b").unwrap().is_empty());
         assert_eq!(store.bluesky_subscriptions("guild-a").unwrap().len(), 1);
 
@@ -7686,7 +7686,7 @@ mod tests {
             .update_bluesky_subscription(
                 "guild-a",
                 first.id,
-                "updates.vozen.org",
+                "updates.example.com",
                 "987654321098765432",
                 "{handle}: {text}",
                 "@here",
@@ -7695,7 +7695,7 @@ mod tests {
             )
             .unwrap()
             .unwrap();
-        assert_eq!(updated.source_handle, "updates.vozen.org");
+        assert_eq!(updated.source_handle, "updates.example.com");
         assert!(!updated.enabled);
         assert!(
             !store
