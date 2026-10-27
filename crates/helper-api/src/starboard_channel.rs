@@ -619,6 +619,24 @@ mod tests {
 
     use super::*;
     #[test]
+    fn install_permissions_cover_every_resource_creation_path() {
+        let permissions = HELPER_INSTALL_PERMISSIONS.parse::<u64>().unwrap();
+        for purpose in [
+            ChannelPurpose::Starboard,
+            ChannelPurpose::TicketPanel,
+            ChannelPurpose::TicketCategory,
+            ChannelPurpose::Birthday,
+            ChannelPurpose::Shop,
+            ChannelPurpose::TempCategory,
+        ] {
+            assert_eq!(
+                permissions & purpose.required_permissions(),
+                purpose.required_permissions()
+            );
+        }
+    }
+
+    #[test]
     fn temporary_voice_category_inherits_permissions_and_never_adopts_ticket_categories() {
         let purpose = ChannelPurpose::TempCategory;
         assert_eq!(purpose.channel_type(), 4);
