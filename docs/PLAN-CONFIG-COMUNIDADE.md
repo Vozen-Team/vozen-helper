@@ -1,5 +1,7 @@
 # Plano — Ativar as features de comunidade no Vozen Support
 
+> Historical configuration plan: channel/category IDs are placeholders, not server identifiers. Replace each placeholder with the corresponding ID from your own server.
+
 > Planeado em 2026-07-13. O bot e as features já estão
 > no VPS; isto é o plano de CONFIGURAÇÃO (canais, cargos, IDs) para as tornar vivas.
 
@@ -12,10 +14,10 @@ AUTOMATIZADA (o bot tem `Manage Channels`/`Manage Roles`) e preenchendo o
 
 ## Estado atual do servidor (2026-07-13)
 
-Canais existentes relevantes: `general-chat` (1523496056359489636) ·
-`mod-logs` (1524488901320769666) · `mod-helper-bot` (1526248625305292870) ·
-`bug-report` (forum) · categoria "Canais de Texto" (1523482273993986170) ·
-categoria "Canais de Voz" (1523482273993986171) · categoria "Mod Room" (1523500066319372429).
+Canais existentes relevantes: `general-chat` (`<GENERAL_CHAT_CHANNEL_ID>`) ·
+`mod-logs` (`<MOD_LOGS_CHANNEL_ID>`) · `mod-helper-bot` (`<HELPER_MOD_CHANNEL_ID>`) ·
+`bug-report` (forum) · categoria "Canais de Texto" (`<TEXT_CATEGORY_ID>`) ·
+categoria "Canais de Voz" (`<VOICE_CATEGORY_ID>`) · categoria "Mod Room" (`<MOD_ROOM_CATEGORY_ID>`).
 
 Cargos: 👑Vozen(9) · Vozen helper(8, bot) · ⭐Developer(7) · 👮Staff(6) ·
 🌸Premium(5) · 🚀Boosters(4) · ☀️Member(3) · 🤖Other bots(2) · Top.gg(1).

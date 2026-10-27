@@ -1,5 +1,7 @@
 # Setup do Vozen Helper — do zero até 24/7 no VPS
 
+> The scp command uses a fictional VPS hostname. Replace it and the local source path before running the example.
+
 Guia completo: criar o bot no Discord (dá pelo telemóvel) e pô-lo a correr sempre
 ligado no **mesmo VPS do Vozen**, como serviço separado. Muito mais simples que o
 Vozen: **sem** ffmpeg, Piper, modelos, Caddy ou API web.
@@ -41,7 +43,7 @@ O código é **privado** (não open source). Duas formas de o levar ao VPS:
 Do PC (Git Bash), copia a pasta para o VPS (substitui o IP):
 
 ```bash
-scp -r "C:/Users/diogo/Videos/second brain/bots-discord/Vozen-helper" vozen@91.98.128.192:~/vozen-helper
+scp -r "C:/Users/diogo/Videos/second brain/bots-discord/Vozen-helper" vozen@vps.example.com:~/vozen-helper
 ```
 
 > Antes de copiar, apaga `node_modules/` e `dist/` locais para ir leve — reconstroem-se no VPS.
