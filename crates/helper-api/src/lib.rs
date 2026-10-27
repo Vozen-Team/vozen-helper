@@ -65,9 +65,9 @@ use uuid::Uuid;
 type HmacSha256 = Hmac<Sha256>;
 const COOKIE: &str = "vh_session";
 const INSTALL_FLOW_MARKER: &str = "install";
-// Instalação base: View Channel, Send Messages, Embed Links e Read Message History.
-// Permissões sensíveis são verificadas pelo passaporte antes de cada módulo ser publicado.
-const HELPER_INSTALL_PERMISSIONS: &str = "16862208";
+// Union of the current feature requirements; see docs/INSTALL-PERMISSIONS.md.
+// Module preflights and role/channel restrictions still apply after installation.
+const HELPER_INSTALL_PERMISSIONS: &str = "19099133930742";
 const SESSION_RESPONSE_HEADER: &str = "x-vozen-session";
 const SESSION_MAX_HOURS: i64 = 8;
 const IDLE_MINUTES: i64 = 30;
@@ -15355,20 +15355,24 @@ mod tests {
         assert_eq!(parameter("redirect_uri"), "https://example.test/callback");
         assert_eq!(parameter("permissions"), HELPER_INSTALL_PERMISSIONS);
         let permissions = parameter("permissions").parse::<u64>().unwrap();
-        for bit in [10_u8, 11, 14, 16, 24] {
+        let required_bits = [
+            1_u8, 2, 4, 5, 6, 7, 10, 11, 13, 14, 15, 16, 17, 18, 20, 24, 26, 27, 28, 30, 31, 33,
+            34, 35, 36, 38, 40, 44,
+        ];
+        for bit in required_bits {
             assert_ne!(
                 permissions & (1_u64 << bit),
                 0,
-                "base permission bit {bit} is missing"
+                "required install permission bit {bit} is missing"
             );
         }
-        for bit in [1_u8, 2, 3, 4, 5, 7, 13, 28, 40] {
-            assert_eq!(
-                permissions & (1_u64 << bit),
-                0,
-                "sensitive permission bit {bit} leaked into the base install"
-            );
-        }
+        assert_eq!(
+            permissions,
+            required_bits
+                .iter()
+                .fold(0, |mask, bit| mask | (1_u64 << bit))
+        );
+        assert_eq!(permissions & (1 << 3), 0, "Administrator is not required");
         assert_eq!(parameter("integration_type"), "0");
         assert_eq!(
             parameter("scope"),
@@ -15376,6 +15380,19 @@ mod tests {
         );
         assert!(parameter("state").contains('.'));
         assert!(parameter("code_challenge").len() >= 43);
+    }
+
+    #[test]
+    fn install_permissions_cover_all_feature_dependencies() {
+        let permissions = HELPER_INSTALL_PERMISSIONS.parse::<u64>().unwrap();
+        for key in helper_core::FEATURE_KEYS {
+            let adapter = helper_core::feature_adapter(key).expect("catalogue adapter");
+            for dependency in adapter.descriptor().dependencies {
+                if let Some((bit, label)) = dependency_permission(&dependency) {
+                    assert_ne!(permissions & (1_u64 << bit), 0, "{key} requires {label}");
+                }
+            }
+        }
     }
 
     #[test]
