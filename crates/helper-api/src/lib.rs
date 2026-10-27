@@ -12256,7 +12256,7 @@ mod tests {
             (
                 "/api/session",
                 "application/json",
-                r#"{"token":"synthetic-token-long-enough","guildId":"guild-a"}"#,
+                r#"{"token":"synthetic-token-long-enough","guild_id":"guild-a"}"#,
             ),
             (
                 "/api/session/vozen",
