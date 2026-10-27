@@ -7,6 +7,7 @@ mod activity_feed;
 mod discord_context;
 mod discord_read;
 mod economy_shop;
+mod session_authorization;
 mod starboard_channel;
 mod ticket_panel;
 
@@ -50,6 +51,7 @@ use hmac::{Hmac, Mac};
 use rand::RngCore;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+pub use session_authorization::GuildAuthorization;
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -72,6 +74,7 @@ static TICKET_PANEL_SAVE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::cons
 #[derive(Clone)]
 pub struct ApiState {
     pub store: Store,
+    pub guild_authorization: Arc<GuildAuthorization>,
     pub discord_token: String,
     pub session_secret: String,
     pub oauth_client_id: String,
@@ -740,7 +743,7 @@ async fn admin_growth(
     headers: HeaderMap,
     Query(query): Query<GrowthQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_auth(&state, &headers)?;
+    let claims = require_auth(&state, &headers).await?;
     let owner_id = state
         .private_tracker_owner_id
         .as_deref()
@@ -906,7 +909,7 @@ async fn tiktok_oauth_status(
     State(state): State<Arc<ApiState>>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_auth(&state, &headers)?;
+    let claims = require_auth(&state, &headers).await?;
     let grant = state
         .store
         .tiktok_grant(&claims.guild_id)
@@ -930,7 +933,7 @@ async fn tiktok_oauth_start(
     State(state): State<Arc<ApiState>>,
     headers: HeaderMap,
 ) -> Result<Json<TikTokOAuthStartResponse>, (StatusCode, Json<ApiError>)> {
-    let claims = require_mutation_auth(&state, &headers)?;
+    let claims = require_mutation_auth(&state, &headers).await?;
     let oauth = TikTokOAuthClient::from_env().ok_or_else(|| {
         client_error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1039,7 +1042,7 @@ async fn tiktok_oauth_disconnect(
     State(state): State<Arc<ApiState>>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_mutation_auth(&state, &headers)?;
+    let claims = require_mutation_auth(&state, &headers).await?;
     state
         .store
         .delete_tiktok_grant(&claims.guild_id)
@@ -1054,7 +1057,7 @@ async fn youtube_health(
     State(state): State<Arc<ApiState>>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_auth(&state, &headers)?;
+    let claims = require_auth(&state, &headers).await?;
     let configured = state
         .youtube
         .as_ref()
@@ -1077,7 +1080,7 @@ async fn coingecko_health(
     State(state): State<Arc<ApiState>>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_auth(&state, &headers)?;
+    let claims = require_auth(&state, &headers).await?;
     let Some(client) = state.coingecko.as_ref() else {
         return Ok(Json(serde_json::json!({
             "guildId": claims.guild_id,
@@ -1103,7 +1106,7 @@ async fn gas_health(
     State(state): State<Arc<ApiState>>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_auth(&state, &headers)?;
+    let claims = require_auth(&state, &headers).await?;
     let networks = state.gas.configured_networks();
     Ok(Json(serde_json::json!({
         "guildId": claims.guild_id,
@@ -1127,7 +1130,7 @@ async fn web3_gating_nonce(
     State(state): State<Arc<ApiState>>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_auth(&state, &headers)?;
+    let claims = require_auth(&state, &headers).await?;
     let Some(verifier) = state.siwe.as_ref() else {
         return Err(client_error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1160,7 +1163,7 @@ async fn web3_gating_verify(
     headers: HeaderMap,
     Json(request): Json<SiweVerifyRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_auth(&state, &headers)?;
+    let claims = require_auth(&state, &headers).await?;
     let Some(verifier) = state.siwe.as_ref() else {
         return Err(client_error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1319,7 +1322,7 @@ async fn gas_quote(
     headers: HeaderMap,
     Query(query): Query<GasQuoteQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_auth(&state, &headers)?;
+    let claims = require_auth(&state, &headers).await?;
     let quote = state.gas.quote(&query.network).await.map_err(|error| {
         let code = error.to_string();
         let status = if code == "unsupported_rpc_network" {
@@ -1347,7 +1350,7 @@ async fn youtube_channel(
     headers: HeaderMap,
     Path(channel_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let _claims = require_auth(&state, &headers)?;
+    let _claims = require_auth(&state, &headers).await?;
     let Some(client) = state.youtube.as_ref() else {
         return Err(client_error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1536,7 +1539,7 @@ async fn youtube_subscriptions(
     State(state): State<Arc<ApiState>>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_auth(&state, &headers)?;
+    let claims = require_auth(&state, &headers).await?;
     let subscriptions = state
         .store
         .youtube_subscriptions(&claims.guild_id)
@@ -1556,7 +1559,7 @@ async fn create_youtube_subscription(
     headers: HeaderMap,
     Json(input): Json<YouTubeSubscriptionInput>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<ApiError>)> {
-    let claims = require_mutation_auth(&state, &headers)?;
+    let claims = require_mutation_auth(&state, &headers).await?;
     require_feature_premium(&state, &claims, "social.youtube").await?;
     let (source, target, template, mention, enabled, interval) =
         validate_youtube_subscription(input)
@@ -1613,7 +1616,7 @@ async fn update_youtube_subscription(
     Path(id): Path<i64>,
     Json(input): Json<YouTubeSubscriptionInput>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_mutation_auth(&state, &headers)?;
+    let claims = require_mutation_auth(&state, &headers).await?;
     require_feature_premium(&state, &claims, "social.youtube").await?;
     let (source, target, template, mention, enabled, interval) =
         validate_youtube_subscription(input)
@@ -1668,7 +1671,7 @@ async fn delete_youtube_subscription(
     headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_mutation_auth(&state, &headers)?;
+    let claims = require_mutation_auth(&state, &headers).await?;
     let deleted = state
         .store
         .delete_youtube_subscription(&claims.guild_id, id)
@@ -1699,7 +1702,7 @@ async fn youtube_subscription_health(
     headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_auth(&state, &headers)?;
+    let claims = require_auth(&state, &headers).await?;
     let record = state
         .store
         .youtube_subscriptions(&claims.guild_id)
@@ -1767,7 +1770,7 @@ async fn test_youtube_delivery(
     Path(id): Path<i64>,
     Json(input): Json<YouTubeSubscriptionInput>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_mutation_auth(&state, &headers)?;
+    let claims = require_mutation_auth(&state, &headers).await?;
     let record = state
         .store
         .youtube_subscriptions(&claims.guild_id)
@@ -1862,7 +1865,7 @@ async fn rss_preview(
     headers: HeaderMap,
     Query(query): Query<RssPreviewQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let _claims = require_auth(&state, &headers)?;
+    let _claims = require_auth(&state, &headers).await?;
     if query.url.trim().len() > 2_048 {
         return Err(client_error(StatusCode::BAD_REQUEST, "invalid_rss_url"));
     }
@@ -1909,7 +1912,7 @@ async fn rss_subscription_health(
     headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_auth(&state, &headers)?;
+    let claims = require_auth(&state, &headers).await?;
     let record = state
         .store
         .rss_subscriptions(&claims.guild_id)
@@ -1973,7 +1976,7 @@ async fn test_rss_delivery(
     Path(id): Path<i64>,
     Json(input): Json<RssSubscriptionInput>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_mutation_auth(&state, &headers)?;
+    let claims = require_mutation_auth(&state, &headers).await?;
     let record = state
         .store
         .rss_subscriptions(&claims.guild_id)
@@ -2502,7 +2505,7 @@ async fn rss_subscriptions(
     State(state): State<Arc<ApiState>>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_auth(&state, &headers)?;
+    let claims = require_auth(&state, &headers).await?;
     let subscriptions = state
         .store
         .rss_subscriptions(&claims.guild_id)
@@ -2522,7 +2525,7 @@ async fn create_rss_subscription(
     headers: HeaderMap,
     Json(input): Json<RssSubscriptionInput>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<ApiError>)> {
-    let claims = require_mutation_auth(&state, &headers)?;
+    let claims = require_mutation_auth(&state, &headers).await?;
     require_feature_premium(&state, &claims, "social.rss").await?;
     let (feed_url, target, template, mention, enabled, interval) = validate_rss_subscription(input)
         .map_err(|code| client_error(StatusCode::BAD_REQUEST, code))?;
@@ -2568,7 +2571,7 @@ async fn update_rss_subscription(
     Path(id): Path<i64>,
     Json(input): Json<RssSubscriptionInput>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_mutation_auth(&state, &headers)?;
+    let claims = require_mutation_auth(&state, &headers).await?;
     require_feature_premium(&state, &claims, "social.rss").await?;
     let (feed_url, target, template, mention, enabled, interval) = validate_rss_subscription(input)
         .map_err(|code| client_error(StatusCode::BAD_REQUEST, code))?;
@@ -2619,7 +2622,7 @@ async fn delete_rss_subscription(
     headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_mutation_auth(&state, &headers)?;
+    let claims = require_mutation_auth(&state, &headers).await?;
     let deleted = state
         .store
         .delete_rss_subscription(&claims.guild_id, id)
@@ -2731,7 +2734,7 @@ async fn bluesky_subscriptions(
     State(state): State<Arc<ApiState>>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_auth(&state, &headers)?;
+    let claims = require_auth(&state, &headers).await?;
     let subscriptions = state
         .store
         .bluesky_subscriptions(&claims.guild_id)
@@ -2751,7 +2754,7 @@ async fn create_bluesky_subscription(
     headers: HeaderMap,
     Json(input): Json<BlueskySubscriptionInput>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<ApiError>)> {
-    let claims = require_mutation_auth(&state, &headers)?;
+    let claims = require_mutation_auth(&state, &headers).await?;
     require_feature_premium(&state, &claims, "social.bluesky").await?;
     let (handle, target, template, mention, enabled, interval) =
         validate_bluesky_subscription(input)
@@ -2799,7 +2802,7 @@ async fn update_bluesky_subscription(
     Path(id): Path<i64>,
     Json(input): Json<BlueskySubscriptionInput>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_mutation_auth(&state, &headers)?;
+    let claims = require_mutation_auth(&state, &headers).await?;
     require_feature_premium(&state, &claims, "social.bluesky").await?;
     let (handle, target, template, mention, enabled, interval) =
         validate_bluesky_subscription(input)
@@ -2845,7 +2848,7 @@ async fn delete_bluesky_subscription(
     headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_mutation_auth(&state, &headers)?;
+    let claims = require_mutation_auth(&state, &headers).await?;
     let deleted = state
         .store
         .delete_bluesky_subscription(&claims.guild_id, id)
@@ -2961,7 +2964,7 @@ async fn tiktok_health(
     State(state): State<Arc<ApiState>>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_auth(&state, &headers)?;
+    let claims = require_auth(&state, &headers).await?;
     let connected = state
         .store
         .tiktok_grant(&claims.guild_id)
@@ -3063,7 +3066,7 @@ async fn tiktok_subscriptions(
     State(state): State<Arc<ApiState>>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_auth(&state, &headers)?;
+    let claims = require_auth(&state, &headers).await?;
     let subscriptions = state
         .store
         .tiktok_subscriptions(&claims.guild_id)
@@ -3081,7 +3084,7 @@ async fn create_tiktok_subscription(
     headers: HeaderMap,
     Json(input): Json<TikTokSubscriptionInput>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<ApiError>)> {
-    let claims = require_mutation_auth(&state, &headers)?;
+    let claims = require_mutation_auth(&state, &headers).await?;
     require_feature_premium(&state, &claims, "social.tiktok").await?;
     let (source, target, template, mention, enabled, interval) =
         validate_tiktok_subscription(input)
@@ -3121,7 +3124,7 @@ async fn update_tiktok_subscription(
     Path(id): Path<i64>,
     Json(input): Json<TikTokSubscriptionInput>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_mutation_auth(&state, &headers)?;
+    let claims = require_mutation_auth(&state, &headers).await?;
     require_feature_premium(&state, &claims, "social.tiktok").await?;
     let (source, target, template, mention, enabled, interval) =
         validate_tiktok_subscription(input)
@@ -3164,7 +3167,7 @@ async fn test_tiktok_delivery(
     Path(id): Path<i64>,
     Json(input): Json<TikTokSubscriptionInput>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_mutation_auth(&state, &headers)?;
+    let claims = require_mutation_auth(&state, &headers).await?;
     require_feature_premium(&state, &claims, "social.tiktok").await?;
     let record = state
         .store
@@ -3243,7 +3246,7 @@ async fn delete_tiktok_subscription(
     headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_mutation_auth(&state, &headers)?;
+    let claims = require_mutation_auth(&state, &headers).await?;
     let deleted = state
         .store
         .delete_tiktok_subscription(&claims.guild_id, id)
@@ -3351,7 +3354,7 @@ async fn instagram_health(
     State(state): State<Arc<ApiState>>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let _ = require_auth(&state, &headers)?;
+    let _ = require_auth(&state, &headers).await?;
     let configured = state
         .instagram
         .as_ref()
@@ -3387,7 +3390,7 @@ async fn instagram_subscriptions(
     State(state): State<Arc<ApiState>>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_auth(&state, &headers)?;
+    let claims = require_auth(&state, &headers).await?;
     let subscriptions = state
         .store
         .instagram_subscriptions(&claims.guild_id)
@@ -3404,7 +3407,7 @@ async fn create_instagram_subscription(
     headers: HeaderMap,
     Json(input): Json<InstagramSubscriptionInput>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<ApiError>)> {
-    let claims = require_mutation_auth(&state, &headers)?;
+    let claims = require_mutation_auth(&state, &headers).await?;
     require_feature_premium(&state, &claims, "social.instagram").await?;
     let (username, target, template, mention, enabled, interval) =
         validate_instagram_subscription(input)
@@ -3443,7 +3446,7 @@ async fn update_instagram_subscription(
     Path(id): Path<i64>,
     Json(input): Json<InstagramSubscriptionInput>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_mutation_auth(&state, &headers)?;
+    let claims = require_mutation_auth(&state, &headers).await?;
     require_feature_premium(&state, &claims, "social.instagram").await?;
     let (username, target, template, mention, enabled, interval) =
         validate_instagram_subscription(input)
@@ -3478,7 +3481,7 @@ async fn delete_instagram_subscription(
     headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_mutation_auth(&state, &headers)?;
+    let claims = require_mutation_auth(&state, &headers).await?;
     let deleted = state
         .store
         .delete_instagram_subscription(&claims.guild_id, id)
@@ -3559,7 +3562,7 @@ async fn kick_health(
     State(state): State<Arc<ApiState>>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let _ = require_auth(&state, &headers)?;
+    let _ = require_auth(&state, &headers).await?;
     let configured = state.kick.is_some();
     let approved = kick_approved();
     Ok(Json(
@@ -3584,7 +3587,7 @@ async fn kick_subscriptions(
     State(state): State<Arc<ApiState>>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_auth(&state, &headers)?;
+    let claims = require_auth(&state, &headers).await?;
     let subscriptions = state
         .store
         .kick_subscriptions(&claims.guild_id)
@@ -3601,7 +3604,7 @@ async fn create_kick_subscription(
     headers: HeaderMap,
     Json(input): Json<KickSubscriptionInput>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<ApiError>)> {
-    let claims = require_mutation_auth(&state, &headers)?;
+    let claims = require_mutation_auth(&state, &headers).await?;
     require_feature_premium(&state, &claims, "social.kick").await?;
     let (source, target, template, mention, enabled, interval) = validate_kick_subscription(input)
         .map_err(|code| client_error(StatusCode::BAD_REQUEST, code))?;
@@ -3639,7 +3642,7 @@ async fn update_kick_subscription(
     Path(id): Path<i64>,
     Json(input): Json<KickSubscriptionInput>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_mutation_auth(&state, &headers)?;
+    let claims = require_mutation_auth(&state, &headers).await?;
     require_feature_premium(&state, &claims, "social.kick").await?;
     let (source, target, template, mention, enabled, interval) = validate_kick_subscription(input)
         .map_err(|code| client_error(StatusCode::BAD_REQUEST, code))?;
@@ -3673,7 +3676,7 @@ async fn delete_kick_subscription(
     headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_mutation_auth(&state, &headers)?;
+    let claims = require_mutation_auth(&state, &headers).await?;
     let deleted = state
         .store
         .delete_kick_subscription(&claims.guild_id, id)
@@ -3769,7 +3772,7 @@ async fn twitch_health(
     State(state): State<Arc<ApiState>>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_auth(&state, &headers)?;
+    let claims = require_auth(&state, &headers).await?;
     let configured = state
         .twitch
         .as_ref()
@@ -3793,7 +3796,7 @@ async fn twitch_channel(
     headers: HeaderMap,
     Path(login): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let _claims = require_auth(&state, &headers)?;
+    let _claims = require_auth(&state, &headers).await?;
     let Some(client) = state.twitch.as_ref() else {
         return Err(client_error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -3903,7 +3906,7 @@ async fn twitch_subscriptions(
     State(state): State<Arc<ApiState>>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_auth(&state, &headers)?;
+    let claims = require_auth(&state, &headers).await?;
     let subscriptions = state
         .store
         .twitch_subscriptions(&claims.guild_id)
@@ -3921,7 +3924,7 @@ async fn create_twitch_subscription(
     headers: HeaderMap,
     Json(input): Json<TwitchSubscriptionInput>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<ApiError>)> {
-    let claims = require_mutation_auth(&state, &headers)?;
+    let claims = require_mutation_auth(&state, &headers).await?;
     require_feature_premium(&state, &claims, "social.twitch").await?;
     let (login, target, template, mention, enabled) = validate_twitch_subscription(input)
         .map_err(|code| client_error(StatusCode::BAD_REQUEST, code))?;
@@ -3975,7 +3978,7 @@ async fn update_twitch_subscription(
     Path(id): Path<i64>,
     Json(input): Json<TwitchSubscriptionInput>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_mutation_auth(&state, &headers)?;
+    let claims = require_mutation_auth(&state, &headers).await?;
     require_feature_premium(&state, &claims, "social.twitch").await?;
     let (login, target, template, mention, enabled) = validate_twitch_subscription(input)
         .map_err(|code| client_error(StatusCode::BAD_REQUEST, code))?;
@@ -4034,7 +4037,7 @@ async fn delete_twitch_subscription(
     headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_mutation_auth(&state, &headers)?;
+    let claims = require_mutation_auth(&state, &headers).await?;
     let deleted = state
         .store
         .delete_twitch_subscription(&claims.guild_id, id)
@@ -4068,7 +4071,7 @@ async fn twitch_subscription_health(
     headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_auth(&state, &headers)?;
+    let claims = require_auth(&state, &headers).await?;
     let record = state
         .store
         .twitch_subscriptions(&claims.guild_id)
@@ -4142,7 +4145,7 @@ async fn test_twitch_delivery(
     Path(id): Path<i64>,
     Json(input): Json<TwitchSubscriptionInput>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_mutation_auth(&state, &headers)?;
+    let claims = require_mutation_auth(&state, &headers).await?;
     let record = state
         .store
         .twitch_subscriptions(&claims.guild_id)
@@ -4232,7 +4235,7 @@ async fn stripe_health(
     State(state): State<Arc<ApiState>>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let _ = require_auth(&state, &headers)?;
+    let _ = require_auth(&state, &headers).await?;
     let configured = state.stripe.is_some();
     let approved = stripe_approved();
     Ok(Json(serde_json::json!({
@@ -5002,7 +5005,7 @@ async fn me(
     State(state): State<Arc<ApiState>>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_auth(&state, &headers)?;
+    let claims = require_auth(&state, &headers).await?;
     Ok(Json(
         serde_json::json!({"id":claims.user_id,"guildId":claims.guild_id,"expiresAt":claims.expires_at,"dbOk":true}),
     ))
@@ -5012,7 +5015,7 @@ async fn guilds(
     State(state): State<Arc<ApiState>>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_auth(&state, &headers)?;
+    let claims = require_auth(&state, &headers).await?;
     let managed_guilds = state
         .store
         .session_guilds(claims.session_id)
@@ -5310,7 +5313,7 @@ async fn guild_context(
     State(state): State<Arc<ApiState>>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_auth(&state, &headers)?;
+    let claims = require_auth(&state, &headers).await?;
     let guild = state
         .store
         .session_guilds(claims.session_id)
@@ -5320,7 +5323,11 @@ async fn guild_context(
     let Some(guild) = guild else {
         return Err(client_error(StatusCode::FORBIDDEN, "guild_not_managed"));
     };
-    let permissions = guild.permissions.unwrap_or_default();
+    let permissions = state
+        .guild_authorization
+        .permissions(&state, &claims)
+        .await?
+        .to_string();
     let snapshot = fetch_discord_guild_snapshot(&guild.guild_id, &state.discord_token).await;
     let bot_permissions =
         effective_bot_permissions(&guild.guild_id, &snapshot.roles, &snapshot.bot_role_ids);
@@ -5745,7 +5752,7 @@ async fn generic_feature_preflight(
     key: String,
     request: FeaturePreflightRequest,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_auth(&state, &headers)?;
+    let claims = require_auth(&state, &headers).await?;
     if key == "support.welcome_channel" {
         return Err(client_error(
             StatusCode::GONE,
@@ -5820,7 +5827,11 @@ async fn generic_feature_preflight(
     let bot_permissions =
         effective_bot_permissions(&claims.guild_id, &snapshot.roles, &snapshot.bot_role_ids);
     let bot_context_available = snapshot.bot_ready && bot_permissions.is_some();
-    let guild_permissions = guild.permissions.unwrap_or_default();
+    let guild_permissions = state
+        .guild_authorization
+        .permissions(&state, &claims)
+        .await?
+        .to_string();
     let mut required_permissions = Vec::new();
     let mut bot_permission_results = serde_json::Map::new();
     let mut user_permission_results = serde_json::Map::new();
@@ -6083,7 +6094,7 @@ async fn preflight(
     headers: HeaderMap,
     Json(request): Json<PreflightRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_auth(&state, &headers)?;
+    let claims = require_auth(&state, &headers).await?;
     let key = match request.operation.as_str() {
         "protection.antispam.publish" | "protection.antispam.rollback" => "protection.antispam",
         "protection.antiscam.publish" | "protection.antiscam.rollback" => "protection.antiscam",
@@ -6108,7 +6119,11 @@ async fn preflight(
         .into_iter()
         .find(|guild| guild.guild_id == claims.guild_id)
         .ok_or_else(|| client_error(StatusCode::FORBIDDEN, "guild_not_managed"))?;
-    let permissions = guild.permissions.unwrap_or_default();
+    let permissions = state
+        .guild_authorization
+        .permissions(&state, &claims)
+        .await?
+        .to_string();
     let discord_snapshot =
         fetch_discord_guild_snapshot(&guild.guild_id, &state.discord_token).await;
     let bot_permissions = effective_bot_permissions(
@@ -6316,7 +6331,7 @@ async fn nickname_preflight(
     headers: HeaderMap,
     request: FeaturePreflightRequest,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_auth(&state, &headers)?;
+    let claims = require_auth(&state, &headers).await?;
     let managed = state
         .store
         .session_guilds(claims.session_id)
@@ -6833,7 +6848,7 @@ async fn role_panels(
     State(state): State<Arc<ApiState>>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_auth(&state, &headers)?;
+    let claims = require_auth(&state, &headers).await?;
     let panels = state
         .store
         .settings_with_prefix(&claims.guild_id, "community.role_panel.")
@@ -6851,7 +6866,7 @@ async fn create_role_panel(
     headers: HeaderMap,
     Json(request): Json<RolePanelRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<ApiError>)> {
-    let claims = require_mutation_auth(&state, &headers)?;
+    let claims = require_mutation_auth(&state, &headers).await?;
     require_feature_premium(&state, &claims, "community.role_panels").await?;
     if !feature_enabled(&state, &claims.guild_id, "community.role_panels") {
         return Err(client_error(StatusCode::CONFLICT, "feature_disabled"));
@@ -6937,7 +6952,7 @@ async fn update_role_panel(
     Path(message_id): Path<String>,
     Json(request): Json<RolePanelRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_mutation_auth(&state, &headers)?;
+    let claims = require_mutation_auth(&state, &headers).await?;
     require_feature_premium(&state, &claims, "community.role_panels").await?;
     if !feature_enabled(&state, &claims.guild_id, "community.role_panels") {
         return Err(client_error(StatusCode::CONFLICT, "feature_disabled"));
@@ -7035,7 +7050,7 @@ async fn delete_role_panel(
     headers: HeaderMap,
     Path(message_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_mutation_auth(&state, &headers)?;
+    let claims = require_mutation_auth(&state, &headers).await?;
     if message_id.parse::<u64>().is_err() {
         return Err(client_error(
             StatusCode::BAD_REQUEST,
@@ -7077,7 +7092,7 @@ async fn repair_role_panel(
     headers: HeaderMap,
     Path(message_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_mutation_auth(&state, &headers)?;
+    let claims = require_mutation_auth(&state, &headers).await?;
     require_feature_premium(&state, &claims, "community.role_panels").await?;
     if message_id.parse::<u64>().is_err() {
         return Err(client_error(
@@ -7166,7 +7181,7 @@ async fn quick_setup(
     State(state): State<Arc<ApiState>>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_auth(&state, &headers)?;
+    let claims = require_auth(&state, &headers).await?;
     Ok(Json(read_quick_setup(&state, &claims.guild_id)))
 }
 
@@ -7174,7 +7189,7 @@ async fn quick_setup_dismiss(
     State(state): State<Arc<ApiState>>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_mutation_auth(&state, &headers)?;
+    let claims = require_mutation_auth(&state, &headers).await?;
     let mut value = read_quick_setup(&state, &claims.guild_id);
     value["status"] = serde_json::json!("dismissed");
     value["revision"] =
@@ -7193,7 +7208,7 @@ async fn quick_setup_step(
     Path(step): Path<String>,
     Json(update): Json<QuickSetupStepUpdate>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_mutation_auth(&state, &headers)?;
+    let claims = require_mutation_auth(&state, &headers).await?;
     if !["welcome", "roles", "moderation", "protection"].contains(&step.as_str()) {
         return Err(client_error(
             StatusCode::BAD_REQUEST,
@@ -7369,7 +7384,7 @@ async fn switch_session_guild(
     headers: HeaderMap,
     Json(request): Json<SwitchGuildRequest>,
 ) -> Result<Response, (StatusCode, Json<ApiError>)> {
-    let current = require_mutation_auth(&state, &headers)?;
+    let current = require_mutation_auth(&state, &headers).await?;
     let managed = state
         .store
         .session_guilds(current.session_id)
@@ -7381,6 +7396,9 @@ async fn switch_session_guild(
     {
         return Err(client_error(StatusCode::FORBIDDEN, "guild_not_managed"));
     }
+    let mut target = current.clone();
+    target.guild_id = request.guild_id.clone();
+    state.guild_authorization.authorize(&state, &target).await?;
     let now = Utc::now();
     let claims = SessionClaims {
         session_id: Uuid::new_v4(),
@@ -7938,7 +7956,7 @@ async fn feature_config(
     State(state): State<Arc<ApiState>>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_auth(&state, &headers)?;
+    let claims = require_auth(&state, &headers).await?;
     let premium_enabled = guild_has_premium(&state, &claims).await;
     let rows = FEATURE_DEFINITIONS
         .iter()
@@ -8806,7 +8824,7 @@ async fn feature_detail(
     headers: HeaderMap,
     Path(key): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_auth(&state, &headers)?;
+    let claims = require_auth(&state, &headers).await?;
     let key = if key == "support.welcome_channel" {
         "support.welcome".to_string()
     } else {
@@ -8928,7 +8946,7 @@ async fn feature_health(
     headers: HeaderMap,
     Path(key): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_auth(&state, &headers)?;
+    let claims = require_auth(&state, &headers).await?;
     if feature_definition(&key).is_none() {
         return Err(client_error(StatusCode::NOT_FOUND, "unknown_feature"));
     }
@@ -9049,7 +9067,7 @@ async fn update_feature_detail(
     Path(key): Path<String>,
     Json(mut update): Json<FeatureDetailUpdate>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_mutation_auth(&state, &headers)?;
+    let claims = require_mutation_auth(&state, &headers).await?;
     if key == "community.levels"
         && let Some(config) = update.config.as_object_mut()
     {
@@ -9518,7 +9536,7 @@ async fn test_feature(
     Path(key): Path<String>,
     Json(test): Json<FeatureTestRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let _claims = require_auth(&state, &headers)?;
+    let _claims = require_auth(&state, &headers).await?;
     if feature_definition(&key).is_none() {
         return Err(client_error(StatusCode::NOT_FOUND, "unknown_feature"));
     }
@@ -9755,7 +9773,7 @@ async fn feature_revisions(
     headers: HeaderMap,
     Path(key): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_auth(&state, &headers)?;
+    let claims = require_auth(&state, &headers).await?;
     if feature_definition(&key).is_none() {
         return Err(client_error(StatusCode::NOT_FOUND, "unknown_feature"));
     }
@@ -9783,7 +9801,7 @@ async fn feature_rollback(
     Path(key): Path<String>,
     Json(request): Json<FeatureRollbackRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_mutation_auth(&state, &headers)?;
+    let claims = require_mutation_auth(&state, &headers).await?;
     if feature_definition(&key).is_none() {
         return Err(client_error(StatusCode::NOT_FOUND, "unknown_feature"));
     }
@@ -10030,7 +10048,7 @@ async fn feature_repair(
     headers: HeaderMap,
     Path(key): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_mutation_auth(&state, &headers)?;
+    let claims = require_mutation_auth(&state, &headers).await?;
     if feature_definition(&key).is_none() {
         return Err(client_error(StatusCode::NOT_FOUND, "unknown_feature"));
     }
@@ -10066,7 +10084,7 @@ async fn update_feature_config(
     headers: HeaderMap,
     Json(update): Json<FeatureUpdate>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_mutation_auth(&state, &headers)?;
+    let claims = require_mutation_auth(&state, &headers).await?;
     if feature_definition(&update.key).is_none() {
         return Err(client_error(StatusCode::BAD_REQUEST, "unknown_feature"));
     }
@@ -10125,7 +10143,7 @@ async fn cases(
     headers: HeaderMap,
     Query(query): Query<LimitQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_auth(&state, &headers)?;
+    let claims = require_auth(&state, &headers).await?;
     let list = state
         .store
         .recent_cases(&claims.guild_id, query.limit.unwrap_or(50).min(200))
@@ -10138,7 +10156,7 @@ async fn audit(
     headers: HeaderMap,
     Query(query): Query<LimitQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_auth(&state, &headers)?;
+    let claims = require_auth(&state, &headers).await?;
     let list = state
         .store
         .recent_audit_events(&claims.guild_id, query.limit.unwrap_or(50).min(200))
@@ -10154,7 +10172,7 @@ async fn activity(
     headers: HeaderMap,
     Query(query): Query<LimitQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_auth(&state, &headers)?;
+    let claims = require_auth(&state, &headers).await?;
     let list = state
         .store
         .recent_activity(&claims.guild_id, query.limit.unwrap_or(50).min(200))
@@ -10169,7 +10187,7 @@ async fn stats(
     State(state): State<Arc<ApiState>>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_auth(&state, &headers)?;
+    let claims = require_auth(&state, &headers).await?;
     let cases = state
         .store
         .recent_cases(&claims.guild_id, 200)
@@ -10268,7 +10286,7 @@ async fn leaderboard(
     State(state): State<Arc<ApiState>>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_auth(&state, &headers)?;
+    let claims = require_auth(&state, &headers).await?;
     let setting = |key: &str| {
         state
             .store
@@ -10332,7 +10350,7 @@ async fn tickets(
     headers: HeaderMap,
     Query(query): Query<LimitQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_auth(&state, &headers)?;
+    let claims = require_auth(&state, &headers).await?;
     let list = state
         .store
         .tickets_for_guild(&claims.guild_id, query.limit.unwrap_or(50).min(200))
@@ -10346,7 +10364,7 @@ async fn quotas(
     State(state): State<Arc<ApiState>>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_auth(&state, &headers)?;
+    let claims = require_auth(&state, &headers).await?;
     let plan = effective_plan(&state, &claims).await;
     let keys = [
         "panels",
@@ -10437,7 +10455,7 @@ async fn modules(
     State(state): State<Arc<ApiState>>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let _ = require_auth(&state, &headers)?;
+    let _ = require_auth(&state, &headers).await?;
     let modules = [
         ("core", Capability::Core),
         ("studio", Capability::Studio),
@@ -10583,7 +10601,7 @@ async fn studio_templates(
     State(state): State<Arc<ApiState>>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_auth(&state, &headers)?;
+    let claims = require_auth(&state, &headers).await?;
     let templates = state
         .store
         .settings_with_prefix(&claims.guild_id, TEMPLATE_PREFIX)
@@ -10602,7 +10620,7 @@ async fn studio_template(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_auth(&state, &headers)?;
+    let claims = require_auth(&state, &headers).await?;
     if !valid_template_id(&id) {
         return Err(client_error(StatusCode::BAD_REQUEST, "invalid_template_id"));
     }
@@ -10623,7 +10641,7 @@ async fn studio_template_revisions(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_auth(&state, &headers)?;
+    let claims = require_auth(&state, &headers).await?;
     if !valid_template_id(&id) {
         return Err(client_error(StatusCode::BAD_REQUEST, "invalid_template_id"));
     }
@@ -10643,7 +10661,7 @@ async fn create_studio_template(
     headers: HeaderMap,
     Json(input): Json<StudioTemplateInput>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<ApiError>)> {
-    let claims = require_mutation_auth(&state, &headers)?;
+    let claims = require_mutation_auth(&state, &headers).await?;
     require_feature_premium(&state, &claims, "management.templates").await?;
     if !validate_template_input(&input) {
         return Err(client_error(StatusCode::BAD_REQUEST, "invalid_template"));
@@ -10684,7 +10702,7 @@ async fn update_studio_template(
     Path(id): Path<String>,
     Json(input): Json<StudioTemplateInput>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_mutation_auth(&state, &headers)?;
+    let claims = require_mutation_auth(&state, &headers).await?;
     require_feature_premium(&state, &claims, "management.templates").await?;
     if !valid_template_id(&id) || !validate_template_input(&input) {
         return Err(client_error(StatusCode::BAD_REQUEST, "invalid_template"));
@@ -10749,7 +10767,7 @@ async fn rollback_studio_template(
     Path(id): Path<String>,
     Json(input): Json<StudioTemplateRollbackInput>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_mutation_auth(&state, &headers)?;
+    let claims = require_mutation_auth(&state, &headers).await?;
     require_feature_premium(&state, &claims, "management.templates").await?;
     if !valid_template_id(&id) || input.revision == 0 {
         return Err(client_error(
@@ -10821,7 +10839,7 @@ async fn delete_studio_template(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
-    let claims = require_mutation_auth(&state, &headers)?;
+    let claims = require_mutation_auth(&state, &headers).await?;
     if !valid_template_id(&id) {
         return Err(client_error(StatusCode::BAD_REQUEST, "invalid_template_id"));
     }
@@ -10839,7 +10857,7 @@ async fn studio_brand(
     State(state): State<Arc<ApiState>>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_auth(&state, &headers)?;
+    let claims = require_auth(&state, &headers).await?;
     let brand = parse_brand_kit(
         state
             .store
@@ -10856,7 +10874,7 @@ async fn update_studio_brand(
     headers: HeaderMap,
     Json(brand): Json<BrandKit>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_mutation_auth(&state, &headers)?;
+    let claims = require_mutation_auth(&state, &headers).await?;
     if !valid_hex_color(&brand.primary_color)
         || !valid_hex_color(&brand.secondary_color)
         || !matches!(
@@ -10931,7 +10949,7 @@ async fn studio_rank_card(
     State(state): State<Arc<ApiState>>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_auth(&state, &headers)?;
+    let claims = require_auth(&state, &headers).await?;
     let config = parse_rank_card(
         state
             .store
@@ -10953,7 +10971,7 @@ async fn update_studio_rank_card(
     headers: HeaderMap,
     Json(config): Json<RankCardConfig>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_mutation_auth(&state, &headers)?;
+    let claims = require_mutation_auth(&state, &headers).await?;
     require_feature_premium(&state, &claims, "studio.rank_card").await?;
     if !valid_rank_card_config(&config) {
         return Err(client_error(StatusCode::BAD_REQUEST, "invalid_rank_card"));
@@ -10974,7 +10992,7 @@ async fn permissions(
     State(state): State<Arc<ApiState>>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let _ = require_auth(&state, &headers)?;
+    let _ = require_auth(&state, &headers).await?;
     Ok(Json(permission_passport_document()))
 }
 
@@ -10982,7 +11000,7 @@ async fn security_health(
     State(state): State<Arc<ApiState>>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_auth(&state, &headers)?;
+    let claims = require_auth(&state, &headers).await?;
     let guild_id = &claims.guild_id;
     let setting = |key: &str| {
         state
@@ -11143,7 +11161,7 @@ async fn analytics(
     headers: HeaderMap,
     Query(query): Query<LimitQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_auth(&state, &headers)?;
+    let claims = require_auth(&state, &headers).await?;
     let days = query.limit.unwrap_or(30).clamp(1, 365);
     let rows = state
         .store
@@ -11164,7 +11182,7 @@ async fn privacy_export(
     State(state): State<Arc<ApiState>>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_auth(&state, &headers)?;
+    let claims = require_auth(&state, &headers).await?;
     if !feature_enabled(&state, &claims.guild_id, "management.privacy") {
         return Err(client_error(StatusCode::FORBIDDEN, "feature_disabled"));
     }
@@ -11179,7 +11197,7 @@ async fn privacy_receipt(
     State(state): State<Arc<ApiState>>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_auth(&state, &headers)?;
+    let claims = require_auth(&state, &headers).await?;
     // The receipt is a safety and transparency endpoint, not a guild feature
     // toggle. It must remain readable even before a manager enables the
     // optional export/delete workflows.
@@ -11234,7 +11252,7 @@ async fn privacy_delete(
     if !bearer_present {
         return Err(client_error(StatusCode::UNAUTHORIZED, "bearer_required"));
     }
-    let claims = require_auth(&state, &headers)?;
+    let claims = require_auth(&state, &headers).await?;
     if !feature_enabled(&state, &claims.guild_id, "management.privacy") {
         return Err(client_error(StatusCode::FORBIDDEN, "feature_disabled"));
     }
@@ -11260,7 +11278,7 @@ async fn import_config(
     headers: HeaderMap,
     Json(document): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_mutation_auth(&state, &headers)?;
+    let claims = require_mutation_auth(&state, &headers).await?;
     let summary = state
         .store
         .import_guild_config(&claims.guild_id, &document)
@@ -11379,7 +11397,7 @@ async fn custom_commands(
     State(state): State<Arc<ApiState>>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_auth(&state, &headers)?;
+    let claims = require_auth(&state, &headers).await?;
     let (limit, max_response_length) = custom_command_limits(&state, &claims.guild_id);
     let commands = state
         .store
@@ -11454,7 +11472,7 @@ async fn create_custom_command(
     headers: HeaderMap,
     Json(request): Json<CustomCommandRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<ApiError>)> {
-    let claims = require_mutation_auth(&state, &headers)?;
+    let claims = require_mutation_auth(&state, &headers).await?;
     let command = save_custom_command(&state, &claims, request, None).await?;
     Ok((
         StatusCode::CREATED,
@@ -11468,7 +11486,7 @@ async fn update_custom_command(
     Path(name): Path<String>,
     Json(request): Json<CustomCommandRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_mutation_auth(&state, &headers)?;
+    let claims = require_mutation_auth(&state, &headers).await?;
     let expected_name = normalize_custom_command_name(&name)
         .ok_or_else(|| custom_command_error("invalid_custom_command_name"))?;
     if state
@@ -11491,7 +11509,7 @@ async fn delete_custom_command(
     headers: HeaderMap,
     Path(name): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_mutation_auth(&state, &headers)?;
+    let claims = require_mutation_auth(&state, &headers).await?;
     if !feature_enabled(&state, &claims.guild_id, "management.custom_commands") {
         return Err(client_error(StatusCode::CONFLICT, "feature_disabled"));
     }
@@ -11522,7 +11540,7 @@ async fn workflows(
     State(state): State<Arc<ApiState>>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_auth(&state, &headers)?;
+    let claims = require_auth(&state, &headers).await?;
     let plan = effective_plan(&state, &claims).await;
     let (plan_limit, max_workflows, max_reply_length) =
         workflow_limits(&state, &claims.guild_id, &plan);
@@ -11545,7 +11563,7 @@ async fn create_workflow(
     headers: HeaderMap,
     Json(request): Json<WorkflowRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<ApiError>)> {
-    let claims = require_mutation_auth(&state, &headers)?;
+    let claims = require_mutation_auth(&state, &headers).await?;
     require_feature_premium(&state, &claims, "management.workflows").await?;
     if !feature_enabled(&state, &claims.guild_id, "management.workflows") {
         return Err(client_error(StatusCode::CONFLICT, "feature_disabled"));
@@ -11592,7 +11610,7 @@ async fn update_workflow(
     Path(id): Path<i64>,
     Json(request): Json<WorkflowUpdateRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_mutation_auth(&state, &headers)?;
+    let claims = require_mutation_auth(&state, &headers).await?;
     require_feature_premium(&state, &claims, "management.workflows").await?;
     if !feature_enabled(&state, &claims.guild_id, "management.workflows") {
         return Err(client_error(StatusCode::CONFLICT, "feature_disabled"));
@@ -11617,7 +11635,7 @@ async fn delete_workflow(
     headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_mutation_auth(&state, &headers)?;
+    let claims = require_mutation_auth(&state, &headers).await?;
     require_feature_premium(&state, &claims, "management.workflows").await?;
     if !feature_enabled(&state, &claims.guild_id, "management.workflows") {
         return Err(client_error(StatusCode::CONFLICT, "feature_disabled"));
@@ -11636,7 +11654,7 @@ async fn premium_server_status(
     State(state): State<Arc<ApiState>>,
     headers: HeaderMap,
 ) -> Result<Json<helper_modules::PremiumSeats>, (StatusCode, Json<ApiError>)> {
-    let claims = require_auth(&state, &headers)?;
+    let claims = require_auth(&state, &headers).await?;
     premium_request_limit(&claims.user_id)?;
     let client = state
         .entitlements
@@ -11660,7 +11678,7 @@ async fn premium_server_activate(
     headers: HeaderMap,
     Json(input): Json<PremiumActivationRequest>,
 ) -> Result<Json<helper_modules::PremiumSeats>, (StatusCode, Json<ApiError>)> {
-    let claims = require_mutation_auth(&state, &headers)?;
+    let claims = require_mutation_auth(&state, &headers).await?;
     premium_request_limit(&claims.user_id)?;
     // Bind the confirmation to the server the person saw, even if another tab changed session.
     if input.guild_id != claims.guild_id {
@@ -11734,19 +11752,21 @@ fn premium_request_limit(user: &str) -> Result<(), (StatusCode, Json<ApiError>)>
     Ok(())
 }
 
-fn require_auth(
+async fn require_auth(
     state: &ApiState,
     headers: &HeaderMap,
 ) -> Result<SessionClaims, (StatusCode, Json<ApiError>)> {
-    authenticate(state, headers)
-        .ok_or_else(|| client_error(StatusCode::UNAUTHORIZED, "unauthenticated"))
+    let claims = authenticate(state, headers)
+        .ok_or_else(|| client_error(StatusCode::UNAUTHORIZED, "unauthenticated"))?;
+    state.guild_authorization.authorize(state, &claims).await?;
+    Ok(claims)
 }
 
 /// State-changing browser requests must prove they came from the configured
 /// panel origin when authentication is carried by the ambient session cookie.
 /// API clients using an explicit Bearer token remain usable without an Origin
 /// header because browsers do not attach that credential automatically.
-fn require_mutation_auth(
+async fn require_mutation_auth(
     state: &ApiState,
     headers: &HeaderMap,
 ) -> Result<SessionClaims, (StatusCode, Json<ApiError>)> {
@@ -11755,7 +11775,7 @@ fn require_mutation_auth(
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
         .is_some_and(|value| !value.trim().is_empty());
-    let claims = require_auth(state, headers)?;
+    let claims = require_auth(state, headers).await?;
     if bearer_present {
         return Ok(claims);
     }
@@ -12440,6 +12460,7 @@ mod tests {
     pub(super) fn state(store: Store) -> ApiState {
         ApiState {
             store,
+            guild_authorization: Arc::new(GuildAuthorization::fixture()),
             discord_token: "test-token".into(),
             session_secret: "test-session-secret-with-at-least-32-bytes".into(),
             oauth_client_id: "client".into(),
