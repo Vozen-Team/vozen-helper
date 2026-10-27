@@ -1105,7 +1105,7 @@ impl Store {
             "DELETE FROM helper_oauth_states WHERE expires_at < ?1 OR used_at < ?1 - 3600",
             [Utc::now().timestamp()],
         )?;
-        let pending: usize = conn.query_row(
+        let pending: i64 = conn.query_row(
             "SELECT COUNT(*) FROM helper_oauth_states WHERE used_at IS NULL",
             [],
             |row| row.get(0),
