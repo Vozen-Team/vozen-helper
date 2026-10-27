@@ -12773,7 +12773,7 @@ mod tests {
         store
             .replace_session_guilds(
                 session.session_id,
-                &[("guild-a".into(), "Alpha".into(), Some("0".into()))],
+                &[("guild-a".into(), "Alpha".into(), Some("32".into()))],
             )
             .unwrap();
         // Simulate a rolling-deploy/legacy row that says a blocked provider
@@ -13621,7 +13621,7 @@ mod tests {
         store
             .replace_session_guilds(
                 session.session_id,
-                &[("guild-a".into(), "Alpha".into(), Some("0".into()))],
+                &[("guild-a".into(), "Alpha".into(), Some("32".into()))],
             )
             .unwrap();
         let response = router(state(store.clone()))
@@ -13660,7 +13660,7 @@ mod tests {
         store
             .replace_session_guilds(
                 session.session_id,
-                &[("guild-a".into(), "Alpha".into(), Some("0".into()))],
+                &[("guild-a".into(), "Alpha".into(), Some("32".into()))],
             )
             .unwrap();
 
@@ -13720,7 +13720,7 @@ mod tests {
         store
             .replace_session_guilds(
                 session.session_id,
-                &[("guild-a".into(), "Alpha".into(), Some("0".into()))],
+                &[("guild-a".into(), "Alpha".into(), Some("32".into()))],
             )
             .unwrap();
         let response = router(state(store.clone()))
@@ -13771,7 +13771,7 @@ mod tests {
         store
             .replace_session_guilds(
                 session.session_id,
-                &[("guild-a".into(), "Alpha".into(), Some("0".into()))],
+                &[("guild-a".into(), "Alpha".into(), Some("32".into()))],
             )
             .unwrap();
 
@@ -13819,7 +13819,7 @@ mod tests {
         store
             .replace_session_guilds(
                 session.session_id,
-                &[("guild-a".into(), "Alpha".into(), Some("0".into()))],
+                &[("guild-a".into(), "Alpha".into(), Some("32".into()))],
             )
             .unwrap();
 
@@ -14108,7 +14108,7 @@ mod tests {
         store
             .replace_session_guilds(
                 session.session_id,
-                &[("guild-a".into(), "Alpha".into(), Some("0".into()))],
+                &[("guild-a".into(), "Alpha".into(), Some("32".into()))],
             )
             .unwrap();
 
@@ -14194,7 +14194,7 @@ mod tests {
         store
             .replace_session_guilds(
                 session.session_id,
-                &[("guild-a".into(), "Alpha".into(), Some("0".into()))],
+                &[("guild-a".into(), "Alpha".into(), Some("32".into()))],
             )
             .unwrap();
 
@@ -14258,7 +14258,7 @@ mod tests {
         store
             .replace_session_guilds(
                 session.session_id,
-                &[("guild-a".into(), "Alpha".into(), Some("0".into()))],
+                &[("guild-a".into(), "Alpha".into(), Some("32".into()))],
             )
             .unwrap();
         store
