@@ -125,7 +125,7 @@ pub(super) async fn create_temp_category(
     headers: HeaderMap,
     Json(request): Json<TempCategoryRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_mutation_auth(&state, &headers)?;
+    let claims = require_mutation_auth(&state, &headers).await?;
     if request.guild_id != claims.guild_id {
         return Err(client_error(StatusCode::CONFLICT, "guild_changed"));
     }
@@ -187,7 +187,7 @@ pub(super) async fn create_shop(
     Query(query): Query<economy_shop::PageQuery>,
     Json(request): Json<TicketCreateRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_mutation_auth(&state, &headers)?;
+    let claims = require_mutation_auth(&state, &headers).await?;
     economy_shop::scope(&claims, &query)?;
     let result = create_for(
         state.clone(),
@@ -351,7 +351,7 @@ async fn create_for(
     request: CreateRequest,
     purpose: ChannelPurpose,
 ) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_mutation_auth(&state, &headers)?;
+    let claims = require_mutation_auth(&state, &headers).await?;
     let name = channel_name(&request.name)
         .ok_or_else(|| client_error(StatusCode::BAD_REQUEST, "starboard_invalid_channel_name"))?;
     if request.moderator_role_ids.len() > 20 {

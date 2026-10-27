@@ -7,7 +7,7 @@ use helper_modules::{
     RssClient, SiweVerifier, StripeConnectClient, TikTokClient, TwitchClient, YouTubeClient,
 };
 use helper_store::Store;
-use std::time::Instant;
+use std::{sync::Arc, time::Instant};
 use tokio::{select, signal};
 
 #[derive(Debug, Parser)]
@@ -71,6 +71,7 @@ async fn main() -> Result<()> {
                 &config.bind_addr,
                 ApiState {
                     store: store.clone(),
+                    guild_authorization: Arc::new(helper_api::GuildAuthorization::new()?),
                     discord_token: config.discord_token.clone(),
                     session_secret: config.session_secret.clone(),
                     oauth_client_id: config.oauth_client_id.clone(),

@@ -27,7 +27,7 @@ pub(super) async fn get(
     headers: HeaderMap,
     Query(query): Query<QueryOptions>,
 ) -> Result<Response, (StatusCode, Json<ApiError>)> {
-    let claims = require_auth(&state, &headers)?;
+    let claims = require_auth(&state, &headers).await?;
     let category = query.category.as_deref().unwrap_or("all");
     if !["all", "joins", "leaves", "bans", "timeouts", "helper"].contains(&category) {
         return Err(client_error(StatusCode::BAD_REQUEST, "invalid_category"));

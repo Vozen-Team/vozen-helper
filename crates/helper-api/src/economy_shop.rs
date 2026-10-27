@@ -47,7 +47,7 @@ pub(super) async fn get(
     headers: HeaderMap,
     Query(query): Query<PageQuery>,
 ) -> Result<Response, (StatusCode, Json<ApiError>)> {
-    let claims = require_auth(&state, &headers)?;
+    let claims = require_auth(&state, &headers).await?;
     scope(&claims, &query)?;
     let before = query.before.unwrap_or(i64::MAX);
     if before <= 0 {
@@ -122,7 +122,7 @@ pub(super) async fn create(
     Query(query): Query<PageQuery>,
     Json(input): Json<ShopProductInput>,
 ) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_mutation_auth(&state, &headers)?;
+    let claims = require_mutation_auth(&state, &headers).await?;
     scope(&claims, &query)?;
     validate_role(&state, &claims.guild_id, &input).await?;
     state
@@ -138,7 +138,7 @@ pub(super) async fn update(
     Query(query): Query<PageQuery>,
     Json(input): Json<ProductWrite>,
 ) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_mutation_auth(&state, &headers)?;
+    let claims = require_mutation_auth(&state, &headers).await?;
     scope(&claims, &query)?;
     validate_role(&state, &claims.guild_id, &input.product).await?;
     state
@@ -154,7 +154,7 @@ pub(super) async fn remove(
     Query(query): Query<PageQuery>,
     Json(input): Json<Version>,
 ) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_mutation_auth(&state, &headers)?;
+    let claims = require_mutation_auth(&state, &headers).await?;
     scope(&claims, &query)?;
     state
         .store
@@ -169,7 +169,7 @@ pub(super) async fn resolve(
     Query(query): Query<PageQuery>,
     Json(input): Json<Resolve>,
 ) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_mutation_auth(&state, &headers)?;
+    let claims = require_mutation_auth(&state, &headers).await?;
     scope(&claims, &query)?;
     state
         .store
@@ -225,7 +225,7 @@ pub(super) async fn settings(
     Query(query): Query<PageQuery>,
     Json(input): Json<NoticeSettings>,
 ) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_mutation_auth(&state, &headers)?;
+    let claims = require_mutation_auth(&state, &headers).await?;
     scope(&claims, &query)?;
     if !input.channel_id.is_empty() {
         if !input.channel_id.parse::<u64>().is_ok_and(|id| id > 0) {
