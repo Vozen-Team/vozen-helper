@@ -18,13 +18,13 @@ jobs:
   linux-release:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '22'
       - name: Validate private reply catalogues
         run: node tools/private-reply-sources.mjs --check
-      - uses: dtolnay/rust-toolchain@1.97.1
+      - uses: dtolnay/rust-toolchain@59a558e8c538bf4a23bbffa19e5a278b703f2920 # 1.97.1
         with:
           components: rustfmt, clippy
       - name: Install achievement card fonts
@@ -44,7 +44,7 @@ jobs:
           HELPER_ACHIEVEMENT_UNLOCK_PREVIEW: ${{ github.workspace }}/achievement-unlocked.png
           HELPER_ACHIEVEMENTS_PREVIEW: ${{ github.workspace }}/achievements.png
         run: cargo test --workspace
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: level-up-preview-${{ github.sha }}
           path: |
@@ -63,7 +63,7 @@ jobs:
           cp deploy/vozen-helper-rust.service release/deploy/
           cp deploy/ROLLBACK.md release/deploy/
           tar -czf vozen-helper-rust-${GITHUB_SHA}.tar.gz -C release .
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: vozen-helper-rust-linux-${{ github.sha }}
           path: vozen-helper-rust-${{ github.sha }}.tar.gz
@@ -74,7 +74,7 @@ jobs:
         run: |
           tag="helper-${GITHUB_SHA}"
           if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$tag" "vozen-helper-rust-${GITHUB_SHA}.tar.gz" --repo "$GITHUB_REPOSITORY" --clobber
+            gh release upload "$tag" "vozen-helper-rust-${GITHUB_SHA}.tar.gz" --repo "$GITHUB_REPOSITORY"
           else
             gh release create "$tag" "vozen-helper-rust-${GITHUB_SHA}.tar.gz" \
               --repo "$GITHUB_REPOSITORY" \
