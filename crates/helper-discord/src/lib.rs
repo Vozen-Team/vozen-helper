@@ -13399,11 +13399,11 @@ mod tests {
     #[test]
     fn stored_role_panel_ids_accept_api_strings_and_legacy_numbers() {
         for value in [
-            serde_json::json!({"role_ids":["1561352308594577429"]}),
-            serde_json::json!({"role_ids":[1561352308594577429u64]}),
+            serde_json::json!({"role_ids":["100000000000000006"]}),
+            serde_json::json!({"role_ids":[100000000000000006u64]}),
         ] {
             let ids = super::stored_role_panel_role_ids(Some(&value));
-            assert_eq!(ids, vec![1561352308594577429]);
+            assert_eq!(ids, vec![100000000000000006]);
             let assigned = helper_core::evaluate_role_panel(&helper_core::RolePanelObservation {
                 panel_role_ids: ids.clone(),
                 selected_role_ids: vec![],
@@ -13923,7 +13923,7 @@ mod tests {
     #[test]
     fn anti_spam_content_metrics_counts_links_without_skewing_caps_detection() {
         assert_eq!(
-            anti_spam_content_metrics("LOUD https://vozen.org/docs, www.vozen.org"),
+            anti_spam_content_metrics("LOUD https://bot.example.com/docs, www.example.com"),
             (2, 4, 4)
         );
     }

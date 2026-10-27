@@ -12220,21 +12220,21 @@ mod tests {
     #[test]
     fn private_tracker_identity_requires_the_dedicated_application_and_owner() {
         assert!(is_private_tracker_identity(
-            "1534014665187655760",
-            "1523489275155583056",
-            "1534014665187655760",
-            "1523489275155583056",
+            "100000000000000008",
+            "100000000000000001",
+            "100000000000000008",
+            "100000000000000001",
         ));
         assert!(!is_private_tracker_identity(
-            "1534014665187655760",
-            "1523489275155583056",
+            "100000000000000008",
+            "100000000000000001",
             "another-application",
-            "1523489275155583056",
+            "100000000000000001",
         ));
         assert!(!is_private_tracker_identity(
-            "1534014665187655760",
-            "1523489275155583056",
-            "1534014665187655760",
+            "100000000000000008",
+            "100000000000000001",
+            "100000000000000008",
             "another-user",
         ));
     }
@@ -12280,7 +12280,7 @@ mod tests {
                     Request::builder()
                         .method("POST")
                         .uri(path)
-                        .header(header::ORIGIN, "https://vozen.org")
+                        .header(header::ORIGIN, "https://bot.example.com")
                         .header(header::CONTENT_TYPE, content_type)
                         .body(Body::from(body))
                         .unwrap(),
@@ -12357,37 +12357,37 @@ mod tests {
             ),
             (
                 true,
-                Some("https://vozen.org"),
+                Some("https://bot.example.com"),
                 r#"{"name":"voice-rooms","guildId":"guild-b"}"#,
                 StatusCode::CONFLICT,
             ),
             (
                 true,
-                Some("https://vozen.org"),
+                Some("https://bot.example.com"),
                 r#"{"name":"../bad","guildId":"guild-a"}"#,
                 StatusCode::BAD_REQUEST,
             ),
             (
                 true,
-                Some("https://vozen.org"),
+                Some("https://bot.example.com"),
                 r#"{"name":"voice-rooms","guildId":"guild-a","permission_overwrites":[]}"#,
                 StatusCode::UNPROCESSABLE_ENTITY,
             ),
             (
                 true,
-                Some("https://vozen.org"),
+                Some("https://bot.example.com"),
                 r#"{"name":"voice-rooms","guildId":"guild-a","moderatorRoleIds":["other"]}"#,
                 StatusCode::UNPROCESSABLE_ENTITY,
             ),
             (
                 true,
-                Some("https://vozen.org"),
+                Some("https://bot.example.com"),
                 r#"{"name":"voice-rooms","guildId":"guild-a"}"#,
                 StatusCode::SERVICE_UNAVAILABLE,
             ),
         ] {
             let mut api_state = state(store.clone());
-            api_state.allowed_origin = Some("https://vozen.org".into());
+            api_state.allowed_origin = Some("https://bot.example.com".into());
             let mut request = Request::builder()
                 .method("POST")
                 .uri("/api/temp-channels/category")
@@ -12453,31 +12453,31 @@ mod tests {
                 ),
                 (
                     true,
-                    Some("https://vozen.org"),
+                    Some("https://bot.example.com"),
                     r#"{"name":"../bad"}"#,
                     StatusCode::BAD_REQUEST,
                 ),
                 (
                     true,
-                    Some("https://vozen.org"),
+                    Some("https://bot.example.com"),
                     r#"{"name":"tickets","guildId":"other"}"#,
                     StatusCode::UNPROCESSABLE_ENTITY,
                 ),
                 (
                     true,
-                    Some("https://vozen.org"),
+                    Some("https://bot.example.com"),
                     r#"{"name":"tickets","moderatorRoleIds":["arbitrary"]}"#,
                     StatusCode::UNPROCESSABLE_ENTITY,
                 ),
                 (
                     true,
-                    Some("https://vozen.org"),
+                    Some("https://bot.example.com"),
                     r#"{"name":"tickets"}"#,
                     StatusCode::SERVICE_UNAVAILABLE,
                 ),
             ] {
                 let mut api_state = state(store.clone());
-                api_state.allowed_origin = Some("https://vozen.org".into());
+                api_state.allowed_origin = Some("https://bot.example.com".into());
                 let mut request = Request::builder()
                     .method("POST")
                     .uri(endpoint)
@@ -12545,25 +12545,25 @@ mod tests {
             ),
             (
                 true,
-                Some("https://vozen.org"),
+                Some("https://bot.example.com"),
                 r#"{"name":"../bad"}"#,
                 StatusCode::BAD_REQUEST,
             ),
             (
                 true,
-                Some("https://vozen.org"),
+                Some("https://bot.example.com"),
                 r#"{"name":"starboard","guildId":"other"}"#,
                 StatusCode::UNPROCESSABLE_ENTITY,
             ),
             (
                 true,
-                Some("https://vozen.org"),
+                Some("https://bot.example.com"),
                 r#"{"name":"starboard"}"#,
                 StatusCode::SERVICE_UNAVAILABLE,
             ),
         ] {
             let mut api_state = state(store.clone());
-            api_state.allowed_origin = Some("https://vozen.org".into());
+            api_state.allowed_origin = Some("https://bot.example.com".into());
             let mut request = Request::builder()
                 .method("POST")
                 .uri("/api/starboard/channel")
@@ -15487,7 +15487,7 @@ mod tests {
         api_state.twitch = TwitchClient::new(
             "client-id",
             "client-secret",
-            "https://api.vozen.org/rust/api/providers/twitch/eventsub",
+            "https://api.example.com/rust/api/providers/twitch/eventsub",
             "eventsub-secret-1234567890",
         );
         let message_id = "message-1";
@@ -15548,7 +15548,7 @@ mod tests {
         store.save_session(&session).unwrap();
         let token = sign_session(&session, "test-session-secret-with-at-least-32-bytes");
         let mut test_state = state(store.clone());
-        test_state.allowed_origin = Some("https://vozen.org".into());
+        test_state.allowed_origin = Some("https://bot.example.com".into());
         let app = router(test_state);
         let body = serde_json::json!({"name":"Physical item","price":80,"delivery":"manual","roleId":null});
         for (authenticated, origin, guild, price, expected) in [
@@ -15568,7 +15568,7 @@ mod tests {
                 request = request.header(header::COOKIE, format!("vh_session={token}"));
             }
             if origin {
-                request = request.header(header::ORIGIN, "https://vozen.org");
+                request = request.header(header::ORIGIN, "https://bot.example.com");
             }
             let response = app
                 .clone()
@@ -15589,7 +15589,7 @@ mod tests {
                 .header(header::COOKIE, format!("vh_session={token}"))
                 .header(header::CONTENT_TYPE, "application/json");
             if origin {
-                request = request.header(header::ORIGIN, "https://vozen.org");
+                request = request.header(header::ORIGIN, "https://bot.example.com");
             }
             let response = app
                 .clone()
@@ -15611,7 +15611,7 @@ mod tests {
                     .method("POST")
                     .uri("/api/economy/channel?guildId=guild-b")
                     .header(header::COOKIE, format!("vh_session={token}"))
-                    .header(header::ORIGIN, "https://vozen.org")
+                    .header(header::ORIGIN, "https://bot.example.com")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(r#"{"name":"shop-orders"}"#))
                     .unwrap(),
@@ -15655,7 +15655,7 @@ mod tests {
                         .method("PUT")
                         .uri(format!("/api/economy/orders/{}?guildId=guild-a", order.id))
                         .header(header::COOKIE, format!("vh_session={token}"))
-                        .header(header::ORIGIN, "https://vozen.org")
+                        .header(header::ORIGIN, "https://bot.example.com")
                         .header(header::CONTENT_TYPE, "application/json")
                         .body(Body::from(r#"{"status":"refunded"}"#))
                         .unwrap(),

@@ -11434,10 +11434,10 @@ mod tests {
     fn ecosystem_oauth_client_takes_precedence_over_legacy_client() {
         assert_eq!(
             resolve_trusted_vozen_oauth_client_id(
-                Some("1537738930722443364".into()),
-                Some("1523826014935842997".into()),
+                Some("100000000000000007".into()),
+                Some("100000000000000004".into()),
             ),
-            Some("1537738930722443364".into())
+            Some("100000000000000007".into())
         );
         assert_eq!(
             resolve_trusted_vozen_oauth_client_id(None, Some("legacy".into())),

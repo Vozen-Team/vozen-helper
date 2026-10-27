@@ -13,11 +13,12 @@ import { signSessionToken, verifySessionToken } from '../src/api/session.js';
 // Fase 1/2 — API + auth + leitura. A verificação de identidade é feita no servidor;
 // só a conta autorizada obtém sessão e lê dados do servidor.
 
-const ALLOWED = '1523489275155583056';
-const CLIENT_ID = '1526211106081734666';
-const GUILD = '1523482270814572584';
+// Synthetic identities and origin for isolated API fixtures.
+const ALLOWED = '100000000000000001';
+const CLIENT_ID = '100000000000000003';
+const GUILD = '100000000000000002';
 const SECRET = 'x'.repeat(40);
-const ORIGIN = 'https://rexy40407.github.io';
+const ORIGIN = 'https://admin.example.com';
 
 const FAKE_CHANNELS = [
   { id: '900000000000000001', name: 'geral', type: 0 },
@@ -825,12 +826,14 @@ describe('loadApiEnv', () => {
   };
 
   it('aceita config válida', () => {
-    const cfg = loadApiEnv(OK);
+    const cfg = loadApiEnv({ ...OK, PANEL_ALLOWED_ORIGIN: ORIGIN });
     expect(cfg.allowedUserId).toBe(ALLOWED);
     expect(cfg.clientId).toBe(CLIENT_ID);
     expect(cfg.guildId).toBe(GUILD);
     expect(cfg.port).toBe(8788);
     expect(cfg.allowedOrigin).toBe(ORIGIN);
+    // Preserve coverage of the unchanged runtime default separately from test data.
+    expect(loadApiEnv(OK).allowedOrigin).toBe('https://rexy40407.github.io');
   });
 
   it('falha se faltar o segredo', () => {
