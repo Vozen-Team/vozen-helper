@@ -7,6 +7,7 @@ mod activity_feed;
 mod discord_context;
 mod discord_read;
 mod economy_shop;
+mod oauth_limits;
 mod session_authorization;
 mod starboard_channel;
 mod ticket_panel;
@@ -48,6 +49,7 @@ use helper_store::{
     YouTubeSubscriptionRecord, YouTubeSubscriptionWrite,
 };
 use hmac::{Hmac, Mac};
+pub use oauth_limits::OAuthLimits;
 use rand::RngCore;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -74,6 +76,7 @@ static TICKET_PANEL_SAVE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::cons
 #[derive(Clone)]
 pub struct ApiState {
     pub store: Store,
+    pub oauth_limits: Arc<OAuthLimits>,
     pub guild_authorization: Arc<GuildAuthorization>,
     pub discord_token: String,
     pub session_secret: String,
@@ -413,8 +416,12 @@ enum OAuthFlow {
 
 async fn oauth_start_post(
     State(state): State<Arc<ApiState>>,
+    headers: HeaderMap,
     Json(request): Json<OAuthStartRequest>,
 ) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    state
+        .oauth_limits
+        .check(&headers, oauth_limits::Endpoint::Start)?;
     if request.guild_id == INSTALL_FLOW_MARKER {
         return Err(client_error(
             StatusCode::BAD_REQUEST,
@@ -442,8 +449,12 @@ struct InstallStartQuery {
 
 async fn oauth_install_start(
     State(state): State<Arc<ApiState>>,
+    headers: HeaderMap,
     Query(query): Query<InstallStartQuery>,
 ) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    state
+        .oauth_limits
+        .check(&headers, oauth_limits::Endpoint::Start)?;
     let source = query.source.as_deref().unwrap_or("unknown");
     if source != "unknown" && helper_store::growth_source(source).is_none() {
         return Err(client_error(
@@ -454,14 +465,16 @@ async fn oauth_install_start(
     let code_verifier = new_code_verifier();
     let code_challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(code_verifier.as_bytes()));
     let install_marker = format!("{INSTALL_FLOW_MARKER}:{source}");
-    let authorization_url = oauth_authorization_url(
+    let (authorization_url, cookie) = oauth_authorization_url(
         &state,
         &install_marker,
         &code_challenge,
         &code_verifier,
         OAuthFlow::Install,
     )?;
-    Ok(Redirect::temporary(authorization_url.as_str()).into_response())
+    let mut response = Redirect::temporary(authorization_url.as_str()).into_response();
+    response.headers_mut().insert(header::SET_COOKIE, cookie);
+    Ok(response)
 }
 
 fn oauth_start_inner(
@@ -471,18 +484,19 @@ fn oauth_start_inner(
     code_verifier: &str,
     flow: OAuthFlow,
 ) -> Result<Response, (StatusCode, Json<ApiError>)> {
-    let authorization_url =
+    let (authorization_url, cookie) =
         oauth_authorization_url(state, guild_id, code_challenge, code_verifier, flow)?;
     let state_token = authorization_url
         .query_pairs()
         .find(|(key, _)| key == "state")
         .map(|(_, value)| value.into_owned())
         .expect("OAuth authorization URLs always include state");
-    let response = Json(OAuthStartResponse {
+    let mut response = Json(OAuthStartResponse {
         authorization_url: authorization_url.into(),
         state: state_token,
     })
     .into_response();
+    response.headers_mut().insert(header::SET_COOKIE, cookie);
     Ok(response)
 }
 
@@ -492,7 +506,7 @@ fn oauth_authorization_url(
     code_challenge: &str,
     code_verifier: &str,
     flow: OAuthFlow,
-) -> Result<url::Url, (StatusCode, Json<ApiError>)> {
+) -> Result<(url::Url, HeaderValue), (StatusCode, Json<ApiError>)> {
     if !is_valid_pkce_verifier(code_verifier)
         || code_challenge.len() != 43
         || URL_SAFE_NO_PAD
@@ -514,12 +528,20 @@ fn oauth_authorization_url(
     }
     let expires = (Utc::now() + Duration::minutes(10)).timestamp();
     let payload = format!("{}.{}.{}", guild_id, expires, code_challenge);
-    let state_token = sign_oauth_state(&payload, &state.session_secret);
+    let browser_nonce = new_code_verifier();
+    let browser_bound = sign_oauth_state(&payload, &browser_nonce);
+    let state_token = sign_oauth_state(&browser_bound, &state.session_secret);
+    let cookie: HeaderValue = format!(
+        "{}={browser_nonce}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=600",
+        oauth_cookie_name(&state_token)
+    )
+    .parse()
+    .map_err(|_| client_error(StatusCode::INTERNAL_SERVER_ERROR, "invalid_oauth_cookie"))?;
     let state_hash = URL_SAFE_NO_PAD.encode(Sha256::digest(state_token.as_bytes()));
     state
         .store
         .register_oauth_state(&state_hash, expires, code_verifier)
-        .map_err(|_| client_error(StatusCode::INTERNAL_SERVER_ERROR, "store_error"))?;
+        .map_err(oauth_state_error)?;
     let mut url = url::Url::parse("https://discord.com/oauth2/authorize").expect("static URL");
     let mut query = url.query_pairs_mut();
     query
@@ -541,7 +563,22 @@ fn oauth_authorization_url(
         }
     }
     drop(query);
-    Ok(url)
+    Ok((url, cookie))
+}
+
+fn oauth_cookie_name(state: &str) -> String {
+    format!(
+        "__Host-vh_oauth_{}",
+        hex::encode(Sha256::digest(state.as_bytes()))
+    )
+}
+
+fn oauth_state_error(error: anyhow::Error) -> (StatusCode, Json<ApiError>) {
+    if error.to_string() == "oauth_pending_limit" {
+        client_error(StatusCode::TOO_MANY_REQUESTS, "oauth_pending_limit")
+    } else {
+        client_error(StatusCode::INTERNAL_SERVER_ERROR, "store_error")
+    }
 }
 
 fn new_code_verifier() -> String {
@@ -569,8 +606,24 @@ async fn oauth_callback(
     headers: HeaderMap,
     Query(query): Query<OAuthCallbackQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiError>)> {
+    state
+        .oauth_limits
+        .check(&headers, oauth_limits::Endpoint::Callback)?;
     let payload = verify_oauth_state(&query.state, &state.session_secret)
         .ok_or_else(|| client_error(StatusCode::BAD_REQUEST, "invalid_oauth_state"))?;
+    let cookie_prefix = format!("{}=", oauth_cookie_name(&query.state));
+    let browser_nonce = headers
+        .get(header::COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|cookies| {
+            cookies
+                .split(';')
+                .find_map(|cookie| cookie.trim().strip_prefix(&cookie_prefix))
+        })
+        .filter(|nonce| is_valid_pkce_verifier(nonce))
+        .ok_or_else(|| client_error(StatusCode::BAD_REQUEST, "invalid_oauth_browser"))?;
+    let payload = verify_oauth_state(&payload, browser_nonce)
+        .ok_or_else(|| client_error(StatusCode::BAD_REQUEST, "invalid_oauth_browser"))?;
     let parts: Vec<&str> = payload.splitn(3, '.').collect();
     if parts.len() != 3
         || parts[1]
@@ -593,7 +646,10 @@ async fn oauth_callback(
     }
     let code_verifier = stored_verifier
         .ok_or_else(|| client_error(StatusCode::BAD_REQUEST, "missing_pkce_verifier"))?;
-    let client = Client::new();
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|_| client_error(StatusCode::SERVICE_UNAVAILABLE, "discord_unavailable"))?;
     let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(code_verifier.as_bytes()));
     if challenge != parts[2] {
         return Err(client_error(
@@ -689,6 +745,15 @@ async fn oauth_callback(
         success_url.set_fragment(Some(&format!("session={session_token}")));
     }
     *response.status_mut() = StatusCode::SEE_OTHER;
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        format!(
+            "{}=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0",
+            oauth_cookie_name(&query.state)
+        )
+        .parse()
+        .map_err(|_| client_error(StatusCode::INTERNAL_SERVER_ERROR, "invalid_oauth_cookie"))?,
+    );
     response.headers_mut().insert(
         header::LOCATION,
         success_url.as_str().parse().map_err(|_| {
@@ -950,7 +1015,7 @@ async fn tiktok_oauth_start(
     state
         .store
         .register_oauth_state(&state_hash, expires, &nonce)
-        .map_err(|_| client_error(StatusCode::INTERNAL_SERVER_ERROR, "store_error"))?;
+        .map_err(oauth_state_error)?;
     let authorization_url = oauth
         .authorization_url(&signed_state)
         .map_err(|_| client_error(StatusCode::INTERNAL_SERVER_ERROR, "tiktok_oauth_url_failed"))?;
@@ -12460,6 +12525,7 @@ mod tests {
     pub(super) fn state(store: Store) -> ApiState {
         ApiState {
             store,
+            oauth_limits: Arc::default(),
             guild_authorization: Arc::new(GuildAuthorization::fixture()),
             discord_token: "test-token".into(),
             session_secret: "test-session-secret-with-at-least-32-bytes".into(),
@@ -15022,6 +15088,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn oauth_callback_requires_its_browser_cookie_before_consuming_state() {
+        let store = Store::open(":memory:").unwrap();
+        let api = state(store.clone());
+        let verifier = "a".repeat(64);
+        let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+        let (url, cookie) =
+            oauth_authorization_url(&api, "guild-a", &challenge, &verifier, OAuthFlow::Account)
+                .unwrap();
+        let state_token = url
+            .query_pairs()
+            .find(|(key, _)| key == "state")
+            .unwrap()
+            .1
+            .into_owned();
+        let (_, other_cookie) =
+            oauth_authorization_url(&api, "guild-a", &challenge, &verifier, OAuthFlow::Account)
+                .unwrap();
+        assert_ne!(cookie, other_cookie);
+        let cookie = cookie
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+        let app = router(api);
+        for value in [
+            None,
+            Some(format!(
+                "{}={}",
+                oauth_cookie_name(&state_token),
+                "b".repeat(64)
+            )),
+        ] {
+            let mut request = Request::builder().uri(format!(
+                "/api/oauth/callback?code=synthetic&state={state_token}"
+            ));
+            if let Some(value) = value {
+                request = request.header(header::COOKIE, value);
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body: serde_json::Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), 10_000).await.unwrap())
+                    .unwrap();
+            assert_eq!(body["code"], "invalid_oauth_browser");
+        }
+        let digest = URL_SAFE_NO_PAD.encode(Sha256::digest(state_token.as_bytes()));
+        assert_eq!(
+            store
+                .consume_oauth_state(&digest, Utc::now().timestamp())
+                .unwrap()
+                .as_deref(),
+            Some(verifier.as_str())
+        );
+        // A consumed state stops before provider I/O, so the valid-cookie path stays network-free.
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/oauth/callback?code=synthetic&state={state_token}"
+                    ))
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 10_000).await.unwrap()).unwrap();
+        assert_eq!(body["code"], "oauth_state_replayed");
+    }
+
+    #[tokio::test]
+    async fn oauth_starts_are_limited_before_new_state_is_created() {
+        let store = Store::open(":memory:").unwrap();
+        let app = router(state(store));
+        for index in 0..21 {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/install/start")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                if index < 20 {
+                    StatusCode::TEMPORARY_REDIRECT
+                } else {
+                    StatusCode::TOO_MANY_REQUESTS
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn oauth_start_binds_verifier_without_exposing_the_verifier() {
         let store = Store::open(":memory:").unwrap();
         let verifier = "a".repeat(64);
@@ -15045,7 +15215,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        assert!(response.headers().get(header::SET_COOKIE).is_none());
+        let cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(cookie.starts_with("__Host-vh_oauth_"));
+        assert!(cookie.contains("HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=600"));
 
         let mismatch = router(state(Store::open(":memory:").unwrap()))
             .oneshot(
