@@ -12280,7 +12280,8 @@ mod tests {
                     Request::builder()
                         .method("POST")
                         .uri(path)
-                        .header(header::ORIGIN, "https://bot.example.com")
+                        // Use the pinned first-party origin to reach the shared rate limiter.
+                        .header(header::ORIGIN, "https://vozen.org")
                         .header(header::CONTENT_TYPE, content_type)
                         .body(Body::from(body))
                         .unwrap(),
