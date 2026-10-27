@@ -4614,8 +4614,12 @@ async fn create_vozen_account_session(
         return Err(client_error(StatusCode::BAD_REQUEST, "invalid_token"));
     }
 
+    state
+        .oauth_limits
+        .check(&headers, oauth_limits::Endpoint::Start)?;
     let identity = Client::new()
         .get("https://discord.com/api/v10/oauth2/@me")
+        .timeout(std::time::Duration::from_secs(10))
         .bearer_auth(token)
         .send()
         .await
@@ -4719,8 +4723,12 @@ async fn create_private_tracker_session_inner(
         return Err(client_error(StatusCode::BAD_REQUEST, "missing_token"));
     }
 
+    state
+        .oauth_limits
+        .check(&headers, oauth_limits::Endpoint::Start)?;
     let identity = Client::new()
         .get("https://discord.com/api/v10/oauth2/@me")
+        .timeout(std::time::Duration::from_secs(10))
         .bearer_auth(token)
         .send()
         .await
@@ -4790,6 +4798,9 @@ async fn create_session(
     if !state.allow_legacy_session {
         return Err(client_error(StatusCode::GONE, "oauth_required"));
     }
+    state
+        .oauth_limits
+        .check(&headers, oauth_limits::Endpoint::Start)?;
     create_session_inner(State(state), headers, Json(req)).await
 }
 
@@ -4801,7 +4812,10 @@ async fn create_session_inner(
     if req.token.trim().is_empty() {
         return Err(client_error(StatusCode::BAD_REQUEST, "missing_token"));
     }
-    let client = Client::new();
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|_| client_error(StatusCode::SERVICE_UNAVAILABLE, "discord_unavailable"))?;
     let discord_user = fetch_discord_user(&client, &req.token).await?;
     // The Discord OAuth endpoint returns every guild in the account, but the
     // Helper can only ever expose servers the account can manage.  Filtering
@@ -12223,6 +12237,58 @@ mod tests {
             "1534014665187655760",
             "another-user",
         ));
+    }
+
+    #[tokio::test]
+    async fn session_bridges_share_the_public_auth_request_budget() {
+        let mut api = state(Store::open(":memory:").unwrap());
+        api.allow_legacy_session = true;
+        api.trusted_vozen_oauth_client_id = Some("vozen-app".into());
+        api.private_tracker_client_id = Some("tracker-app".into());
+        api.private_tracker_owner_id = Some("owner".into());
+        for _ in 0..20 {
+            api.oauth_limits
+                .check(&HeaderMap::new(), oauth_limits::Endpoint::Start)
+                .unwrap();
+        }
+        let app = router(api);
+        for (path, content_type, body) in [
+            (
+                "/api/session",
+                "application/json",
+                r#"{"token":"synthetic-token-long-enough","guildId":"guild-a"}"#,
+            ),
+            (
+                "/api/session/vozen",
+                "application/json",
+                r#"{"token":"synthetic-token-long-enough"}"#,
+            ),
+            (
+                "/api/admin/private-tracker/session",
+                "application/json",
+                r#"{"token":"synthetic-token-long-enough"}"#,
+            ),
+            (
+                "/api/admin/private-tracker/handoff",
+                "application/x-www-form-urlencoded",
+                "token=synthetic-token-long-enough",
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(path)
+                        .header(header::ORIGIN, "https://vozen.org")
+                        .header(header::CONTENT_TYPE, content_type)
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS, "{path}");
+        }
     }
 
     #[tokio::test]
