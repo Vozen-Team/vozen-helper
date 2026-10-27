@@ -3,8 +3,8 @@
 // Duas camadas:
 //  1. `loadEnv` — segredos e IDs que variam por ambiente (token, guild), lidos do
 //     ambiente e VALIDADOS no arranque (falha rápida com mensagem clara).
-//  2. `modConfig` — config-as-code (roles de mod, canais de log, thresholds). Vive
-//     no repo, versionada, tipada. Preenche os IDs à medida que as fases avançam.
+//  2. `loadModConfig` / `modConfig` - validated environment ID overrides with
+//     backwards-compatible defaults; moderation thresholds remain versioned.
 
 /** Níveis de log aceites (do menos ao mais severo). */
 export const LOG_LEVELS = ['debug', 'info', 'warn', 'error'] as const;
@@ -319,186 +319,236 @@ export interface LogConfig {
 const DAY = 24 * 60 * 60 * 1000;
 const HOUR = 60 * 60 * 1000;
 
-/**
- * Config-as-code por omissão. Os IDs ficam vazios até o Diogo os colar; a escada de
- * escalação traz defaults sensatos (3 strikes → timeout 1h, 5 → timeout 1 dia, 7 → ban).
- */
-export const modConfig: ModConfig = {
-  // Comandos só no canal #mod-helper-bot.
-  commandChannelIds: ['1526248625305292870'],
-  // Staff isenta de automod/anti-spam/filtros: ⭐Developer + 👮Staff.
-  modRoleIds: ['1523492883011997776', '1523499171246772355'],
-  whitelistIds: [],
-  strikeWindowMs: 30 * DAY,
-  escalationLadder: [
-    { atStrikes: 3, action: 'timeout', durationMs: HOUR },
-    { atStrikes: 5, action: 'timeout', durationMs: DAY },
-    { atStrikes: 7, action: 'ban' },
-  ],
-  dmOnPunish: true,
-  automod: {
-    advertisingKeywords: [],
-    advertisingRegexPatterns: [
-      '\\b(?:https?://)?(?:www\\.)?(?:discord\\.gg/\\S+|discord(?:app)?\\.com/(?:invite/\\S+|(?:api/)?oauth2/authorize\\S*))',
-      '\\b(?:https?://)?(?:www\\.)?(?:youtube\\.com|youtu\\.be|tiktok\\.com|instagram\\.com|twitch\\.tv|twitter\\.com|x\\.com|facebook\\.com|kick\\.com)/\\S+',
+// Optional ID overrides preserve legacy defaults when unset or blank.
+function isSnowflake(value: string): boolean {
+  return /^[1-9]\d{16,19}$/.test(value) && BigInt(value) <= 18446744073709551615n;
+}
+
+function idFromEnv(
+  env: Record<string, string | undefined>,
+  name: string,
+  fallback: string,
+): string {
+  const value = env[name]?.trim() || fallback;
+  if (!isSnowflake(value)) throw new ConfigError(`${name} must be a valid Discord snowflake.`);
+  return value;
+}
+
+function idsFromEnv(
+  env: Record<string, string | undefined>,
+  name: string,
+  fallback: string[],
+): string[] {
+  const raw = env[name]?.trim();
+  if (!raw) return fallback;
+  const values = raw.split(',').map((value) => value.trim());
+  if (!values.every(isSnowflake)) {
+    throw new ConfigError(`${name} must contain comma-separated Discord snowflakes.`);
+  }
+  return values;
+}
+
+export function loadModConfig(env: Record<string, string | undefined>): ModConfig {
+  const generalChannelId = idFromEnv(env, 'HELPER_GENERAL_CHANNEL_ID', '1523496056359489636');
+  const suggestionsChannelId = idFromEnv(
+    env,
+    'HELPER_SUGGESTIONS_CHANNEL_ID',
+    '1526360535501639771',
+  );
+  const starboardChannelId = idFromEnv(env, 'HELPER_STARBOARD_CHANNEL_ID', '1526360536705404948');
+  const logChannelId = idFromEnv(env, 'HELPER_LOG_CHANNEL_ID', '1524488901320769666');
+  return {
+    // Comandos só no canal #mod-helper-bot.
+    commandChannelIds: idsFromEnv(env, 'HELPER_COMMAND_CHANNEL_IDS', ['1526248625305292870']),
+    // Staff isenta de automod/anti-spam/filtros: ⭐Developer + 👮Staff.
+    modRoleIds: idsFromEnv(env, 'HELPER_MOD_ROLE_IDS', [
+      '1523492883011997776',
+      '1523499171246772355',
+    ]),
+    whitelistIds: [],
+    strikeWindowMs: 30 * DAY,
+    escalationLadder: [
+      { atStrikes: 3, action: 'timeout', durationMs: HOUR },
+      { atStrikes: 5, action: 'timeout', durationMs: DAY },
+      { atStrikes: 7, action: 'ban' },
     ],
-    // Racismo/discurso de ódio: delegado ao preset nativo (bloqueia ANTES de publicar).
-    enableSlurPreset: true,
-    enableProfanityPreset: false,
-    enableSexualPreset: true,
-    mentionLimit: 8,
-    mentionRaidProtectionEnabled: true,
-  },
-  bannedWords: [],
-  dangerousExtensions: ['exe', 'bat', 'scr', 'cmd', 'com', 'pif', 'vbs', 'js', 'jar', 'msi'],
-  automodExemptChannelIds: [],
-  spam: {
-    enabled: true,
-    windowMs: 10_000,
-    decayPerSec: 1,
-    punishAt: 10,
-    timeoutMs: 5 * 60 * 1000, // 5 min
-    repeatWindowMs: 30 * DAY,
-    maxTimeoutMs: DAY,
-    floodCount: 5, // >5 mensagens em 10s soma calor
-    floodHeat: 4,
-    duplicateHeat: 4,
-    multiChannelThreshold: 3,
-    multiChannelHeat: 6,
-    mentionLimit: 5,
-    mentionHeat: 2,
-    capsRatio: 0.7,
-    capsMinLength: 10,
-    capsHeat: 3,
-    emojiLimit: 8,
-    emojiHeat: 3,
-    newlineLimit: 10,
-    newlineHeat: 3,
-    linkLimit: 3,
-    linkHeat: 3,
-    inviteHeat: 5,
-  },
-  language: {
-    enabled: true,
-    terms: [
-      'fuck',
-      'fucking',
-      'fucked',
-      'motherfucker',
-      'shit',
-      'bullshit',
-      'bitch',
-      'asshole',
-      'bastard',
-      'cunt',
-      'dickhead',
-    ],
-    windowMs: 60_000,
-    repeatedTermCount: 5,
-    excessiveTermCount: 3,
-  },
-  logging: {
-    // Tudo para o #mod-logs por agora (podes separar por canal quando quiseres).
-    channels: {
-      messages: '1524488901320769666',
-      members: '1524488901320769666',
-      voice: '1524488901320769666',
-      server: '1524488901320769666',
-      mod: '1524488901320769666',
-    },
-    ignoreChannelIds: [],
-    ignoreUserIds: [],
-  },
-  joinGate: {
-    enabled: true,
-    minAccountAgeMs: 3 * DAY, // contas com menos de 3 dias
-    newAccountAction: 'none', // por defeito só regista; muda para 'kick' quando quiseres
-    requireAvatar: false,
-    noAvatarAction: 'none',
-    blockedUsernameSubstrings: [],
-    badUsernameAction: 'kick',
-  },
-  raid: {
-    enabled: true,
-    joinWindowMs: 10_000,
-    joinThreshold: 8, // 8 joins em 10s
-    raidModeMs: 10 * 60 * 1000,
-    raiseVerificationLevel: 3, // HIGH
-    pauseInvites: true,
-    alertChannelId: null,
-  },
-  verification: {
-    // Auto-role: toda a gente que entra recebe o ☀️Member.
-    autoRoleId: '1523498442653958294',
-    verifiedRoleId: null,
-    stickyRolesEnabled: true,
-  },
-  antiNuke: {
-    enabled: true,
-    // Começa em modo alerta: observa e avisa sem punir, para calibrar thresholds sem
-    // atingir mods legítimos. Passa a false quando tiveres confiança.
-    alertOnly: true,
-    windowMs: 10_000,
-    thresholds: {
-      channelDelete: 4,
-      roleDelete: 4,
-      ban: 5,
-      kick: 5,
-      webhookCreate: 3,
-    },
-    quarantineBotAdds: true,
-  },
-  antiScam: {
-    enabled: true,
-    blacklistDomains: [],
-    protectedDomains: ['discord.com', 'discord.gg', 'discord.gift', 'discordapp.com'],
-  },
-  nickname: {
-    dehoistEnabled: true,
-    fallbackName: 'Member',
-    protectedNames: [],
-  },
-  honeypotChannelId: null,
-  community: {
-    suggestions: { enabled: true, channelId: '1526360535501639771' },
-    welcome: {
-      enabled: false,
-      channelId: null,
-      message: 'Welcome {user} to **{server}**! You are member #{membercount}. 🎉',
-    },
-    welcomeDm: {
-      // Texto voltado ao membro → em inglês (comunidade anglófona). Editável no painel.
-      enabled: true,
-      message:
-        'Hey {user}, welcome to **{server}**! 🎉 You are member #{membercount}.\n\n' +
-        "Here's a quick tour to get you started:\n" +
-        '• <#1523496056359489636> — general chat, come say hi!\n' +
-        '• <#1526360535501639771> — drop your suggestions for the server\n' +
-        '• <#1526360536705404948> — the best messages end up here ⭐\n\n' +
-        'Have fun and make sure to read the rules. Any questions, reach out to the staff!',
-    },
-    memberCounter: { channelId: '1526361580487573635', template: '📊 Members: {count}' },
-    leveling: {
-      enabled: true,
-      announceChannelId: '1523496056359489636', // #general-chat
-      noXpChannelIds: ['1526248625305292870', '1523486728042840124'], // mod-helper-bot, bot-testing
-      minXp: 15,
-      maxXp: 25,
-      cooldownMs: 60_000,
-      levelRoles: [
-        { level: 5, roleId: '1526360728880283770' }, // 🥉 Nível 5
-        { level: 10, roleId: '1526360730499285103' }, // 🥈 Nível 10
-        { level: 20, roleId: '1526360731618906122' }, // 🥇 Nível 20
+    dmOnPunish: true,
+    automod: {
+      advertisingKeywords: [],
+      advertisingRegexPatterns: [
+        '\\b(?:https?://)?(?:www\\.)?(?:discord\\.gg/\\S+|discord(?:app)?\\.com/(?:invite/\\S+|(?:api/)?oauth2/authorize\\S*))',
+        '\\b(?:https?://)?(?:www\\.)?(?:youtube\\.com|youtu\\.be|tiktok\\.com|instagram\\.com|twitch\\.tv|twitter\\.com|x\\.com|facebook\\.com|kick\\.com)/\\S+',
       ],
-      stackRoles: false,
+      // Racismo/discurso de ódio: delegado ao preset nativo (bloqueia ANTES de publicar).
+      enableSlurPreset: true,
+      enableProfanityPreset: false,
+      enableSexualPreset: true,
+      mentionLimit: 8,
+      mentionRaidProtectionEnabled: true,
     },
-    tickets: {
+    bannedWords: [],
+    dangerousExtensions: ['exe', 'bat', 'scr', 'cmd', 'com', 'pif', 'vbs', 'js', 'jar', 'msi'],
+    automodExemptChannelIds: [],
+    spam: {
       enabled: true,
-      staffRoleId: '1523499171246772355',
-      transcriptChannelId: '1526362020041981992',
+      windowMs: 10_000,
+      decayPerSec: 1,
+      punishAt: 10,
+      timeoutMs: 5 * 60 * 1000, // 5 min
+      repeatWindowMs: 30 * DAY,
+      maxTimeoutMs: DAY,
+      floodCount: 5, // >5 mensagens em 10s soma calor
+      floodHeat: 4,
+      duplicateHeat: 4,
+      multiChannelThreshold: 3,
+      multiChannelHeat: 6,
+      mentionLimit: 5,
+      mentionHeat: 2,
+      capsRatio: 0.7,
+      capsMinLength: 10,
+      capsHeat: 3,
+      emojiLimit: 8,
+      emojiHeat: 3,
+      newlineLimit: 10,
+      newlineHeat: 3,
+      linkLimit: 3,
+      linkHeat: 3,
+      inviteHeat: 5,
     },
-    starboard: { enabled: true, channelId: '1526360536705404948', threshold: 3, emoji: '⭐' },
-    birthdays: { enabled: false, channelId: null, roleId: null },
-    bumpReminder: { enabled: true, channelId: '1523496056359489636' },
-  },
-};
+    language: {
+      enabled: true,
+      terms: [
+        'fuck',
+        'fucking',
+        'fucked',
+        'motherfucker',
+        'shit',
+        'bullshit',
+        'bitch',
+        'asshole',
+        'bastard',
+        'cunt',
+        'dickhead',
+      ],
+      windowMs: 60_000,
+      repeatedTermCount: 5,
+      excessiveTermCount: 3,
+    },
+    logging: {
+      // Tudo para o #mod-logs por agora (podes separar por canal quando quiseres).
+      channels: {
+        messages: logChannelId,
+        members: logChannelId,
+        voice: logChannelId,
+        server: logChannelId,
+        mod: logChannelId,
+      },
+      ignoreChannelIds: [],
+      ignoreUserIds: [],
+    },
+    joinGate: {
+      enabled: true,
+      minAccountAgeMs: 3 * DAY, // contas com menos de 3 dias
+      newAccountAction: 'none', // por defeito só regista; muda para 'kick' quando quiseres
+      requireAvatar: false,
+      noAvatarAction: 'none',
+      blockedUsernameSubstrings: [],
+      badUsernameAction: 'kick',
+    },
+    raid: {
+      enabled: true,
+      joinWindowMs: 10_000,
+      joinThreshold: 8, // 8 joins em 10s
+      raidModeMs: 10 * 60 * 1000,
+      raiseVerificationLevel: 3, // HIGH
+      pauseInvites: true,
+      alertChannelId: null,
+    },
+    verification: {
+      // Auto-role: toda a gente que entra recebe o ☀️Member.
+      autoRoleId: idFromEnv(env, 'HELPER_AUTO_ROLE_ID', '1523498442653958294'),
+      verifiedRoleId: null,
+      stickyRolesEnabled: true,
+    },
+    antiNuke: {
+      enabled: true,
+      // Começa em modo alerta: observa e avisa sem punir, para calibrar thresholds sem
+      // atingir mods legítimos. Passa a false quando tiveres confiança.
+      alertOnly: true,
+      windowMs: 10_000,
+      thresholds: {
+        channelDelete: 4,
+        roleDelete: 4,
+        ban: 5,
+        kick: 5,
+        webhookCreate: 3,
+      },
+      quarantineBotAdds: true,
+    },
+    antiScam: {
+      enabled: true,
+      blacklistDomains: [],
+      protectedDomains: ['discord.com', 'discord.gg', 'discord.gift', 'discordapp.com'],
+    },
+    nickname: {
+      dehoistEnabled: true,
+      fallbackName: 'Member',
+      protectedNames: [],
+    },
+    honeypotChannelId: null,
+    community: {
+      suggestions: { enabled: true, channelId: suggestionsChannelId },
+      welcome: {
+        enabled: false,
+        channelId: null,
+        message: 'Welcome {user} to **{server}**! You are member #{membercount}. 🎉',
+      },
+      welcomeDm: {
+        // Texto voltado ao membro → em inglês (comunidade anglófona). Editável no painel.
+        enabled: true,
+        message:
+          'Hey {user}, welcome to **{server}**! 🎉 You are member #{membercount}.\n\n' +
+          "Here's a quick tour to get you started:\n" +
+          `• <#${generalChannelId}> — general chat, come say hi!\n` +
+          `• <#${suggestionsChannelId}> — drop your suggestions for the server\n` +
+          `• <#${starboardChannelId}> — the best messages end up here ⭐\n\n` +
+          'Have fun and make sure to read the rules. Any questions, reach out to the staff!',
+      },
+      memberCounter: {
+        channelId: idFromEnv(env, 'HELPER_MEMBER_COUNTER_CHANNEL_ID', '1526361580487573635'),
+        template: '📊 Members: {count}',
+      },
+      leveling: {
+        enabled: true,
+        announceChannelId: generalChannelId, // #general-chat
+        noXpChannelIds: idsFromEnv(env, 'HELPER_NO_XP_CHANNEL_IDS', [
+          '1526248625305292870',
+          '1523486728042840124',
+        ]), // mod-helper-bot, bot-testing
+        minXp: 15,
+        maxXp: 25,
+        cooldownMs: 60_000,
+        levelRoles: [
+          { level: 5, roleId: idFromEnv(env, 'HELPER_LEVEL_5_ROLE_ID', '1526360728880283770') }, // 🥉 Nível 5
+          { level: 10, roleId: idFromEnv(env, 'HELPER_LEVEL_10_ROLE_ID', '1526360730499285103') }, // 🥈 Nível 10
+          { level: 20, roleId: idFromEnv(env, 'HELPER_LEVEL_20_ROLE_ID', '1526360731618906122') }, // 🥇 Nível 20
+        ],
+        stackRoles: false,
+      },
+      tickets: {
+        enabled: true,
+        staffRoleId: idFromEnv(env, 'HELPER_TICKET_STAFF_ROLE_ID', '1523499171246772355'),
+        transcriptChannelId: idFromEnv(
+          env,
+          'HELPER_TICKET_TRANSCRIPT_CHANNEL_ID',
+          '1526362020041981992',
+        ),
+      },
+      starboard: { enabled: true, channelId: starboardChannelId, threshold: 3, emoji: '⭐' },
+      birthdays: { enabled: false, channelId: null, roleId: null },
+      bumpReminder: { enabled: true, channelId: generalChannelId },
+    },
+  };
+}
+
+export const modConfig: ModConfig = loadModConfig(process.env);
