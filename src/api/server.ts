@@ -4,7 +4,7 @@ import cors from '@fastify/cors';
 import rateLimit from '@fastify/rate-limit';
 import type Database from 'better-sqlite3';
 import { fetchDiscordUser, type DiscordUser } from './discordAuth.js';
-import { signSessionToken, verifySessionToken } from './session.js';
+import { sessionTokenDigest, signSessionToken, verifySessionTokenClaims } from './session.js';
 import { getRecentCases, countCases } from '../store/cases.js';
 import { getRecentActivity, countActivity } from '../store/activity.js';
 import { getStatsTotals } from '../community/store.js';
@@ -33,6 +33,7 @@ import { modConfig } from '../config.js';
 const COOKIE = 'vh_session';
 /** Validade da sessão (8 horas). */
 const SESSION_MAX_AGE = 60 * 60 * 8;
+const MAX_REVOKED_SESSIONS = 1_000;
 
 /** Nº máximo de casos devolvidos numa listagem (teto anti-abuso). */
 const MAX_CASES = 200;
@@ -41,6 +42,13 @@ const MAX_CASES = 200;
 const MAX_ACTIVITY = 200;
 /** Allowlist de tipos filtráveis no endpoint de atividade. */
 const ACTIVITY_TYPES = new Set(['join', 'leave', 'ban', 'unban', 'kick']);
+
+function cookieOriginAllowed(req: FastifyRequest, allowedOrigin: string): boolean {
+  const originCount = req.raw.rawHeaders.filter(
+    (value, index) => index % 2 === 0 && value.toLowerCase() === 'origin',
+  ).length;
+  return originCount === 1 && req.headers.origin === allowedOrigin;
+}
 
 export interface ServerOptions {
   /** Única conta autorizada. */
@@ -59,10 +67,45 @@ export interface ServerOptions {
   verifyUser?: (token: string) => Promise<DiscordUser | null>;
   /** Lista de canais (injetável nos testes; default = REST do Discord). */
   listChannels?: () => Promise<GuildChannel[]>;
+  /** Relógio para validar a expiração no servidor. */
+  now?: () => number;
+}
+
+class RevokedSessionStore {
+  private readonly byDigest = new Map<string, number>();
+
+  private prune(now: number): void {
+    for (const [digest, expiresAt] of this.byDigest) {
+      if (expiresAt <= now) this.byDigest.delete(digest);
+    }
+  }
+
+  revoke(token: string, expiresAt: number, now: number): void {
+    this.prune(now);
+    const digest = sessionTokenDigest(token);
+    if (!this.byDigest.has(digest) && this.byDigest.size >= MAX_REVOKED_SESSIONS) {
+      let oldestDigest: string | undefined;
+      let oldestExpiry = Number.POSITIVE_INFINITY;
+      for (const [existingDigest, existingExpiry] of this.byDigest) {
+        if (existingExpiry < oldestExpiry) {
+          oldestDigest = existingDigest;
+          oldestExpiry = existingExpiry;
+        }
+      }
+      if (oldestDigest) this.byDigest.delete(oldestDigest);
+    }
+    this.byDigest.set(digest, expiresAt);
+  }
+
+  has(token: string, now: number): boolean {
+    this.prune(now);
+    return this.byDigest.has(sessionTokenDigest(token));
+  }
 }
 
 /** Constrói (sem arrancar) a instância Fastify com as rotas da Fase 1. */
 export function buildServer(opts: ServerOptions): FastifyInstance {
+  const now = opts.now ?? Date.now;
   const verify = opts.verifyUser ?? ((token: string) => fetchDiscordUser(token));
   const listChannels = opts.listChannels ?? (() => fetchGuildChannels(opts.botToken, opts.guildId));
   // Cache curto da lista de canais (evita bater na REST do Discord a cada pedido).
@@ -109,7 +152,8 @@ export function buildServer(opts: ServerOptions): FastifyInstance {
     if (!user) return reply.code(401).send({ error: 'invalid_token' });
     if (user.id !== opts.allowedUserId) return reply.code(403).send({ error: 'blocked' });
 
-    reply.setCookie(COOKIE, user.id, {
+    const sessionToken = signSessionToken(user.id, opts.sessionSecret, now(), SESSION_MAX_AGE);
+    reply.setCookie(COOKIE, sessionToken, {
       signed: true,
       httpOnly: true,
       secure: true,
@@ -119,7 +163,7 @@ export function buildServer(opts: ServerOptions): FastifyInstance {
     });
     // O token no corpo é o mecanismo principal (o painel envia-o no header Authorization);
     // o cookie fica como fallback para navegadores que aceitam cookies de terceiros.
-    const sessionToken = signSessionToken(user.id, opts.sessionSecret, Date.now(), SESSION_MAX_AGE);
+
     return {
       ok: true,
       user: { id: user.id, name: user.global_name || user.username },
@@ -129,29 +173,32 @@ export function buildServer(opts: ServerOptions): FastifyInstance {
 
   // Tokens revogados por logout. Em memória: perde-se num restart da API, mas os
   // tokens expiram sozinhos em 8h e o painel é de UMA conta — risco residual aceite.
-  const revoked = new Set<string>();
+  const revoked = new RevokedSessionStore();
+
+  function revokeIfValid(token: string, at: number): void {
+    const claims = verifySessionTokenClaims(token, opts.sessionSecret, at);
+    if (claims?.userId === opts.allowedUserId) {
+      revoked.revoke(token, claims.expiresAt, at);
+    }
+  }
 
   // Termina a sessão: limpa o cookie e revoga o Bearer token (se enviado).
   app.post('/api/logout', async (req: FastifyRequest, reply: FastifyReply) => {
+    const at = now();
+    const auth = req.headers.authorization;
+    const rawBearer = auth?.startsWith('Bearer ') ? auth.slice(7) : undefined;
     const bearer =
-      req.headers.authorization?.startsWith('Bearer ') &&
-      req.headers.authorization.slice(7).trim().length > 0;
-    const originCount = req.raw.rawHeaders.filter(
-      (value, index) => index % 2 === 0 && value.toLowerCase() === 'origin',
-    ).length;
-    if (!bearer && (originCount !== 1 || req.headers.origin !== opts.allowedOrigin)) {
+      rawBearer !== undefined &&
+      !revoked.has(rawBearer, at) &&
+      verifySessionTokenClaims(rawBearer, opts.sessionSecret, at)?.userId === opts.allowedUserId;
+    if (!bearer && !cookieOriginAllowed(req, opts.allowedOrigin)) {
       return reply.code(403).send({ error: 'csrf_origin_invalid' });
     }
-    const auth = req.headers.authorization;
-    if (auth && auth.startsWith('Bearer ')) {
-      const raw = auth.slice(7);
-      // Só revoga um token VÁLIDO desta conta. Sem esta verificação, POSTs não
-      // autenticados enchiam o Set `revoked` (em memória) com strings arbitrárias —
-      // DoS lento de memória. Um token inválido já é rejeitado pelo guard, revogá-lo
-      // não teria efeito de segurança, só custo de memória.
-      if (verifySessionToken(raw, opts.sessionSecret, Date.now()) === opts.allowedUserId) {
-        revoked.add(raw);
-      }
+    if (rawBearer) revokeIfValid(rawBearer, at);
+    const cookieToken = req.cookies[COOKIE];
+    if (cookieToken) {
+      const unsigned = req.unsignCookie(cookieToken);
+      if (unsigned.valid) revokeIfValid(unsigned.value, at);
     }
     reply.clearCookie(COOKIE, { path: '/' });
     return { ok: true };
@@ -160,18 +207,33 @@ export function buildServer(opts: ServerOptions): FastifyInstance {
   // Guarda de sessão: aceita (1) token no header Authorization (principal, robusto
   // cross-site) OU (2) o cookie assinado (fallback). Ambos têm de ser da conta certa.
   const guard = async (req: FastifyRequest, reply: FastifyReply): Promise<void> => {
+    const at = now();
     const auth = req.headers.authorization;
     if (auth && auth.startsWith('Bearer ')) {
       const raw = auth.slice(7);
-      if (!revoked.has(raw)) {
-        const uid = verifySessionToken(raw, opts.sessionSecret, Date.now());
-        if (uid === opts.allowedUserId) return;
+      if (!revoked.has(raw, at)) {
+        const claims = verifySessionTokenClaims(raw, opts.sessionSecret, at);
+        if (claims?.userId === opts.allowedUserId) return;
       }
     }
     const raw = req.cookies[COOKIE];
     if (raw) {
       const un = req.unsignCookie(raw);
-      if (un.valid && un.value === opts.allowedUserId) return;
+      if (un.valid && !revoked.has(un.value, at)) {
+        const claims = verifySessionTokenClaims(un.value, opts.sessionSecret, at);
+        if (claims?.userId === opts.allowedUserId) {
+          // Cookies são credenciais ambientes: só a origem do painel pode escrever.
+          // O Bearer válido já retornou acima e não depende desta restrição.
+          if (
+            req.method !== 'GET' &&
+            req.method !== 'HEAD' &&
+            !cookieOriginAllowed(req, opts.allowedOrigin)
+          ) {
+            await reply.code(403).send({ error: 'csrf_origin_invalid' });
+          }
+          return;
+        }
+      }
     }
     await reply.code(401).send({ error: 'unauthenticated' });
   };
