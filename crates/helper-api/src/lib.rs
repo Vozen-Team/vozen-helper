@@ -13,6 +13,7 @@ mod discord_context;
 mod discord_read;
 mod economy_shop;
 mod oauth_limits;
+mod reminders;
 #[cfg(test)]
 mod role_panel_authority_tests;
 mod session_authorization;
@@ -146,6 +147,11 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/oauth/callback", get(oauth_callback))
         .route("/api/logout", post(logout))
         .route("/api/me", get(me))
+        .route("/api/reminders", get(reminders::list))
+        .route(
+            "/api/reminders/{id}",
+            axum::routing::delete(reminders::cancel),
+        )
         .route("/api/achievements/{guild}", get(achievements::page))
         .route("/api/starboard/channel", post(starboard_channel::create))
         .route("/api/economy/channel", post(starboard_channel::create_shop))
@@ -12853,7 +12859,7 @@ mod tests {
         }
     }
 
-    fn claims(guild_id: &str) -> SessionClaims {
+    pub(super) fn claims(guild_id: &str) -> SessionClaims {
         let now = Utc::now();
         SessionClaims {
             session_id: Uuid::new_v4(),
