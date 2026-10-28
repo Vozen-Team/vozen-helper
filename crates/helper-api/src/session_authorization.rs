@@ -343,7 +343,7 @@ mod tests {
                 .method("POST")
                 .uri("/api/config/import")
                 .header(header::CONTENT_TYPE, "application/json");
-            Body::from(serde_json::json!({"version":1,"settings":[{"key":"test.authorization","value":value}],"tags":[],"workflows":[]}).to_string())
+            Body::from(serde_json::json!({"version":1,"settings":[],"tags":[{"name":"authorization","content":value,"authorId":USER}],"workflows":[]}).to_string())
         } else {
             request = request.uri("/api/stats");
             Body::empty()
@@ -368,8 +368,9 @@ mod tests {
         );
         assert_eq!(
             store
-                .get_setting(GUILD, "test.authorization")
+                .get_tag(GUILD, "authorization")
                 .unwrap()
+                .map(|tag| tag.content)
                 .as_deref(),
             Some("before")
         );
