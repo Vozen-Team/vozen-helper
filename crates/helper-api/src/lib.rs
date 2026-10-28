@@ -2,6 +2,9 @@
 
 #![recursion_limit = "256"]
 
+mod config_import;
+use config_import::import_config;
+
 mod achievements;
 mod activity_feed;
 #[cfg(test)]
@@ -1633,6 +1636,7 @@ async fn create_youtube_subscription(
     let (source, target, template, mention, enabled, interval) =
         validate_youtube_subscription(input)
             .map_err(|code| client_error(StatusCode::BAD_REQUEST, code))?;
+    require_subscription_channel(&state, &claims.guild_id, &target).await?;
     let Some(client) = state.youtube.as_ref() else {
         return Err(client_error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1690,6 +1694,7 @@ async fn update_youtube_subscription(
     let (source, target, template, mention, enabled, interval) =
         validate_youtube_subscription(input)
             .map_err(|code| client_error(StatusCode::BAD_REQUEST, code))?;
+    require_subscription_channel(&state, &claims.guild_id, &target).await?;
     let Some(client) = state.youtube.as_ref() else {
         return Err(client_error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -2598,6 +2603,7 @@ async fn create_rss_subscription(
     require_feature_premium(&state, &claims, "social.rss").await?;
     let (feed_url, target, template, mention, enabled, interval) = validate_rss_subscription(input)
         .map_err(|code| client_error(StatusCode::BAD_REQUEST, code))?;
+    require_subscription_channel(&state, &claims.guild_id, &target).await?;
     let Some(client) = state.rss.as_ref() else {
         return Err(client_error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -2644,6 +2650,7 @@ async fn update_rss_subscription(
     require_feature_premium(&state, &claims, "social.rss").await?;
     let (feed_url, target, template, mention, enabled, interval) = validate_rss_subscription(input)
         .map_err(|code| client_error(StatusCode::BAD_REQUEST, code))?;
+    require_subscription_channel(&state, &claims.guild_id, &target).await?;
     let Some(client) = state.rss.as_ref() else {
         return Err(client_error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -2828,6 +2835,7 @@ async fn create_bluesky_subscription(
     let (handle, target, template, mention, enabled, interval) =
         validate_bluesky_subscription(input)
             .map_err(|code| client_error(StatusCode::BAD_REQUEST, code))?;
+    require_subscription_channel(&state, &claims.guild_id, &target).await?;
     let client = state
         .bluesky
         .as_ref()
@@ -2876,6 +2884,7 @@ async fn update_bluesky_subscription(
     let (handle, target, template, mention, enabled, interval) =
         validate_bluesky_subscription(input)
             .map_err(|code| client_error(StatusCode::BAD_REQUEST, code))?;
+    require_subscription_channel(&state, &claims.guild_id, &target).await?;
     let client = state
         .bluesky
         .as_ref()
@@ -3158,6 +3167,7 @@ async fn create_tiktok_subscription(
     let (source, target, template, mention, enabled, interval) =
         validate_tiktok_subscription(input)
             .map_err(|code| client_error(StatusCode::BAD_REQUEST, code))?;
+    require_subscription_channel(&state, &claims.guild_id, &target).await?;
     let client = tiktok_provider_for_guild(&state, &claims.guild_id).await?;
     if enabled {
         client
@@ -3198,6 +3208,7 @@ async fn update_tiktok_subscription(
     let (source, target, template, mention, enabled, interval) =
         validate_tiktok_subscription(input)
             .map_err(|code| client_error(StatusCode::BAD_REQUEST, code))?;
+    require_subscription_channel(&state, &claims.guild_id, &target).await?;
     let _client = tiktok_provider_for_guild(&state, &claims.guild_id).await?;
     let record = state
         .store
@@ -3481,6 +3492,7 @@ async fn create_instagram_subscription(
     let (username, target, template, mention, enabled, interval) =
         validate_instagram_subscription(input)
             .map_err(|code| client_error(StatusCode::BAD_REQUEST, code))?;
+    require_subscription_channel(&state, &claims.guild_id, &target).await?;
     let client = require_instagram_provider(&state)?;
     if enabled {
         client
@@ -3520,6 +3532,7 @@ async fn update_instagram_subscription(
     let (username, target, template, mention, enabled, interval) =
         validate_instagram_subscription(input)
             .map_err(|code| client_error(StatusCode::BAD_REQUEST, code))?;
+    require_subscription_channel(&state, &claims.guild_id, &target).await?;
     let _ = require_instagram_provider(&state)?;
     let record = state
         .store
@@ -3677,6 +3690,7 @@ async fn create_kick_subscription(
     require_feature_premium(&state, &claims, "social.kick").await?;
     let (source, target, template, mention, enabled, interval) = validate_kick_subscription(input)
         .map_err(|code| client_error(StatusCode::BAD_REQUEST, code))?;
+    require_subscription_channel(&state, &claims.guild_id, &target).await?;
     let client = require_kick_provider(&state)?;
     if enabled {
         client
@@ -3715,6 +3729,7 @@ async fn update_kick_subscription(
     require_feature_premium(&state, &claims, "social.kick").await?;
     let (source, target, template, mention, enabled, interval) = validate_kick_subscription(input)
         .map_err(|code| client_error(StatusCode::BAD_REQUEST, code))?;
+    require_subscription_channel(&state, &claims.guild_id, &target).await?;
     let _ = require_kick_provider(&state)?;
     let record = state
         .store
@@ -3897,6 +3912,19 @@ async fn prepare_twitch_feature(
     config: &serde_json::Value,
     enabled: bool,
 ) -> Result<Option<TwitchSubscriptionWrite>, (StatusCode, Json<ApiError>)> {
+    let subscription = prepare_twitch_feature_read_only(state, claims, config, enabled).await?;
+    if enabled && let Some(subscription) = &subscription {
+        ensure_twitch_subscription(state, subscription).await?;
+    }
+    Ok(subscription)
+}
+
+async fn prepare_twitch_feature_read_only(
+    state: &ApiState,
+    claims: &SessionClaims,
+    config: &serde_json::Value,
+    enabled: bool,
+) -> Result<Option<TwitchSubscriptionWrite>, (StatusCode, Json<ApiError>)> {
     let existing = state
         .store
         .twitch_subscriptions(&claims.guild_id)
@@ -3953,13 +3981,6 @@ async fn prepare_twitch_feature(
             "twitch_channel_not_found",
         ));
     };
-    client
-        .ensure_stream_online_subscription(&user.id)
-        .await
-        .map_err(|error| {
-            tracing::warn!(%error, "twitch EventSub subscription failed");
-            client_error(StatusCode::BAD_GATEWAY, "twitch_eventsub_unavailable")
-        })?;
     Ok(Some(TwitchSubscriptionWrite {
         source_login: user.login,
         source_user_id: user.id,
@@ -3969,6 +3990,24 @@ async fn prepare_twitch_feature(
         enabled: true,
         created_by: claims.user_id.clone(),
     }))
+}
+
+async fn ensure_twitch_subscription(
+    state: &ApiState,
+    subscription: &TwitchSubscriptionWrite,
+) -> Result<(), (StatusCode, Json<ApiError>)> {
+    let client = state
+        .twitch
+        .as_ref()
+        .ok_or_else(|| client_error(StatusCode::SERVICE_UNAVAILABLE, "provider_not_configured"))?;
+    client
+        .ensure_stream_online_subscription(&subscription.source_user_id)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error,"twitch EventSub subscription failed");
+            client_error(StatusCode::BAD_GATEWAY, "twitch_eventsub_unavailable")
+        })?;
+    Ok(())
 }
 
 async fn twitch_subscriptions(
@@ -3997,6 +4036,7 @@ async fn create_twitch_subscription(
     require_feature_premium(&state, &claims, "social.twitch").await?;
     let (login, target, template, mention, enabled) = validate_twitch_subscription(input)
         .map_err(|code| client_error(StatusCode::BAD_REQUEST, code))?;
+    require_subscription_channel(&state, &claims.guild_id, &target).await?;
     let Some(client) = state.twitch.as_ref() else {
         return Err(client_error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -4051,6 +4091,7 @@ async fn update_twitch_subscription(
     require_feature_premium(&state, &claims, "social.twitch").await?;
     let (login, target, template, mention, enabled) = validate_twitch_subscription(input)
         .map_err(|code| client_error(StatusCode::BAD_REQUEST, code))?;
+    require_subscription_channel(&state, &claims.guild_id, &target).await?;
     let Some(client) = state.twitch.as_ref() else {
         return Err(client_error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -5178,13 +5219,52 @@ async fn discord_send_channel_message(
     .await
 }
 
-async fn discord_send_channel_message_at(
+async fn require_subscription_channel(
+    state: &ApiState,
+    guild_id: &str,
+    channel_id: &str,
+) -> Result<(), (StatusCode, Json<ApiError>)> {
+    #[cfg(test)]
+    let test_base = discord_channel_tests::TEST_BASE.try_with(Clone::clone).ok();
+    #[cfg(test)]
+    let api_base = test_base.as_deref().unwrap_or(DISCORD_API_BASE);
+    #[cfg(not(test))]
+    let api_base = DISCORD_API_BASE;
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|_| {
+            client_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "discord_adapter_unavailable",
+            )
+        })?;
+    discord_require_guild_channel_at(
+        &client,
+        api_base,
+        &state.discord_token,
+        guild_id,
+        channel_id,
+    )
+    .await
+    .map_err(|error| match error.as_str() {
+        "discord_channel_guild_mismatch" | "discord_channel_type_unsupported" => {
+            client_error(StatusCode::FORBIDDEN, "discord_channel_not_in_guild")
+        }
+        "invalid_discord_channel_id" | "invalid_discord_guild_id" => {
+            client_error(StatusCode::BAD_REQUEST, "invalid_discord_channel_id")
+        }
+        _ => client_error(StatusCode::BAD_GATEWAY, "discord_channel_unavailable"),
+    })
+}
+
+async fn discord_require_guild_channel_at(
     client: &Client,
     api_base: &str,
     discord_token: &str,
     expected_guild_id: &str,
     channel_id: &str,
-    content: &str,
 ) -> Result<(), String> {
     if discord_token.len() < 20 {
         return Err("discord_adapter_unavailable".into());
@@ -5199,14 +5279,39 @@ async fn discord_send_channel_message_at(
     if !is_discord_snowflake(expected_guild_id) {
         return Err("invalid_discord_guild_id".into());
     }
-    let auth = format!("Bot {discord_token}");
-    let channel =
-        discord_read::get_json(client, &auth, &format!("{api_base}/channels/{channel_id}")).await?;
+    let channel = discord_read::get_json(
+        client,
+        &format!("Bot {discord_token}"),
+        &format!("{api_base}/channels/{channel_id}"),
+    )
+    .await?;
     if channel["id"].as_str() != Some(channel_id)
         || channel["guild_id"].as_str() != Some(expected_guild_id)
     {
         return Err("discord_channel_guild_mismatch".into());
     }
+    if !matches!(channel["type"].as_i64(), Some(0 | 5 | 10 | 11 | 12)) {
+        return Err("discord_channel_type_unsupported".into());
+    }
+    Ok(())
+}
+
+async fn discord_send_channel_message_at(
+    client: &Client,
+    api_base: &str,
+    discord_token: &str,
+    expected_guild_id: &str,
+    channel_id: &str,
+    content: &str,
+) -> Result<(), String> {
+    discord_require_guild_channel_at(
+        client,
+        api_base,
+        discord_token,
+        expected_guild_id,
+        channel_id,
+    )
+    .await?;
     let response = client
         .post(format!("{api_base}/channels/{channel_id}/messages"))
         .header(header::AUTHORIZATION, format!("Bot {discord_token}"))
@@ -5224,6 +5329,10 @@ async fn discord_send_channel_message_at(
 }
 
 async fn fetch_discord_guild_snapshot(guild_id: &str, discord_token: &str) -> DiscordGuildSnapshot {
+    #[cfg(test)]
+    if let Ok(snapshot) = config_import::TEST_SNAPSHOT.try_with(Clone::clone) {
+        return snapshot;
+    }
     static INFLIGHT: std::sync::OnceLock<discord_context::Inflight<DiscordGuildSnapshot>> =
         std::sync::OnceLock::new();
     // Scope sharing to both the guild and credential, without storing tokens in
@@ -5907,10 +6016,20 @@ fn channel_dependency_issues(
 }
 
 async fn generic_feature_preflight(
+    state: State<Arc<ApiState>>,
+    headers: HeaderMap,
+    key: String,
+    request: FeaturePreflightRequest,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
+    generic_feature_preflight_with_import(state, headers, key, request, None).await
+}
+
+async fn generic_feature_preflight_with_import(
     State(state): State<Arc<ApiState>>,
     headers: HeaderMap,
     key: String,
     request: FeaturePreflightRequest,
+    imported_enabled: Option<&std::collections::BTreeMap<String, bool>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
     let claims = require_auth(&state, &headers).await?;
     if key == "support.welcome_channel" {
@@ -6015,7 +6134,10 @@ async fn generic_feature_preflight(
             if request.enabled
                 && let Some(required_feature) = internal_feature_dependency(dependency)
                 && required_feature != key
-                && !feature_enabled(&state, &claims.guild_id, required_feature)
+                && !imported_enabled
+                    .and_then(|features| features.get(required_feature))
+                    .copied()
+                    .unwrap_or_else(|| feature_enabled(&state, &claims.guild_id, required_feature))
             {
                 add_dependency_issue(
                     &mut issues,
@@ -11498,53 +11620,6 @@ async fn privacy_delete(
     })))
 }
 
-async fn import_config(
-    State(state): State<Arc<ApiState>>,
-    headers: HeaderMap,
-    Json(document): Json<serde_json::Value>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_mutation_auth(&state, &headers).await?;
-    let summary = state
-        .store
-        .import_guild_config(&claims.guild_id, &document)
-        .map_err(|error| {
-            let code = error.to_string();
-            let invalid = [
-                "invalid_target_guild",
-                "config_too_large",
-                "invalid_config_document",
-                "unsupported_config_version",
-                "invalid_settings",
-                "invalid_tags",
-                "invalid_workflows",
-                "config_limits_exceeded",
-                "invalid_setting_key",
-                "invalid_setting_value",
-                "invalid_setting_bounds",
-                "secret_setting_rejected",
-                "invalid_tag_name",
-                "invalid_tag_content",
-                "invalid_tag_author",
-                "invalid_tag_bounds",
-                "invalid_workflow_name",
-                "invalid_workflow_trigger",
-                "invalid_workflow_action",
-                "invalid_workflow_payload",
-                "unsupported_workflow",
-            ];
-            if invalid.contains(&code.as_str()) {
-                client_error(StatusCode::BAD_REQUEST, "invalid_config_import")
-            } else {
-                client_error(StatusCode::INTERNAL_SERVER_ERROR, "store_error")
-            }
-        })?;
-    Ok(Json(serde_json::json!({
-        "ok": true,
-        "guildId": claims.guild_id,
-        "imported": summary,
-    })))
-}
-
 #[derive(Debug, Deserialize)]
 struct WorkflowRequest {
     name: String,
@@ -15087,7 +15162,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             store.get_setting("guild-a", "welcome.channel").unwrap(),
-            Some("123".into())
+            None
         );
         assert!(
             store

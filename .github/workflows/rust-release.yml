@@ -9,6 +9,7 @@ on:
 
 permissions:
   contents: write
+  actions: read
 
 concurrency:
   group: helper-rust-release
@@ -46,6 +47,33 @@ jobs:
           HELPER_ACHIEVEMENT_UNLOCK_PREVIEW: ${{ github.workspace }}/achievement-unlocked.png
           HELPER_ACHIEVEMENTS_PREVIEW: ${{ github.workspace }}/achievements.png
         run: cargo test --workspace
+      - name: Require complete CI for this revision
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml --event push \
+            --commit "$GITHUB_SHA" --limit 100 --json databaseId,headSha,headBranch,event > "$RUNNER_TEMP/helper-ci.json"
+          run_id=$(python3 - <<'PY'
+          import json, os
+          with open(os.environ['RUNNER_TEMP'] + '/helper-ci.json') as stream:
+              runs = json.load(stream)
+          matches = [run for run in runs if run['headSha'] == os.environ['GITHUB_SHA']
+                     and run['headBranch'] == os.environ['GITHUB_REF_NAME'] and run['event'] == 'push']
+          assert matches, 'No push CI exists for this exact revision and branch'
+          print(max(matches, key=lambda run: run['databaseId'])['databaseId'])
+          PY
+          )
+          gh run watch "$run_id" --repo "$GITHUB_REPOSITORY" --exit-status
+          gh run view "$run_id" --repo "$GITHUB_REPOSITORY" \
+            --json headSha,headBranch,event,conclusion > "$RUNNER_TEMP/helper-ci-result.json"
+          python3 - <<'PY'
+          import json, os
+          with open(os.environ['RUNNER_TEMP'] + '/helper-ci-result.json') as stream:
+              run = json.load(stream)
+          assert run == dict(headSha=os.environ['GITHUB_SHA'], headBranch=os.environ['GITHUB_REF_NAME'],
+                             event='push', conclusion='success'), 'Exact revision CI did not pass'
+          PY
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: level-up-preview-${{ github.sha }}

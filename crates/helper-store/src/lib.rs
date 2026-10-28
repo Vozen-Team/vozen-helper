@@ -827,8 +827,55 @@ pub struct WorkflowRecord {
     pub created_at: i64,
 }
 
-#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SkippedImportSetting {
+    pub key: String,
+    pub reason: String,
+}
+pub struct PreparedConfigImport {
+    pub settings: Vec<(String, String)>,
+    pub tags: Vec<(String, String, String)>,
+    pub workflows: Vec<(String, String, String, String, bool)>,
+    birthdays: Vec<(String, u32, u32)>,
+}
+pub struct ConfigImportLimits {
+    pub tags: usize,
+    pub workflows: usize,
+    pub tag_length: usize,
+    pub reply_length: usize,
+}
+impl Default for ConfigImportLimits {
+    fn default() -> Self {
+        Self {
+            tags: 100,
+            workflows: 100,
+            tag_length: 2000,
+            reply_length: 1000,
+        }
+    }
+}
+pub struct ConfigImportFeature {
+    pub key: String,
+    pub enabled: bool,
+    pub config_json: String,
+    pub expected_revision: u64,
+    pub projections: Vec<(String, String)>,
+    pub subscription: ImportSubscription,
+}
+pub enum ImportSubscription {
+    None,
+    YouTube(Option<YouTubeSubscriptionWrite>),
+    Rss(Option<RssSubscriptionWrite>),
+    Bluesky(Option<BlueskySubscriptionWrite>),
+    TikTok(Option<TikTokSubscriptionWrite>),
+    Twitch(Option<TwitchSubscriptionWrite>),
+    Instagram(Option<InstagramSubscriptionWrite>),
+    Kick(Option<KickSubscriptionWrite>),
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ConfigImportSummary {
+    pub skipped_settings: Vec<SkippedImportSetting>,
     pub settings: usize,
     pub tags: usize,
     pub workflows: usize,
@@ -2124,6 +2171,31 @@ impl Store {
     ) -> Result<FeatureSettingRecord> {
         let mut conn = self.conn.lock().expect("store mutex poisoned");
         let tx = conn.transaction()?;
+        let record = Self::publish_feature_setting_on_tx(
+            &tx,
+            guild_id,
+            key,
+            enabled,
+            config_json,
+            expected_revision,
+            updated_by,
+            projections,
+        )?;
+        tx.commit()?;
+        Ok(record)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn publish_feature_setting_on_tx(
+        tx: &rusqlite::Transaction<'_>,
+        guild_id: &str,
+        key: &str,
+        enabled: bool,
+        config_json: &str,
+        expected_revision: Option<u64>,
+        updated_by: &str,
+        projections: &[(String, String)],
+    ) -> Result<FeatureSettingRecord> {
         let current: Option<(i64, i64, String, String)> = tx
             .query_row(
                 "SELECT revision,enabled,config_json,updated_by FROM feature_settings WHERE guild_id=?1 AND key=?2",
@@ -2178,7 +2250,6 @@ impl Store {
             "INSERT INTO audit_events(correlation_id,guild_id,actor_id,action,reason,before_json,after_json,outcome,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
             params![correlation_id, guild_id, updated_by, "feature.publish", key, before_json.to_string(), after_json.to_string(), "published", now],
         )?;
-        tx.commit()?;
         Ok(FeatureSettingRecord {
             guild_id: guild_id.to_string(),
             key: key.to_string(),
@@ -2207,6 +2278,33 @@ impl Store {
     ) -> Result<FeatureSettingRecord> {
         let mut conn = self.conn.lock().expect("store mutex poisoned");
         let tx = conn.transaction()?;
+        let record = Self::publish_youtube_feature_setting_on_tx(
+            &tx,
+            guild_id,
+            key,
+            enabled,
+            config_json,
+            expected_revision,
+            updated_by,
+            projections,
+            subscription,
+        )?;
+        tx.commit()?;
+        Ok(record)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn publish_youtube_feature_setting_on_tx(
+        tx: &rusqlite::Transaction<'_>,
+        guild_id: &str,
+        key: &str,
+        enabled: bool,
+        config_json: &str,
+        expected_revision: Option<u64>,
+        updated_by: &str,
+        projections: &[(String, String)],
+        subscription: Option<&YouTubeSubscriptionWrite>,
+    ) -> Result<FeatureSettingRecord> {
         let current: Option<(i64, i64, String, String)> = tx
             .query_row(
                 "SELECT revision,enabled,config_json,updated_by FROM feature_settings WHERE guild_id=?1 AND key=?2",
@@ -2275,7 +2373,6 @@ impl Store {
             "INSERT INTO audit_events(correlation_id,guild_id,actor_id,action,reason,before_json,after_json,outcome,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
             params![correlation_id, guild_id, updated_by, "feature.publish", key, before_json.to_string(), after_json.to_string(), "published", now],
         )?;
-        tx.commit()?;
         Ok(FeatureSettingRecord {
             guild_id: guild_id.to_string(),
             key: key.to_string(),
@@ -2302,6 +2399,33 @@ impl Store {
     ) -> Result<FeatureSettingRecord> {
         let mut conn = self.conn.lock().expect("store mutex poisoned");
         let tx = conn.transaction()?;
+        let record = Self::publish_rss_feature_setting_on_tx(
+            &tx,
+            guild_id,
+            key,
+            enabled,
+            config_json,
+            expected_revision,
+            updated_by,
+            projections,
+            subscription,
+        )?;
+        tx.commit()?;
+        Ok(record)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn publish_rss_feature_setting_on_tx(
+        tx: &rusqlite::Transaction<'_>,
+        guild_id: &str,
+        key: &str,
+        enabled: bool,
+        config_json: &str,
+        expected_revision: Option<u64>,
+        updated_by: &str,
+        projections: &[(String, String)],
+        subscription: Option<&RssSubscriptionWrite>,
+    ) -> Result<FeatureSettingRecord> {
         let current: Option<(i64, i64, String, String)> = tx
             .query_row(
                 "SELECT revision,enabled,config_json,updated_by FROM feature_settings WHERE guild_id=?1 AND key=?2",
@@ -2367,7 +2491,6 @@ impl Store {
             "INSERT INTO audit_events(correlation_id,guild_id,actor_id,action,reason,before_json,after_json,outcome,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
             params![correlation_id, guild_id, updated_by, "feature.publish", key, before_json.to_string(), after_json.to_string(), "published", now],
         )?;
-        tx.commit()?;
         Ok(FeatureSettingRecord {
             guild_id: guild_id.to_string(),
             key: key.to_string(),
@@ -2396,6 +2519,33 @@ impl Store {
     ) -> Result<FeatureSettingRecord> {
         let mut conn = self.conn.lock().expect("store mutex poisoned");
         let tx = conn.transaction()?;
+        let record = Self::publish_bluesky_feature_setting_on_tx(
+            &tx,
+            guild_id,
+            key,
+            enabled,
+            config_json,
+            expected_revision,
+            updated_by,
+            projections,
+            subscription,
+        )?;
+        tx.commit()?;
+        Ok(record)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn publish_bluesky_feature_setting_on_tx(
+        tx: &rusqlite::Transaction<'_>,
+        guild_id: &str,
+        key: &str,
+        enabled: bool,
+        config_json: &str,
+        expected_revision: Option<u64>,
+        updated_by: &str,
+        projections: &[(String, String)],
+        subscription: Option<&BlueskySubscriptionWrite>,
+    ) -> Result<FeatureSettingRecord> {
         let current: Option<(i64, i64, String)> = tx
             .query_row(
                 "SELECT revision,enabled,config_json FROM feature_settings WHERE guild_id=?1 AND key=?2",
@@ -2461,7 +2611,6 @@ impl Store {
             "INSERT INTO audit_events(correlation_id,guild_id,actor_id,action,reason,before_json,after_json,outcome,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
             params![correlation_id, guild_id, updated_by, "feature.publish", key, before_json.to_string(), after_json.to_string(), "published", now],
         )?;
-        tx.commit()?;
         Ok(FeatureSettingRecord {
             guild_id: guild_id.to_string(),
             key: key.to_string(),
@@ -2675,6 +2824,33 @@ impl Store {
     ) -> Result<FeatureSettingRecord> {
         let mut conn = self.conn.lock().expect("store mutex poisoned");
         let tx = conn.transaction()?;
+        let record = Self::publish_tiktok_feature_setting_on_tx(
+            &tx,
+            guild_id,
+            key,
+            enabled,
+            config_json,
+            expected_revision,
+            updated_by,
+            projections,
+            subscription,
+        )?;
+        tx.commit()?;
+        Ok(record)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn publish_tiktok_feature_setting_on_tx(
+        tx: &rusqlite::Transaction<'_>,
+        guild_id: &str,
+        key: &str,
+        enabled: bool,
+        config_json: &str,
+        expected_revision: Option<u64>,
+        updated_by: &str,
+        projections: &[(String, String)],
+        subscription: Option<&TikTokSubscriptionWrite>,
+    ) -> Result<FeatureSettingRecord> {
         let current: Option<(i64, i64, String)> = tx
             .query_row(
                 "SELECT revision,enabled,config_json FROM feature_settings WHERE guild_id=?1 AND key=?2",
@@ -2734,7 +2910,6 @@ impl Store {
             "INSERT INTO audit_events(correlation_id,guild_id,actor_id,action,reason,before_json,after_json,outcome,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
             params![correlation_id, guild_id, updated_by, "feature.publish", key, before_json.to_string(), after_json.to_string(), "published", now],
         )?;
-        tx.commit()?;
         Ok(FeatureSettingRecord {
             guild_id: guild_id.to_string(),
             key: key.to_string(),
@@ -2841,6 +3016,33 @@ impl Store {
     ) -> Result<FeatureSettingRecord> {
         let mut conn = self.conn.lock().expect("store mutex poisoned");
         let tx = conn.transaction()?;
+        let record = Self::publish_twitch_feature_setting_on_tx(
+            &tx,
+            guild_id,
+            key,
+            enabled,
+            config_json,
+            expected_revision,
+            updated_by,
+            projections,
+            subscription,
+        )?;
+        tx.commit()?;
+        Ok(record)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn publish_twitch_feature_setting_on_tx(
+        tx: &rusqlite::Transaction<'_>,
+        guild_id: &str,
+        key: &str,
+        enabled: bool,
+        config_json: &str,
+        expected_revision: Option<u64>,
+        updated_by: &str,
+        projections: &[(String, String)],
+        subscription: Option<&TwitchSubscriptionWrite>,
+    ) -> Result<FeatureSettingRecord> {
         let current: Option<(i64, i64, String, String)> = tx
             .query_row(
                 "SELECT revision,enabled,config_json,updated_by FROM feature_settings WHERE guild_id=?1 AND key=?2",
@@ -2906,7 +3108,6 @@ impl Store {
             "INSERT INTO audit_events(correlation_id,guild_id,actor_id,action,reason,before_json,after_json,outcome,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
             params![correlation_id, guild_id, updated_by, "feature.publish", key, before_json.to_string(), after_json.to_string(), "published", now],
         )?;
-        tx.commit()?;
         Ok(FeatureSettingRecord {
             guild_id: guild_id.to_string(),
             key: key.to_string(),
@@ -3624,6 +3825,33 @@ impl Store {
     ) -> Result<FeatureSettingRecord> {
         let mut conn = self.conn.lock().expect("store mutex poisoned");
         let tx = conn.transaction()?;
+        let record = Self::publish_instagram_feature_setting_on_tx(
+            &tx,
+            guild_id,
+            key,
+            enabled,
+            config_json,
+            expected_revision,
+            updated_by,
+            projections,
+            subscription,
+        )?;
+        tx.commit()?;
+        Ok(record)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn publish_instagram_feature_setting_on_tx(
+        tx: &rusqlite::Transaction<'_>,
+        guild_id: &str,
+        key: &str,
+        enabled: bool,
+        config_json: &str,
+        expected_revision: Option<u64>,
+        updated_by: &str,
+        projections: &[(String, String)],
+        subscription: Option<&InstagramSubscriptionWrite>,
+    ) -> Result<FeatureSettingRecord> {
         let current: Option<(i64, i64, String)> = tx.query_row(
             "SELECT revision,enabled,config_json FROM feature_settings WHERE guild_id=?1 AND key=?2",
             params![guild_id, key], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
@@ -3664,7 +3892,6 @@ impl Store {
             .unwrap_or_else(|| serde_json::json!({}));
         let after_json = serde_json::json!({"enabled":enabled,"config":serde_json::from_str::<serde_json::Value>(config_json).unwrap_or_else(|_| serde_json::json!({})),"revision":next_revision});
         tx.execute("INSERT INTO audit_events(correlation_id,guild_id,actor_id,action,reason,before_json,after_json,outcome,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)", params![correlation_id,guild_id,updated_by,"feature.publish",key,before_json.to_string(),after_json.to_string(),"published",now])?;
-        tx.commit()?;
         Ok(FeatureSettingRecord {
             guild_id: guild_id.to_string(),
             key: key.to_string(),
@@ -3691,6 +3918,33 @@ impl Store {
     ) -> Result<FeatureSettingRecord> {
         let mut conn = self.conn.lock().expect("store mutex poisoned");
         let tx = conn.transaction()?;
+        let record = Self::publish_kick_feature_setting_on_tx(
+            &tx,
+            guild_id,
+            key,
+            enabled,
+            config_json,
+            expected_revision,
+            updated_by,
+            projections,
+            subscription,
+        )?;
+        tx.commit()?;
+        Ok(record)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn publish_kick_feature_setting_on_tx(
+        tx: &rusqlite::Transaction<'_>,
+        guild_id: &str,
+        key: &str,
+        enabled: bool,
+        config_json: &str,
+        expected_revision: Option<u64>,
+        updated_by: &str,
+        projections: &[(String, String)],
+        subscription: Option<&KickSubscriptionWrite>,
+    ) -> Result<FeatureSettingRecord> {
         let current: Option<(i64,i64,String)> = tx.query_row("SELECT revision,enabled,config_json FROM feature_settings WHERE guild_id=?1 AND key=?2", params![guild_id,key], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).optional()?;
         let current_revision = current
             .as_ref()
@@ -3726,7 +3980,6 @@ impl Store {
             .unwrap_or_else(|| serde_json::json!({}));
         let after_json = serde_json::json!({"enabled":enabled,"config":serde_json::from_str::<serde_json::Value>(config_json).unwrap_or_else(|_|serde_json::json!({})),"revision":next_revision});
         tx.execute("INSERT INTO audit_events(correlation_id,guild_id,actor_id,action,reason,before_json,after_json,outcome,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)", params![correlation_id,guild_id,updated_by,"feature.publish",key,before_json.to_string(),after_json.to_string(),"published",now])?;
-        tx.commit()?;
         Ok(FeatureSettingRecord {
             guild_id: guild_id.to_string(),
             key: key.to_string(),
@@ -4456,11 +4709,10 @@ impl Store {
     /// `export_guild`. The target guild always comes from the authenticated
     /// caller; the source `guildId` in the document is informational only.
     /// Secrets and unsupported automation shapes are rejected before any write.
-    pub fn import_guild_config(
-        &self,
+    pub fn prepare_guild_config_import(
         guild_id: &str,
         document: &serde_json::Value,
-    ) -> Result<ConfigImportSummary> {
+    ) -> Result<PreparedConfigImport> {
         if guild_id.trim().is_empty() || guild_id.len() > 64 {
             bail!("invalid_target_guild");
         }
@@ -4485,6 +4737,12 @@ impl Store {
             .get("workflows")
             .and_then(serde_json::Value::as_array)
             .ok_or_else(|| anyhow!("invalid_workflows"))?;
+        if object
+            .get("birthdays")
+            .is_some_and(|value| !value.is_array())
+        {
+            bail!("invalid_birthdays");
+        }
         let birthdays = object
             .get("birthdays")
             .and_then(serde_json::Value::as_array)
@@ -4499,6 +4757,7 @@ impl Store {
         }
 
         let secret_needles = ["secret", "token", "webhook", "credential"];
+        let mut seen_settings = std::collections::HashSet::new();
         let mut parsed_settings = Vec::with_capacity(settings.len());
         for item in settings {
             let key = item
@@ -4521,6 +4780,9 @@ impl Store {
                 .any(|needle| lower_key.contains(needle))
             {
                 bail!("secret_setting_rejected");
+            }
+            if !seen_settings.insert(key.clone()) {
+                bail!("duplicate_setting_key");
             }
             parsed_settings.push((key, value));
         }
@@ -4549,6 +4811,9 @@ impl Store {
                 || !(1..=64).contains(&author_id.len())
             {
                 bail!("invalid_tag_bounds");
+            }
+            if parsed_tags.iter().any(|(previous, _, _)| previous == &name) {
+                bail!("duplicate_tag");
             }
             parsed_tags.push((name, content, author_id));
         }
@@ -4583,6 +4848,9 @@ impl Store {
                 .ok_or_else(|| anyhow!("invalid_workflow_payload"))?
                 .trim()
                 .to_string();
+            if item.get("enabled").is_some_and(|value| !value.is_boolean()) {
+                bail!("invalid_workflow_enabled");
+            }
             let enabled = item
                 .get("enabled")
                 .and_then(serde_json::Value::as_bool)
@@ -4598,6 +4866,12 @@ impl Store {
                 || condition.len() > 200
             {
                 bail!("unsupported_workflow");
+            }
+            if parsed_workflows
+                .iter()
+                .any(|(previous, _, _, _, _)| previous == &name)
+            {
+                bail!("duplicate_workflow");
             }
             parsed_workflows.push((name, condition, action, payload, enabled));
         }
@@ -4627,21 +4901,214 @@ impl Store {
             parsed_birthdays.push((user_id, month as u32, day as u32));
         }
 
+        Ok(PreparedConfigImport {
+            settings: parsed_settings,
+            tags: parsed_tags,
+            workflows: parsed_workflows,
+            birthdays: parsed_birthdays,
+        })
+    }
+
+    pub fn import_guild_config(
+        &self,
+        guild_id: &str,
+        document: &serde_json::Value,
+    ) -> Result<ConfigImportSummary> {
+        let prepared = Self::prepare_guild_config_import(guild_id, document)?;
+        let skipped = prepared
+            .settings
+            .iter()
+            .map(|(key, _)| SkippedImportSetting {
+                key: key.clone(),
+                reason: "requires_authenticated_feature_validation".into(),
+            })
+            .collect::<Vec<_>>();
+        self.apply_guild_config_import(
+            guild_id,
+            &prepared,
+            "config-import",
+            &[],
+            &skipped,
+            &ConfigImportLimits::default(),
+        )
+    }
+
+    pub fn validate_guild_config_import_limits(
+        &self,
+        guild_id: &str,
+        prepared: &PreparedConfigImport,
+        limits: &ConfigImportLimits,
+    ) -> Result<()> {
         let conn = self.conn.lock().expect("store mutex poisoned");
         let tx = conn.unchecked_transaction()?;
-        for (key, value) in &parsed_settings {
-            tx.execute(
-                "INSERT INTO settings(guild_id,key,value,updated_at) VALUES(?1,?2,?3,?4) ON CONFLICT(guild_id,key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
-                params![guild_id, key, value, Utc::now().timestamp_millis()],
-            )?;
+        Self::validate_import_limits_on_tx(&tx, guild_id, prepared, limits)
+    }
+    fn validate_import_limits_on_tx(
+        tx: &rusqlite::Transaction<'_>,
+        guild_id: &str,
+        prepared: &PreparedConfigImport,
+        limits: &ConfigImportLimits,
+    ) -> Result<()> {
+        let parsed_tags = &prepared.tags;
+        let parsed_workflows = &prepared.workflows;
+        // Check merged counts under the same lock/transaction as publication.
+        if !parsed_tags.is_empty() {
+            let mut names = tx
+                .prepare("SELECT name FROM tags WHERE guild_id=?1")?
+                .query_map([guild_id], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<std::collections::HashSet<_>>>()?;
+            for (name, content, _) in parsed_tags {
+                if content.chars().count() > limits.tag_length {
+                    bail!("import_tag_length_exceeded");
+                }
+                names.insert(name.clone());
+            }
+            if names.len() > limits.tags {
+                bail!("import_tag_quota_exceeded");
+            }
         }
-        for (name, content, author_id) in &parsed_tags {
+        if !parsed_workflows.is_empty() {
+            let existing: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM workflows WHERE guild_id=?1",
+                [guild_id],
+                |row| row.get(0),
+            )?;
+            let mut count = existing;
+            for (name, _, action, payload, _) in parsed_workflows {
+                if action == "reply" && payload.len() > limits.reply_length {
+                    bail!("import_reply_length_exceeded");
+                }
+                let replaced:i64=tx.query_row("SELECT COUNT(*) FROM workflows WHERE guild_id=?1 AND name=?2 AND trigger='message'",params![guild_id,name],|row|row.get(0))?;
+                count = count - replaced + 1;
+            }
+            if count > limits.workflows as i64 {
+                bail!("import_workflow_quota_exceeded");
+            }
+        }
+        Ok(())
+    }
+
+    pub fn apply_guild_config_import(
+        &self,
+        guild_id: &str,
+        prepared: &PreparedConfigImport,
+        actor_id: &str,
+        features: &[ConfigImportFeature],
+        skipped_settings: &[SkippedImportSetting],
+        limits: &ConfigImportLimits,
+    ) -> Result<ConfigImportSummary> {
+        let PreparedConfigImport {
+            tags: parsed_tags,
+            workflows: parsed_workflows,
+            birthdays: parsed_birthdays,
+            ..
+        } = prepared;
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let tx = conn.unchecked_transaction()?;
+        Self::validate_import_limits_on_tx(&tx, guild_id, prepared, limits)?;
+        for feature in features {
+            let args = (
+                &tx,
+                guild_id,
+                feature.key.as_str(),
+                feature.enabled,
+                feature.config_json.as_str(),
+                Some(feature.expected_revision),
+                actor_id,
+                feature.projections.as_slice(),
+            );
+            match &feature.subscription {
+                ImportSubscription::None => Self::publish_feature_setting_on_tx(
+                    args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7,
+                )?,
+                ImportSubscription::YouTube(value) => Self::publish_youtube_feature_setting_on_tx(
+                    args.0,
+                    args.1,
+                    args.2,
+                    args.3,
+                    args.4,
+                    args.5,
+                    args.6,
+                    args.7,
+                    value.as_ref(),
+                )?,
+                ImportSubscription::Rss(value) => Self::publish_rss_feature_setting_on_tx(
+                    args.0,
+                    args.1,
+                    args.2,
+                    args.3,
+                    args.4,
+                    args.5,
+                    args.6,
+                    args.7,
+                    value.as_ref(),
+                )?,
+                ImportSubscription::Bluesky(value) => Self::publish_bluesky_feature_setting_on_tx(
+                    args.0,
+                    args.1,
+                    args.2,
+                    args.3,
+                    args.4,
+                    args.5,
+                    args.6,
+                    args.7,
+                    value.as_ref(),
+                )?,
+                ImportSubscription::TikTok(value) => Self::publish_tiktok_feature_setting_on_tx(
+                    args.0,
+                    args.1,
+                    args.2,
+                    args.3,
+                    args.4,
+                    args.5,
+                    args.6,
+                    args.7,
+                    value.as_ref(),
+                )?,
+                ImportSubscription::Twitch(value) => Self::publish_twitch_feature_setting_on_tx(
+                    args.0,
+                    args.1,
+                    args.2,
+                    args.3,
+                    args.4,
+                    args.5,
+                    args.6,
+                    args.7,
+                    value.as_ref(),
+                )?,
+                ImportSubscription::Instagram(value) => {
+                    Self::publish_instagram_feature_setting_on_tx(
+                        args.0,
+                        args.1,
+                        args.2,
+                        args.3,
+                        args.4,
+                        args.5,
+                        args.6,
+                        args.7,
+                        value.as_ref(),
+                    )?
+                }
+                ImportSubscription::Kick(value) => Self::publish_kick_feature_setting_on_tx(
+                    args.0,
+                    args.1,
+                    args.2,
+                    args.3,
+                    args.4,
+                    args.5,
+                    args.6,
+                    args.7,
+                    value.as_ref(),
+                )?,
+            };
+        }
+        for (name, content, _author_id) in parsed_tags {
             tx.execute(
                 "INSERT INTO tags(guild_id,name,content,author_id,created_at) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(guild_id,name) DO UPDATE SET content=excluded.content,author_id=excluded.author_id,created_at=excluded.created_at",
-                params![guild_id, name, content, author_id, Utc::now().timestamp_millis()],
+                params![guild_id, name, content, actor_id, Utc::now().timestamp_millis()],
             )?;
         }
-        for (name, condition, action, payload, enabled) in &parsed_workflows {
+        for (name, condition, action, payload, enabled) in parsed_workflows {
             tx.execute(
                 "DELETE FROM workflows WHERE guild_id=?1 AND name=?2 AND trigger='message'",
                 params![guild_id, name],
@@ -4651,7 +5118,7 @@ impl Store {
                 params![guild_id, name, condition, action, payload, i64::from(*enabled), Utc::now().timestamp_millis()],
             )?;
         }
-        for (user_id, month, day) in &parsed_birthdays {
+        for (user_id, month, day) in parsed_birthdays {
             tx.execute(
                 "INSERT INTO birthdays(guild_id,user_id,month,day,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?5) ON CONFLICT(guild_id,user_id) DO UPDATE SET month=excluded.month,day=excluded.day,last_announced_year=NULL,updated_at=excluded.updated_at",
                 params![guild_id, user_id, month, day, Utc::now().timestamp_millis()],
@@ -4659,7 +5126,8 @@ impl Store {
         }
         tx.commit()?;
         Ok(ConfigImportSummary {
-            settings: parsed_settings.len(),
+            settings: features.len(),
+            skipped_settings: skipped_settings.to_vec(),
             tags: parsed_tags.len(),
             workflows: parsed_workflows.len(),
             birthdays: parsed_birthdays.len(),
@@ -8343,13 +8811,14 @@ mod tests {
         let export = store.export_guild("source").unwrap();
 
         let imported = store.import_guild_config("target", &export).unwrap();
-        assert_eq!(imported.settings, 1);
+        assert_eq!(imported.settings, 0);
+        assert_eq!(imported.skipped_settings[0].key, "welcome.channel");
         assert_eq!(imported.tags, 1);
         assert_eq!(imported.workflows, 1);
         assert_eq!(imported.birthdays, 1);
         assert_eq!(
             store.get_setting("target", "welcome.channel").unwrap(),
-            Some("10".into())
+            None
         );
         assert_eq!(
             store.get_tag("target", "rules").unwrap().unwrap().content,
@@ -8397,6 +8866,80 @@ mod tests {
             .expect("imported reaction workflow");
         assert_eq!(workflow.action, "react");
         assert_eq!(workflow.payload, "✅");
+    }
+
+    #[test]
+    fn prepared_import_rolls_back_all_features_arrays_and_projections_on_revision_conflict() {
+        let store = Store::open(":memory:").unwrap();
+        store
+            .publish_feature_setting("target", "utility.help", true, "{}", None, "old", &[])
+            .unwrap();
+        let document = serde_json::json!({"version":1,"settings":[],"tags":[{"name":"rules","content":"hello","authorId":"forged"}],"workflows":[]});
+        let prepared = Store::prepare_guild_config_import("target", &document).unwrap();
+        let feature = |key: &str| ConfigImportFeature {
+            key: key.into(),
+            enabled: false,
+            config_json: "{}".into(),
+            expected_revision: 0,
+            projections: vec![(format!("feature.{key}"), "false".into())],
+            subscription: ImportSubscription::None,
+        };
+        assert!(
+            store
+                .apply_guild_config_import(
+                    "target",
+                    &prepared,
+                    "actor",
+                    &[feature("utility.reminders"), feature("utility.help")],
+                    &[],
+                    &ConfigImportLimits::default()
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .get_feature_setting("target", "utility.reminders")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .get_setting("target", "feature.utility.reminders")
+                .unwrap()
+                .is_none()
+        );
+        assert!(store.get_tag("target", "rules").unwrap().is_none());
+        assert_eq!(
+            store
+                .get_feature_setting("target", "utility.help")
+                .unwrap()
+                .unwrap()
+                .revision,
+            1
+        );
+    }
+
+    #[test]
+    fn prepared_import_rechecks_merged_workflow_quota_inside_transaction() {
+        let store = Store::open(":memory:").unwrap();
+        let document = serde_json::json!({"version":1,"settings":[],"tags":[],"workflows":[{"name":"new","trigger":"message","action":"reply","payload":"hi"}]});
+        let prepared = Store::prepare_guild_config_import("target", &document).unwrap();
+        let limits = ConfigImportLimits {
+            workflows: 1,
+            ..Default::default()
+        };
+        store
+            .validate_guild_config_import_limits("target", &prepared, &limits)
+            .unwrap();
+        store
+            .create_workflow("target", "concurrent", "message", "", "reply", "hi")
+            .unwrap();
+        assert!(
+            store
+                .apply_guild_config_import("target", &prepared, "actor", &[], &[], &limits)
+                .is_err()
+        );
+        assert_eq!(store.workflows("target", 100).unwrap().len(), 1);
     }
 
     #[test]

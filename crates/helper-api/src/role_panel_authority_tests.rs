@@ -187,3 +187,38 @@ async fn publication_routes_reject_above_publisher_before_discord_or_storage_mut
         server.abort();
     }
 }
+
+#[tokio::test]
+async fn config_import_rechecks_publisher_hierarchy_and_manage_roles() {
+    for (role, permissions) in [(HIGH, 32 | (1 << 28)), (LOW, 32)] {
+        let (state, claims, discord, server) = fixture().await;
+        discord.permissions.store(permissions, Ordering::SeqCst);
+        let store = state.store.clone();
+        let token = sign_session(&claims, &state.session_secret);
+        let document = serde_json::json!({"version":1,"settings":[
+            {"key":"feature.community.role_panels","value":"true"},
+            {"key":"feature.config.community.role_panels","value":serde_json::json!({"roleIds":[role]}).to_string()}
+        ],"tags":[{"name":"rules","content":"hello","authorId":"forged"}],"workflows":[]});
+        let response = router(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/config/import")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(document.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(
+            store
+                .get_feature_setting(GUILD, "community.role_panels")
+                .unwrap()
+                .is_none()
+        );
+        assert!(store.get_tag(GUILD, "rules").unwrap().is_none());
+        server.abort();
+    }
+}
