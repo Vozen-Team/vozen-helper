@@ -234,6 +234,15 @@ export function buildServer(opts: ServerOptions): FastifyInstance {
 
   // Termina a sessão: limpa o cookie e revoga o Bearer token (se enviado).
   app.post('/api/logout', async (req: FastifyRequest, reply: FastifyReply) => {
+    const bearer =
+      req.headers.authorization?.startsWith('Bearer ') &&
+      req.headers.authorization.slice(7).trim().length > 0;
+    const originCount = req.raw.rawHeaders.filter(
+      (value, index) => index % 2 === 0 && value.toLowerCase() === 'origin',
+    ).length;
+    if (!bearer && (originCount !== 1 || req.headers.origin !== opts.allowedOrigin)) {
+      return reply.code(403).send({ error: 'csrf_origin_invalid' });
+    }
     const at = now();
     const auth = req.headers.authorization;
     if (auth?.startsWith('Bearer ')) revokeIfValid(auth.slice(7), at);

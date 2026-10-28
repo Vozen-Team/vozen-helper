@@ -862,3 +862,76 @@ describe('loadApiEnv', () => {
     expect(() => loadApiEnv({ ...OK, CLIENT_ID: 'nope' })).toThrow(ApiConfigError);
   });
 });
+
+describe('logout origin boundary', () => {
+  it('rejects external, absent, duplicate and malformed origins without clearing the session', async () => {
+    for (const origin of [
+      undefined,
+      'https://attacker.invalid',
+      'null',
+      '',
+      ORIGIN + '.attacker.invalid',
+      ORIGIN + ', https://attacker.invalid',
+      [ORIGIN, ORIGIN],
+    ]) {
+      const app = makeApp(db, { id: ALLOWED, username: 'owner' });
+      const cookie = await login(app);
+      const headers: Record<string, string | string[]> = {};
+      if (origin !== undefined) headers.origin = origin;
+      const response = await app.inject({
+        method: 'POST',
+        url: '/api/logout',
+        headers,
+        cookies: { vh_session: cookie },
+      });
+      expect(response.statusCode).toBe(403);
+      expect(response.headers['set-cookie']).toBeUndefined();
+      const stillValid = await app.inject({
+        method: 'GET',
+        url: '/api/me',
+        cookies: { vh_session: cookie },
+      });
+      expect(stillValid.statusCode).toBe(200);
+      await app.close();
+    }
+  });
+
+  it('clears cookies only for the configured origin and keeps explicit Bearer clients working', async () => {
+    const app = makeApp(db, { id: ALLOWED, username: 'owner' });
+    const cookie = await login(app);
+    const logout = await app.inject({
+      method: 'POST',
+      url: '/api/logout',
+      headers: { origin: ORIGIN },
+      cookies: { vh_session: cookie },
+    });
+    expect(logout.statusCode).toBe(200);
+    expect(logout.cookies.some((value) => value.name === 'vh_session' && value.value === '')).toBe(
+      true,
+    );
+    await app.close();
+    for (const origin of [undefined, 'https://attacker.invalid']) {
+      const bearerApp = makeApp(db, { id: ALLOWED, username: 'owner' });
+      const token = await loginToken(bearerApp);
+      const valid = await bearerApp.inject({
+        method: 'GET',
+        url: '/api/me',
+        headers: { authorization: 'Bearer ' + token },
+      });
+      expect(valid.statusCode).toBe(200);
+      const response = await bearerApp.inject({
+        method: 'POST',
+        url: '/api/logout',
+        headers: { authorization: 'Bearer ' + token, ...(origin ? { origin } : {}) },
+      });
+      expect(response.statusCode).toBe(200);
+      const revoked = await bearerApp.inject({
+        method: 'GET',
+        url: '/api/me',
+        headers: { authorization: 'Bearer ' + token },
+      });
+      expect(revoked.statusCode).toBe(401);
+      await bearerApp.close();
+    }
+  });
+});
