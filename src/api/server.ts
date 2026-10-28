@@ -98,6 +98,13 @@ function jsonSize(value: unknown): number {
   return Buffer.byteLength(JSON.stringify(value), 'utf8');
 }
 
+function cookieOriginAllowed(req: FastifyRequest, allowedOrigin: string): boolean {
+  const originCount = req.raw.rawHeaders.filter(
+    (value, index) => index % 2 === 0 && value.toLowerCase() === 'origin',
+  ).length;
+  return originCount === 1 && req.headers.origin === allowedOrigin;
+}
+
 export interface ServerOptions {
   /** Application ID Discord esperada no token OAuth do painel. */
   clientId: string;
@@ -234,18 +241,17 @@ export function buildServer(opts: ServerOptions): FastifyInstance {
 
   // Termina a sessão: limpa o cookie e revoga o Bearer token (se enviado).
   app.post('/api/logout', async (req: FastifyRequest, reply: FastifyReply) => {
-    const bearer =
-      req.headers.authorization?.startsWith('Bearer ') &&
-      req.headers.authorization.slice(7).trim().length > 0;
-    const originCount = req.raw.rawHeaders.filter(
-      (value, index) => index % 2 === 0 && value.toLowerCase() === 'origin',
-    ).length;
-    if (!bearer && (originCount !== 1 || req.headers.origin !== opts.allowedOrigin)) {
-      return reply.code(403).send({ error: 'csrf_origin_invalid' });
-    }
     const at = now();
     const auth = req.headers.authorization;
-    if (auth?.startsWith('Bearer ')) revokeIfValid(auth.slice(7), at);
+    const rawBearer = auth?.startsWith('Bearer ') ? auth.slice(7) : undefined;
+    const bearer =
+      rawBearer !== undefined &&
+      !revoked.has(rawBearer, at) &&
+      verifySessionTokenClaims(rawBearer, opts.sessionSecret, at)?.userId === opts.allowedUserId;
+    if (!bearer && !cookieOriginAllowed(req, opts.allowedOrigin)) {
+      return reply.code(403).send({ error: 'csrf_origin_invalid' });
+    }
+    if (rawBearer) revokeIfValid(rawBearer, at);
     const cookieToken = req.cookies[COOKIE];
     if (cookieToken) {
       const unsigned = req.unsignCookie(cookieToken);
@@ -272,7 +278,18 @@ export function buildServer(opts: ServerOptions): FastifyInstance {
       const un = req.unsignCookie(raw);
       if (un.valid && !revoked.has(un.value, at)) {
         const claims = verifySessionTokenClaims(un.value, opts.sessionSecret, at);
-        if (claims?.userId === opts.allowedUserId) return;
+        if (claims?.userId === opts.allowedUserId) {
+          // Cookies são credenciais ambientes: só a origem do painel pode escrever.
+          // O Bearer válido já retornou acima e não depende desta restrição.
+          if (
+            req.method !== 'GET' &&
+            req.method !== 'HEAD' &&
+            !cookieOriginAllowed(req, opts.allowedOrigin)
+          ) {
+            await reply.code(403).send({ error: 'csrf_origin_invalid' });
+          }
+          return;
+        }
       }
     }
     await reply.code(401).send({ error: 'unauthenticated' });

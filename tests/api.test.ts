@@ -441,7 +441,7 @@ describe('auth por token (header Authorization)', () => {
     const logout = await app.inject({
       method: 'POST',
       url: '/api/logout',
-      headers: { authorization: 'Bearer valor-inválido-sem-registo' },
+      headers: { authorization: 'Bearer valor-inválido-sem-registo', origin: ORIGIN },
     });
     expect(logout.statusCode).toBe(200);
     const stillValid = await app.inject({
