@@ -2,10 +2,10 @@
 
 Bot público de Discord para moderação, automação e comunidade, multi-guild e
 self-hosted. É um produto independente do Vozen TTS, Music e RPG: partilha apenas
-o contrato central de entitlements, sem copiar código AGPL entre repositórios.
+o contrato central de entitlements.
 
-> **Código proprietário / não open source.** O acesso público é feito através da
-> instalação OAuth do bot; o código continua privado e sem licença OSS.
+> **Licença do código: AGPL-3.0-only.** Consulta o ficheiro [LICENSE](LICENSE).
+> Os componentes de terceiros conservam as respetivas licenças e avisos.
 
 ## Módulos
 
