@@ -2,12 +2,19 @@
 
 #![recursion_limit = "256"]
 
+mod config_import;
+use config_import::import_config;
+
 mod achievements;
 mod activity_feed;
+#[cfg(test)]
+mod discord_channel_tests;
 mod discord_context;
 mod discord_read;
 mod economy_shop;
 mod oauth_limits;
+#[cfg(test)]
+mod role_panel_authority_tests;
 mod session_authorization;
 mod starboard_channel;
 mod ticket_panel;
@@ -1629,6 +1636,7 @@ async fn create_youtube_subscription(
     let (source, target, template, mention, enabled, interval) =
         validate_youtube_subscription(input)
             .map_err(|code| client_error(StatusCode::BAD_REQUEST, code))?;
+    require_subscription_channel(&state, &claims.guild_id, &target).await?;
     let Some(client) = state.youtube.as_ref() else {
         return Err(client_error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1686,6 +1694,7 @@ async fn update_youtube_subscription(
     let (source, target, template, mention, enabled, interval) =
         validate_youtube_subscription(input)
             .map_err(|code| client_error(StatusCode::BAD_REQUEST, code))?;
+    require_subscription_channel(&state, &claims.guild_id, &target).await?;
     let Some(client) = state.youtube.as_ref() else {
         return Err(client_error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1873,7 +1882,7 @@ async fn test_youtube_delivery(
         )
     };
     let content = content.chars().take(2_000).collect::<String>();
-    discord_send_channel_message(&state.discord_token, &target, &content)
+    discord_send_channel_message(&state.discord_token, &claims.guild_id, &target, &content)
         .await
         .map_err(|error| {
             let status = if error == "discord_http_403" || error == "discord_http_401" {
@@ -2083,7 +2092,7 @@ async fn test_rss_delivery(
         )
     };
     let content = content.chars().take(2_000).collect::<String>();
-    discord_send_channel_message(&state.discord_token, &target, &content)
+    discord_send_channel_message(&state.discord_token, &claims.guild_id, &target, &content)
         .await
         .map_err(|error| {
             let status = if error == "discord_http_403" || error == "discord_http_401" {
@@ -2594,6 +2603,7 @@ async fn create_rss_subscription(
     require_feature_premium(&state, &claims, "social.rss").await?;
     let (feed_url, target, template, mention, enabled, interval) = validate_rss_subscription(input)
         .map_err(|code| client_error(StatusCode::BAD_REQUEST, code))?;
+    require_subscription_channel(&state, &claims.guild_id, &target).await?;
     let Some(client) = state.rss.as_ref() else {
         return Err(client_error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -2640,6 +2650,7 @@ async fn update_rss_subscription(
     require_feature_premium(&state, &claims, "social.rss").await?;
     let (feed_url, target, template, mention, enabled, interval) = validate_rss_subscription(input)
         .map_err(|code| client_error(StatusCode::BAD_REQUEST, code))?;
+    require_subscription_channel(&state, &claims.guild_id, &target).await?;
     let Some(client) = state.rss.as_ref() else {
         return Err(client_error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -2824,6 +2835,7 @@ async fn create_bluesky_subscription(
     let (handle, target, template, mention, enabled, interval) =
         validate_bluesky_subscription(input)
             .map_err(|code| client_error(StatusCode::BAD_REQUEST, code))?;
+    require_subscription_channel(&state, &claims.guild_id, &target).await?;
     let client = state
         .bluesky
         .as_ref()
@@ -2872,6 +2884,7 @@ async fn update_bluesky_subscription(
     let (handle, target, template, mention, enabled, interval) =
         validate_bluesky_subscription(input)
             .map_err(|code| client_error(StatusCode::BAD_REQUEST, code))?;
+    require_subscription_channel(&state, &claims.guild_id, &target).await?;
     let client = state
         .bluesky
         .as_ref()
@@ -3154,6 +3167,7 @@ async fn create_tiktok_subscription(
     let (source, target, template, mention, enabled, interval) =
         validate_tiktok_subscription(input)
             .map_err(|code| client_error(StatusCode::BAD_REQUEST, code))?;
+    require_subscription_channel(&state, &claims.guild_id, &target).await?;
     let client = tiktok_provider_for_guild(&state, &claims.guild_id).await?;
     if enabled {
         client
@@ -3194,6 +3208,7 @@ async fn update_tiktok_subscription(
     let (source, target, template, mention, enabled, interval) =
         validate_tiktok_subscription(input)
             .map_err(|code| client_error(StatusCode::BAD_REQUEST, code))?;
+    require_subscription_channel(&state, &claims.guild_id, &target).await?;
     let _client = tiktok_provider_for_guild(&state, &claims.guild_id).await?;
     let record = state
         .store
@@ -3272,7 +3287,7 @@ async fn test_tiktok_delivery(
         )
     };
     let content = content.chars().take(2_000).collect::<String>();
-    discord_send_channel_message(&state.discord_token, &target, &content)
+    discord_send_channel_message(&state.discord_token, &claims.guild_id, &target, &content)
         .await
         .map_err(|error| {
             let status = if error == "discord_http_403" || error == "discord_http_401" {
@@ -3477,6 +3492,7 @@ async fn create_instagram_subscription(
     let (username, target, template, mention, enabled, interval) =
         validate_instagram_subscription(input)
             .map_err(|code| client_error(StatusCode::BAD_REQUEST, code))?;
+    require_subscription_channel(&state, &claims.guild_id, &target).await?;
     let client = require_instagram_provider(&state)?;
     if enabled {
         client
@@ -3516,6 +3532,7 @@ async fn update_instagram_subscription(
     let (username, target, template, mention, enabled, interval) =
         validate_instagram_subscription(input)
             .map_err(|code| client_error(StatusCode::BAD_REQUEST, code))?;
+    require_subscription_channel(&state, &claims.guild_id, &target).await?;
     let _ = require_instagram_provider(&state)?;
     let record = state
         .store
@@ -3673,6 +3690,7 @@ async fn create_kick_subscription(
     require_feature_premium(&state, &claims, "social.kick").await?;
     let (source, target, template, mention, enabled, interval) = validate_kick_subscription(input)
         .map_err(|code| client_error(StatusCode::BAD_REQUEST, code))?;
+    require_subscription_channel(&state, &claims.guild_id, &target).await?;
     let client = require_kick_provider(&state)?;
     if enabled {
         client
@@ -3711,6 +3729,7 @@ async fn update_kick_subscription(
     require_feature_premium(&state, &claims, "social.kick").await?;
     let (source, target, template, mention, enabled, interval) = validate_kick_subscription(input)
         .map_err(|code| client_error(StatusCode::BAD_REQUEST, code))?;
+    require_subscription_channel(&state, &claims.guild_id, &target).await?;
     let _ = require_kick_provider(&state)?;
     let record = state
         .store
@@ -3893,6 +3912,19 @@ async fn prepare_twitch_feature(
     config: &serde_json::Value,
     enabled: bool,
 ) -> Result<Option<TwitchSubscriptionWrite>, (StatusCode, Json<ApiError>)> {
+    let subscription = prepare_twitch_feature_read_only(state, claims, config, enabled).await?;
+    if enabled && let Some(subscription) = &subscription {
+        ensure_twitch_subscription(state, subscription).await?;
+    }
+    Ok(subscription)
+}
+
+async fn prepare_twitch_feature_read_only(
+    state: &ApiState,
+    claims: &SessionClaims,
+    config: &serde_json::Value,
+    enabled: bool,
+) -> Result<Option<TwitchSubscriptionWrite>, (StatusCode, Json<ApiError>)> {
     let existing = state
         .store
         .twitch_subscriptions(&claims.guild_id)
@@ -3949,13 +3981,6 @@ async fn prepare_twitch_feature(
             "twitch_channel_not_found",
         ));
     };
-    client
-        .ensure_stream_online_subscription(&user.id)
-        .await
-        .map_err(|error| {
-            tracing::warn!(%error, "twitch EventSub subscription failed");
-            client_error(StatusCode::BAD_GATEWAY, "twitch_eventsub_unavailable")
-        })?;
     Ok(Some(TwitchSubscriptionWrite {
         source_login: user.login,
         source_user_id: user.id,
@@ -3965,6 +3990,24 @@ async fn prepare_twitch_feature(
         enabled: true,
         created_by: claims.user_id.clone(),
     }))
+}
+
+async fn ensure_twitch_subscription(
+    state: &ApiState,
+    subscription: &TwitchSubscriptionWrite,
+) -> Result<(), (StatusCode, Json<ApiError>)> {
+    let client = state
+        .twitch
+        .as_ref()
+        .ok_or_else(|| client_error(StatusCode::SERVICE_UNAVAILABLE, "provider_not_configured"))?;
+    client
+        .ensure_stream_online_subscription(&subscription.source_user_id)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error,"twitch EventSub subscription failed");
+            client_error(StatusCode::BAD_GATEWAY, "twitch_eventsub_unavailable")
+        })?;
+    Ok(())
 }
 
 async fn twitch_subscriptions(
@@ -3993,6 +4036,7 @@ async fn create_twitch_subscription(
     require_feature_premium(&state, &claims, "social.twitch").await?;
     let (login, target, template, mention, enabled) = validate_twitch_subscription(input)
         .map_err(|code| client_error(StatusCode::BAD_REQUEST, code))?;
+    require_subscription_channel(&state, &claims.guild_id, &target).await?;
     let Some(client) = state.twitch.as_ref() else {
         return Err(client_error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -4047,6 +4091,7 @@ async fn update_twitch_subscription(
     require_feature_premium(&state, &claims, "social.twitch").await?;
     let (login, target, template, mention, enabled) = validate_twitch_subscription(input)
         .map_err(|code| client_error(StatusCode::BAD_REQUEST, code))?;
+    require_subscription_channel(&state, &claims.guild_id, &target).await?;
     let Some(client) = state.twitch.as_ref() else {
         return Err(client_error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -4251,7 +4296,7 @@ async fn test_twitch_delivery(
         .chars()
         .take(2_000)
         .collect::<String>();
-    discord_send_channel_message(&state.discord_token, &target, &content)
+    discord_send_channel_message(&state.discord_token, &claims.guild_id, &target, &content)
         .await
         .map_err(|error| {
             let status = if error == "discord_http_403" || error == "discord_http_401" {
@@ -5154,8 +5199,72 @@ async fn discord_json(
 
 async fn discord_send_channel_message(
     discord_token: &str,
+    expected_guild_id: &str,
     channel_id: &str,
     content: &str,
+) -> Result<(), String> {
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|_| "discord_request_failed".to_string())?;
+    discord_send_channel_message_at(
+        &client,
+        DISCORD_API_BASE,
+        discord_token,
+        expected_guild_id,
+        channel_id,
+        content,
+    )
+    .await
+}
+
+async fn require_subscription_channel(
+    state: &ApiState,
+    guild_id: &str,
+    channel_id: &str,
+) -> Result<(), (StatusCode, Json<ApiError>)> {
+    #[cfg(test)]
+    let test_base = discord_channel_tests::TEST_BASE.try_with(Clone::clone).ok();
+    #[cfg(test)]
+    let api_base = test_base.as_deref().unwrap_or(DISCORD_API_BASE);
+    #[cfg(not(test))]
+    let api_base = DISCORD_API_BASE;
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|_| {
+            client_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "discord_adapter_unavailable",
+            )
+        })?;
+    discord_require_guild_channel_at(
+        &client,
+        api_base,
+        &state.discord_token,
+        guild_id,
+        channel_id,
+    )
+    .await
+    .map_err(|error| match error.as_str() {
+        "discord_channel_guild_mismatch" | "discord_channel_type_unsupported" => {
+            client_error(StatusCode::FORBIDDEN, "discord_channel_not_in_guild")
+        }
+        "invalid_discord_channel_id" | "invalid_discord_guild_id" => {
+            client_error(StatusCode::BAD_REQUEST, "invalid_discord_channel_id")
+        }
+        _ => client_error(StatusCode::BAD_GATEWAY, "discord_channel_unavailable"),
+    })
+}
+
+async fn discord_require_guild_channel_at(
+    client: &Client,
+    api_base: &str,
+    discord_token: &str,
+    expected_guild_id: &str,
+    channel_id: &str,
 ) -> Result<(), String> {
     if discord_token.len() < 20 {
         return Err("discord_adapter_unavailable".into());
@@ -5167,12 +5276,44 @@ async fn discord_send_channel_message(
     {
         return Err("invalid_discord_channel_id".into());
     }
-    let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(8))
-        .build()
-        .map_err(|_| "discord_request_failed".to_string())?;
+    if !is_discord_snowflake(expected_guild_id) {
+        return Err("invalid_discord_guild_id".into());
+    }
+    let channel = discord_read::get_json(
+        client,
+        &format!("Bot {discord_token}"),
+        &format!("{api_base}/channels/{channel_id}"),
+    )
+    .await?;
+    if channel["id"].as_str() != Some(channel_id)
+        || channel["guild_id"].as_str() != Some(expected_guild_id)
+    {
+        return Err("discord_channel_guild_mismatch".into());
+    }
+    if !matches!(channel["type"].as_i64(), Some(0 | 5 | 10 | 11 | 12)) {
+        return Err("discord_channel_type_unsupported".into());
+    }
+    Ok(())
+}
+
+async fn discord_send_channel_message_at(
+    client: &Client,
+    api_base: &str,
+    discord_token: &str,
+    expected_guild_id: &str,
+    channel_id: &str,
+    content: &str,
+) -> Result<(), String> {
+    discord_require_guild_channel_at(
+        client,
+        api_base,
+        discord_token,
+        expected_guild_id,
+        channel_id,
+    )
+    .await?;
     let response = client
-        .post(format!("{DISCORD_API_BASE}/channels/{channel_id}/messages"))
+        .post(format!("{api_base}/channels/{channel_id}/messages"))
         .header(header::AUTHORIZATION, format!("Bot {discord_token}"))
         .json(&serde_json::json!({
             "content": content,
@@ -5188,6 +5329,10 @@ async fn discord_send_channel_message(
 }
 
 async fn fetch_discord_guild_snapshot(guild_id: &str, discord_token: &str) -> DiscordGuildSnapshot {
+    #[cfg(test)]
+    if let Ok(snapshot) = config_import::TEST_SNAPSHOT.try_with(Clone::clone) {
+        return snapshot;
+    }
     static INFLIGHT: std::sync::OnceLock<discord_context::Inflight<DiscordGuildSnapshot>> =
         std::sync::OnceLock::new();
     // Scope sharing to both the guild and credential, without storing tokens in
@@ -5717,6 +5862,48 @@ fn ticket_staff_notification_issues(
     issues
 }
 
+async fn require_role_offers(
+    state: &ApiState,
+    guild_id: &str,
+    publisher_id: &str,
+    role_ids: &[String],
+) -> Result<(), (StatusCode, Json<ApiError>)> {
+    let (authority, roles) = state
+        .guild_authorization
+        .role_offer_context(state, guild_id, publisher_id)
+        .await?;
+    let guild_id = guild_id
+        .parse::<u64>()
+        .map_err(|_| client_error(StatusCode::FORBIDDEN, "role_not_offerable"))?;
+    if role_ids.is_empty()
+        || role_ids.iter().any(|id| {
+            let role = roles
+                .iter()
+                .find(|role| role["id"].as_str() == Some(id.as_str()));
+            !id.parse::<u64>().ok().is_some_and(|id| {
+                helper_core::role_offer_allowed(
+                    guild_id,
+                    id,
+                    role.and_then(|role| role["position"].as_i64()),
+                    role.and_then(|role| role["managed"].as_bool())
+                        .unwrap_or(true),
+                    &authority,
+                )
+            })
+        })
+    {
+        return Err(client_error(StatusCode::FORBIDDEN, "role_not_offerable"));
+    }
+    Ok(())
+}
+
+fn role_reference_is_assigned(path: &str) -> bool {
+    !matches!(
+        path.split(['.', '[']).next().unwrap_or(path),
+        "staffRole" | "requiredRole" | "ignoredRoles"
+    )
+}
+
 fn role_hierarchy_issues(
     guild_id: &str,
     bot_role_ids: &[String],
@@ -5737,10 +5924,9 @@ fn role_hierarchy_issues(
         .max()
         .unwrap_or(0);
     for (path, id) in configured_roles {
-        let field = path.split(['.', '[']).next().unwrap_or(path);
         // These roles are references used for authorization/exemptions. They
         // are never assigned by the bot, so hierarchy must not block them.
-        if matches!(field, "staffRole" | "requiredRole" | "ignoredRoles") {
+        if !role_reference_is_assigned(path) {
             continue;
         }
         let Some(role) = roles
@@ -5830,10 +6016,20 @@ fn channel_dependency_issues(
 }
 
 async fn generic_feature_preflight(
+    state: State<Arc<ApiState>>,
+    headers: HeaderMap,
+    key: String,
+    request: FeaturePreflightRequest,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
+    generic_feature_preflight_with_import(state, headers, key, request, None).await
+}
+
+async fn generic_feature_preflight_with_import(
     State(state): State<Arc<ApiState>>,
     headers: HeaderMap,
     key: String,
     request: FeaturePreflightRequest,
+    imported_enabled: Option<&std::collections::BTreeMap<String, bool>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
     let claims = require_auth(&state, &headers).await?;
     if key == "support.welcome_channel" {
@@ -5906,6 +6102,19 @@ async fn generic_feature_preflight(
         );
     }
 
+    if request.enabled && key == "community.role_panels" {
+        let role_ids = request.config["roleIds"]
+            .as_array()
+            .map(|ids| {
+                ids.iter()
+                    .filter_map(|id| id.as_str().map(str::to_owned))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if !role_ids.is_empty() {
+            require_role_offers(&state, &claims.guild_id, &claims.user_id, &role_ids).await?;
+        }
+    }
     let snapshot = fetch_discord_guild_snapshot(&claims.guild_id, &state.discord_token).await;
     let bot_permissions =
         effective_bot_permissions(&claims.guild_id, &snapshot.roles, &snapshot.bot_role_ids);
@@ -5925,7 +6134,10 @@ async fn generic_feature_preflight(
             if request.enabled
                 && let Some(required_feature) = internal_feature_dependency(dependency)
                 && required_feature != key
-                && !feature_enabled(&state, &claims.guild_id, required_feature)
+                && !imported_enabled
+                    .and_then(|features| features.get(required_feature))
+                    .copied()
+                    .unwrap_or_else(|| feature_enabled(&state, &claims.guild_id, required_feature))
             {
                 add_dependency_issue(
                     &mut issues,
@@ -6103,6 +6315,16 @@ async fn generic_feature_preflight(
                 "The Helper bot needs Manage Roles to assign achievement reward roles.".into(),
                 "error",
             );
+        }
+    }
+    if request.enabled && needs_role_management {
+        let assigned = configured_roles
+            .iter()
+            .filter(|(path, _)| role_reference_is_assigned(path))
+            .map(|(_, id)| id.clone())
+            .collect::<Vec<_>>();
+        if !assigned.is_empty() {
+            require_role_offers(&state, &claims.guild_id, &claims.user_id, &assigned).await?;
         }
     }
     if request.enabled && needs_role_management && snapshot.roles_ready && bot_context_available {
@@ -6657,6 +6879,7 @@ async fn discord_create_role(
 async fn discord_publish_role_panel(
     state: &ApiState,
     guild_id: &str,
+    publisher_id: &str,
     config: &serde_json::Value,
     reuse_existing: bool,
     source: &str,
@@ -6682,6 +6905,7 @@ async fn discord_publish_role_panel(
     if channel_id.is_empty() || role_ids.is_empty() {
         return Ok(None);
     }
+    require_role_offers(state, guild_id, publisher_id, &role_ids).await?;
     if reuse_existing
         && state
             .store
@@ -6796,7 +7020,8 @@ async fn discord_publish_role_panel(
                 "role_ids": role_ids,
                 "selection_mode": selection_mode,
                 "remove_on_unselect": remove_on_unselect,
-                "source": source
+                "source": source,
+                "publisher_id": publisher_id
             })
             .to_string(),
         )
@@ -6989,11 +7214,16 @@ async fn create_role_panel(
             "role_panel_quota_exceeded",
         ));
     }
-    let message_id = discord_publish_role_panel(&state, &claims.guild_id, &config, false, "panel")
-        .await?
-        .ok_or_else(|| {
-            client_error(StatusCode::BAD_GATEWAY, "discord_role_panel_publish_failed")
-        })?;
+    let message_id = discord_publish_role_panel(
+        &state,
+        &claims.guild_id,
+        &claims.user_id,
+        &config,
+        false,
+        "panel",
+    )
+    .await?
+    .ok_or_else(|| client_error(StatusCode::BAD_GATEWAY, "discord_role_panel_publish_failed"))?;
     let enabled_value = "true".to_owned();
     let mut projections = vec![
         (feature_key("community.role_panels"), enabled_value),
@@ -7081,11 +7311,16 @@ async fn update_role_panel(
             "feature_preflight_failed",
         ));
     }
-    let new_id = discord_publish_role_panel(&state, &claims.guild_id, &config, false, "update")
-        .await?
-        .ok_or_else(|| {
-            client_error(StatusCode::BAD_GATEWAY, "discord_role_panel_publish_failed")
-        })?;
+    let new_id = discord_publish_role_panel(
+        &state,
+        &claims.guild_id,
+        &claims.user_id,
+        &config,
+        false,
+        "update",
+    )
+    .await?
+    .ok_or_else(|| client_error(StatusCode::BAD_GATEWAY, "discord_role_panel_publish_failed"))?;
     if !old_channel_id.is_empty() {
         let _ = discord_delete_role_panel(&state, &old_channel_id, &message_id).await;
     }
@@ -7203,11 +7438,16 @@ async fn repair_role_panel(
         "selectionMode": panel.get("selection_mode").and_then(serde_json::Value::as_str).unwrap_or("multiple"),
         "removeOnUnselect": panel.get("remove_on_unselect").and_then(serde_json::Value::as_bool).unwrap_or(true),
     });
-    let new_id = discord_publish_role_panel(&state, &claims.guild_id, &config, false, "repair")
-        .await?
-        .ok_or_else(|| {
-            client_error(StatusCode::BAD_GATEWAY, "discord_role_panel_publish_failed")
-        })?;
+    let new_id = discord_publish_role_panel(
+        &state,
+        &claims.guild_id,
+        &claims.user_id,
+        &config,
+        false,
+        "repair",
+    )
+    .await?
+    .ok_or_else(|| client_error(StatusCode::BAD_GATEWAY, "discord_role_panel_publish_failed"))?;
     // Publish first so a Discord failure never destroys the last known-good
     // panel. Cleanup is best-effort after the replacement is stored.
     if !channel_id.is_empty() {
@@ -7304,6 +7544,18 @@ async fn quick_setup_step(
             "invalid_quick_setup_status",
         ));
     }
+    if step == "roles"
+        && update.status == "applied"
+        && update.enabled
+        && state
+            .guild_authorization
+            .permissions(&state, &claims)
+            .await?
+            & ((1 << 28) | 8)
+            == 0
+    {
+        return Err(client_error(StatusCode::FORBIDDEN, "role_not_offerable"));
+    }
     let mut value = read_quick_setup(&state, &claims.guild_id);
     let revision = value["revision"].as_u64().unwrap_or(0);
     if update
@@ -7386,6 +7638,17 @@ async fn quick_setup_step(
                 &normalized_config,
             )?,
             "roles" => {
+                if update.enabled {
+                    let ids = normalized_config["roleIds"]
+                        .as_array()
+                        .map(|ids| {
+                            ids.iter()
+                                .filter_map(|id| id.as_str().map(str::to_owned))
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    require_role_offers(&state, &claims.guild_id, &claims.user_id, &ids).await?;
+                }
                 publish_quick_setup_feature(
                     &state,
                     &claims.guild_id,
@@ -7398,6 +7661,7 @@ async fn quick_setup_step(
                     && let Some(message_id) = discord_publish_role_panel(
                         &state,
                         &claims.guild_id,
+                        &claims.user_id,
                         &normalized_config,
                         true,
                         "quick_setup",
@@ -11356,53 +11620,6 @@ async fn privacy_delete(
     })))
 }
 
-async fn import_config(
-    State(state): State<Arc<ApiState>>,
-    headers: HeaderMap,
-    Json(document): Json<serde_json::Value>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    let claims = require_mutation_auth(&state, &headers).await?;
-    let summary = state
-        .store
-        .import_guild_config(&claims.guild_id, &document)
-        .map_err(|error| {
-            let code = error.to_string();
-            let invalid = [
-                "invalid_target_guild",
-                "config_too_large",
-                "invalid_config_document",
-                "unsupported_config_version",
-                "invalid_settings",
-                "invalid_tags",
-                "invalid_workflows",
-                "config_limits_exceeded",
-                "invalid_setting_key",
-                "invalid_setting_value",
-                "invalid_setting_bounds",
-                "secret_setting_rejected",
-                "invalid_tag_name",
-                "invalid_tag_content",
-                "invalid_tag_author",
-                "invalid_tag_bounds",
-                "invalid_workflow_name",
-                "invalid_workflow_trigger",
-                "invalid_workflow_action",
-                "invalid_workflow_payload",
-                "unsupported_workflow",
-            ];
-            if invalid.contains(&code.as_str()) {
-                client_error(StatusCode::BAD_REQUEST, "invalid_config_import")
-            } else {
-                client_error(StatusCode::INTERNAL_SERVER_ERROR, "store_error")
-            }
-        })?;
-    Ok(Json(serde_json::json!({
-        "ok": true,
-        "guildId": claims.guild_id,
-        "imported": summary,
-    })))
-}
-
 #[derive(Debug, Deserialize)]
 struct WorkflowRequest {
     name: String,
@@ -14945,7 +15162,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             store.get_setting("guild-a", "welcome.channel").unwrap(),
-            Some("123".into())
+            None
         );
         assert!(
             store

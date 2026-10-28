@@ -61,7 +61,9 @@ mod activity_observer;
 mod economy_shop;
 pub mod giveaway_card;
 mod giveaway_display;
+mod guild_delivery;
 pub mod leaderboard_card;
+mod manual_moderation;
 pub mod poll_card;
 mod poll_display;
 mod private_replies;
@@ -1764,7 +1766,7 @@ impl EventHandler for Handler {
                     .required(false),
                 ),
             CreateCommand::new("event-list").description("List native Discord scheduled events"),
-            CreateCommand::new("event-edit")
+            event_management_command("event-edit")
                 .description("Edit a native Discord scheduled event")
                 .add_option(
                     CreateCommandOption::new(
@@ -1840,7 +1842,7 @@ impl EventHandler for Handler {
                     )
                     .required(true),
                 ),
-            CreateCommand::new("event-cancel")
+            event_management_command("event-cancel")
                 .description("Cancel a native Discord scheduled event")
                 .add_option(
                     CreateCommandOption::new(
@@ -2599,6 +2601,7 @@ impl EventHandler for Handler {
                 if action == "quarantine"
                     && let Some(role_id) =
                         setting_u64_optional(&self.store, &guild_text, "security.join_gate.role_id")
+                    && join_gate_role_allowed(&ctx, &self.store, guild_id, role_id).await
                 {
                     let _ = new_member.add_role(&ctx.http, RoleId::new(role_id)).await;
                 }
@@ -2635,6 +2638,7 @@ impl EventHandler for Handler {
                 }
             } else if let Some(role_id) =
                 setting_u64_optional(&self.store, &guild_text, "security.join_gate.auto_role_id")
+                && join_gate_role_allowed(&ctx, &self.store, guild_id, role_id).await
             {
                 let _ = new_member.add_role(&ctx.http, RoleId::new(role_id)).await;
             }
@@ -4467,11 +4471,13 @@ async fn process_youtube_subscription(
         &video,
         &subscription.source_channel_id,
     );
-    let channel_id = subscription
-        .target_channel_id
-        .parse::<u64>()
-        .map_err(|_| anyhow::anyhow!("invalid_discord_channel_id"))?;
-    ChannelId::new(channel_id).say(http, content).await?;
+    guild_delivery::send(
+        http,
+        &subscription.guild_id,
+        &subscription.target_channel_id,
+        content,
+    )
+    .await?;
     store.update_youtube_poll(subscription.id, Some(&video.id), next(), 0, None)?;
     Ok(())
 }
@@ -4571,11 +4577,14 @@ async fn process_rss_subscription(
         return Ok(());
     }
     let content = format_rss_message(&subscription.message_template, &subscription.mention, &item);
-    let channel_id = subscription
-        .target_channel_id
-        .parse::<u64>()
-        .map_err(|_| anyhow::anyhow!("invalid_discord_channel_id"))?;
-    if let Err(error) = ChannelId::new(channel_id).say(http, content).await {
+    if let Err(error) = guild_delivery::send(
+        http,
+        &subscription.guild_id,
+        &subscription.target_channel_id,
+        content,
+    )
+    .await
+    {
         let failures = subscription.failure_count.saturating_add(1).min(8);
         let backoff = rss_retry_seconds(subscription.interval_seconds, failures);
         // Do not advance last_item_id until Discord confirms delivery.  The
@@ -4588,7 +4597,7 @@ async fn process_rss_subscription(
             failures,
             Some("discord_delivery_failed"),
         )?;
-        return Err(error.into());
+        return Err(error);
     }
     store.update_rss_poll(subscription.id, Some(&item.id), next(), 0, None)?;
     Ok(())
@@ -5237,11 +5246,13 @@ async fn process_bluesky_subscription(
     }
     let content =
         format_bluesky_message(&subscription.message_template, &subscription.mention, &post);
-    let channel_id = subscription
-        .target_channel_id
-        .parse::<u64>()
-        .map_err(|_| anyhow::anyhow!("invalid_discord_channel_id"))?;
-    ChannelId::new(channel_id).say(http, content).await?;
+    guild_delivery::send(
+        http,
+        &subscription.guild_id,
+        &subscription.target_channel_id,
+        content,
+    )
+    .await?;
     store.update_bluesky_poll(subscription.id, Some(&post.uri), next(), 0, None)?;
     Ok(())
 }
@@ -5423,11 +5434,13 @@ async fn process_tiktok_subscription(
         &subscription.source_label,
         &video,
     );
-    let channel_id = subscription
-        .target_channel_id
-        .parse::<u64>()
-        .map_err(|_| anyhow::anyhow!("invalid_discord_channel_id"))?;
-    ChannelId::new(channel_id).say(http, content).await?;
+    guild_delivery::send(
+        http,
+        &subscription.guild_id,
+        &subscription.target_channel_id,
+        content,
+    )
+    .await?;
     store.update_tiktok_poll(subscription.id, Some(&video.id), next(), 0, None)?;
     Ok(())
 }
@@ -5538,11 +5551,13 @@ async fn process_instagram_subscription(
         &subscription.source_label,
         &item,
     );
-    let channel_id = subscription
-        .target_channel_id
-        .parse::<u64>()
-        .map_err(|_| anyhow::anyhow!("invalid_discord_channel_id"))?;
-    ChannelId::new(channel_id).say(http, content).await?;
+    guild_delivery::send(
+        http,
+        &subscription.guild_id,
+        &subscription.target_channel_id,
+        content,
+    )
+    .await?;
     store.update_instagram_poll(subscription.id, Some(&item.id), next(), 0, None)?;
     Ok(())
 }
@@ -5643,11 +5658,13 @@ async fn process_kick_subscription(
         &subscription.source_handle,
         &stream,
     );
-    let channel_id = subscription
-        .target_channel_id
-        .parse::<u64>()
-        .map_err(|_| anyhow::anyhow!("invalid_discord_channel_id"))?;
-    ChannelId::new(channel_id).say(http, content).await?;
+    guild_delivery::send(
+        http,
+        &subscription.guild_id,
+        &subscription.target_channel_id,
+        content,
+    )
+    .await?;
     store.update_kick_poll(subscription.id, Some(&stream.id), next(), 0, None)?;
     Ok(())
 }
@@ -5720,11 +5737,14 @@ async fn process_twitch_subscription(
             .as_deref()
             .unwrap_or_default(),
     );
-    let channel_id = subscription
-        .target_channel_id
-        .parse::<u64>()
-        .map_err(|_| anyhow::anyhow!("invalid_discord_channel_id"))?;
-    if let Err(error) = ChannelId::new(channel_id).say(http, content).await {
+    if let Err(error) = guild_delivery::send(
+        http,
+        &subscription.guild_id,
+        &subscription.target_channel_id,
+        content,
+    )
+    .await
+    {
         let failures = subscription.failure_count.saturating_add(1).min(8);
         let backoff = 5_i64 * (1_i64 << failures.min(6));
         store.retry_twitch_event(
@@ -5734,7 +5754,7 @@ async fn process_twitch_subscription(
             failures,
             Some("discord_delivery_failed"),
         )?;
-        return Err(error.into());
+        return Err(error);
     }
     store.ack_twitch_event(subscription.id, event_id, i64::MAX, 0, None)?;
     Ok(())
@@ -6333,6 +6353,44 @@ impl Handler {
                     ctx,
                     command,
                     "Não tens a permissão necessária para este comando.",
+                )
+                .await;
+            }
+        }
+        if helper_core::manual_moderation::permissions(&command.data.name).is_some()
+            && let Some(guild_id) = command.guild_id
+        {
+            let target = if command.data.name == "unban" {
+                option_string(command, "user_id")
+                    .and_then(|id| id.parse::<u64>().ok())
+                    .filter(|id| *id > 0)
+            } else {
+                command
+                    .data
+                    .options
+                    .iter()
+                    .find_map(|option| match option.value {
+                        CommandDataOptionValue::User(user) => Some(user.get()),
+                        _ => None,
+                    })
+            };
+            let Some(target) = target else {
+                return respond(ctx, command, "Indica um membro.").await;
+            };
+            if !manual_moderation::allowed(
+                &ctx.http,
+                guild_id.get(),
+                command.user.id.get(),
+                target,
+                &command.data.name,
+                &[],
+            )
+            .await
+            {
+                return respond(
+                    ctx,
+                    command,
+                    "Unable to perform the action; check permissions and role hierarchy.",
                 )
                 .await;
             }
@@ -8044,6 +8102,9 @@ impl Handler {
                 let Some(record) = self.store.get_quarantine(&guild_id.to_string(), &target.to_string())? else {
                     return respond(ctx, command, "Esse membro não está em quarantine.").await;
                 };
+                if !manual_moderation::allowed(&ctx.http, guild_id.get(), command.user.id.get(), target.get(), "unquarantine", &record.role_ids).await {
+                    return respond(ctx, command, "Unable to perform the action; check permissions and role hierarchy.").await;
+                }
                 let member = guild_id.member(&ctx.http, target).await?;
                 let role_member = &member;
                 let role_http = &ctx.http;
@@ -8063,28 +8124,40 @@ impl Handler {
                 };
                 let enabled = option_bool(command, "enabled").unwrap_or(false);
                 let minimum_age = option_i64(command, "min_age_days").unwrap_or(0).clamp(0, 365);
-                self.store.set_setting(
-                    &guild_id.to_string(),
-                    "security.join_gate.enabled",
-                    if enabled { "true" } else { "false" },
-                )?;
-                self.store.set_setting(
-                    &guild_id.to_string(),
-                    "security.join_gate.min_age_days",
-                    &minimum_age.to_string(),
-                )?;
-                if let Some(role_id) = command.data.options.iter().find_map(|option| {
-                    (option.name == "role").then_some(match option.value {
-                        CommandDataOptionValue::Role(role) => role,
-                        _ => return None,
-                    })
-                }) {
-                    self.store.set_setting(
-                        &guild_id.to_string(),
-                        "security.join_gate.role_id",
-                        &role_id.to_string(),
-                    )?;
+                let guild_text = guild_id.to_string();
+                let adapter = helper_core::feature_adapter("protection.join_gate").expect("join gate adapter");
+                let mut config = self.store.get_feature_setting(&guild_text, "protection.join_gate")?
+                    .and_then(|record| serde_json::from_str::<serde_json::Value>(&record.config_json).ok())
+                    .unwrap_or_else(|| {
+                        let mut config = adapter.descriptor().defaults;
+                        config["requireAvatar"] = serde_json::json!(setting_bool(&self.store, &guild_text, "security.join_gate.require_avatar", false));
+                        config["action"] = serde_json::json!(setting_string(&self.store, &guild_text, "security.join_gate.action").unwrap_or_else(|| "quarantine".into()));
+                        config["logChannel"] = serde_json::json!(setting_string(&self.store, &guild_text, "security.join_gate.log_channel").unwrap_or_default());
+                        config["blockedNamePatterns"] = setting_string(&self.store, &guild_text, "security.join_gate.blocked_name_patterns")
+                            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok()).filter(serde_json::Value::is_array).unwrap_or_else(|| serde_json::json!([]));
+                        config
+                    });
+                config["minimumAccountDays"] = serde_json::json!(minimum_age);
+                config["verifiedRole"] = serde_json::json!(option_role(command, "role").map(|role| role.to_string())
+                    .or_else(|| setting_string(&self.store, &guild_text, "security.join_gate.role_id")).unwrap_or_default());
+                config["autoRole"] = serde_json::json!(setting_string(&self.store, &guild_text, "security.join_gate.auto_role_id").unwrap_or_default());
+                let role_ids = ["verifiedRole", "autoRole"].iter().filter_map(|key| config[*key].as_str())
+                    .filter(|id| !id.is_empty()).map(str::parse::<u64>).collect::<std::result::Result<Vec<_>, _>>();
+                let role_ids = match role_ids {
+                    Ok(ids) => ids,
+                    Err(_) if !enabled && option_role(command, "role").is_none() => Vec::new(),
+                    Err(_) => return respond(ctx, command, "Indica pelo menos um cargo válido.").await,
+                };
+                if enabled || option_role(command, "role").is_some() {
+                    let roles = guild_id.roles(&ctx.http).await?;
+                    if !role_ids.is_empty() && !role_publisher_allowed(ctx, guild_id, command.user.id, &roles, &role_ids).await.unwrap_or(false) {
+                        return respond(ctx, command, "Unable to perform the action; check permissions and role hierarchy.").await;
+                    }
                 }
+                let mut projections = adapter.runtime_projection(&config);
+                projections.push(("feature.protection.join_gate".into(), enabled.to_string()));
+                projections.push(("feature.config.protection.join_gate".into(), config.to_string()));
+                self.store.publish_feature_setting(&guild_text, "protection.join_gate", enabled, &config.to_string(), None, &command.user.id.to_string(), &projections)?;
                 if enabled {
                     let role_note = private_replies::current_text(if option_role(command, "role").is_some() {
                         "; verification role updated"
@@ -8101,8 +8174,7 @@ impl Handler {
                     return respond(ctx, command, "Este comando só pode ser usado num servidor.").await;
                 };
                 let guild_text = guild_id.to_string();
-                let enabled = self.store.get_setting(&guild_text, "security.join_gate.enabled")?
-                    .is_some_and(|value| value == "true");
+                let enabled = feature_enabled(&self.store, &guild_text, "protection.join_gate", Some("security.join_gate.enabled"));
                 let Some(verified_role_id) = setting_u64_optional(
                     &self.store,
                     &guild_text,
@@ -8112,6 +8184,9 @@ impl Handler {
                 };
                 if !enabled {
                     return respond(ctx, command, "Ativa primeiro o `/join-gate`; o painel não deve ficar exposto enquanto o gate está desligado.").await;
+                }
+                if !join_gate_role_allowed(ctx, &self.store, guild_id, verified_role_id).await {
+                    return respond(ctx, command, "Configure a verified-member role in Join Gate before posting a verification panel.").await;
                 }
                 command.channel_id.send_message(
                     &ctx.http,
@@ -9103,6 +9178,9 @@ impl Handler {
                 if buttons.is_empty() {
                     return respond(ctx, command, "Indica pelo menos um cargo válido.").await;
                 }
+                if !role_publisher_allowed(ctx, guild_id, command.user.id, &guild_roles, &role_ids).await.unwrap_or(false) {
+                    return respond(ctx, command, "Unable to perform the action; check permissions and role hierarchy.").await;
+                }
                 let panel_channel = setting_string(&self.store, &guild_text, "community.role_panels.channel_id")
                     .and_then(|value| value.parse::<u64>().ok())
                     .map(ChannelId::new)
@@ -9125,6 +9203,7 @@ impl Handler {
                         "message_id": message.id,
                         "title": title,
                         "role_ids": role_ids,
+                        "publisher_id": command.user.id.to_string(),
                         "selection_mode": selection_mode,
                         "remove_on_unselect": setting_bool(
                             &self.store,
@@ -9468,33 +9547,17 @@ impl Handler {
                         true,
                     )
                 });
-            let roles = guild_id.roles(&ctx.http).await?;
-            let Some(role) = roles.get(&role_id) else {
-                return respond_component(ctx, component, "That role no longer exists.").await;
+            let Some(publisher_id) = stored_role_panel_publisher(panel.as_ref()) else {
+                return respond_component(ctx, component, "This role panel is no longer valid.")
+                    .await;
             };
-            if role.managed {
-                return respond_component(
-                    ctx,
-                    component,
-                    "Managed Discord roles cannot be assigned.",
-                )
-                .await;
-            }
-            let bot_user = ctx.http.get_current_user().await?;
-            let bot_member = guild_id.member(&ctx.http, bot_user.id).await?;
-            let bot_top_position = bot_member
-                .roles
-                .iter()
-                .filter_map(|id| roles.get(id).map(|item| item.position))
-                .max()
-                .unwrap_or(0);
-            if role.position >= bot_top_position {
-                return respond_component(
-                    ctx,
-                    component,
-                    "That role is above the Helper's highest role.",
-                )
-                .await;
+            let roles = guild_id.roles(&ctx.http).await?;
+            if !role_publisher_allowed(ctx, guild_id, publisher_id, &roles, &panel_roles)
+                .await
+                .unwrap_or(false)
+            {
+                return respond_component(ctx, component, "This role panel is no longer valid.")
+                    .await;
             }
             let member = guild_id.member(&ctx.http, component.user.id).await?;
             let decision = evaluate_role_panel(&RolePanelObservation {
@@ -9574,23 +9637,34 @@ impl Handler {
                 )
                 .await;
             };
+            let quarantine = setting_u64_optional(
+                &self.store,
+                &guild_id.to_string(),
+                "security.join_gate.role_id",
+            );
+            let quarantine_allowed = if let Some(role) = quarantine {
+                join_gate_role_allowed(ctx, &self.store, guild_id, role).await
+            } else {
+                true
+            };
+            if !join_gate_role_allowed(ctx, &self.store, guild_id, verified_role_id).await
+                || !quarantine_allowed
+            {
+                return respond_component(
+                    ctx,
+                    component,
+                    "This verification panel needs a configured verified-member role.",
+                )
+                .await;
+            }
             let member = guild_id.member(&ctx.http, component.user.id).await?;
             let decision = evaluate_join_gate_verification(
                 &member.roles,
-                setting_u64_optional(
-                    &self.store,
-                    &guild_id.to_string(),
-                    "security.join_gate.role_id",
-                )
-                .map(RoleId::new),
+                quarantine.map(RoleId::new),
                 RoleId::new(verified_role_id),
             );
             if decision.remove_quarantine_role
-                && let Some(quarantine_role_id) = setting_u64_optional(
-                    &self.store,
-                    &guild_id.to_string(),
-                    "security.join_gate.role_id",
-                )
+                && let Some(quarantine_role_id) = quarantine
             {
                 member
                     .remove_role(&ctx.http, RoleId::new(quarantine_role_id))
@@ -10005,7 +10079,7 @@ impl Handler {
                         for chunk in transcript.as_bytes().chunks(1_800) {
                             let text = String::from_utf8_lossy(chunk);
                             let _ = ChannelId::new(transcript_channel)
-                                .say(&ctx.http, text)
+                                .send_message(&ctx.http, transcript_message(&text))
                                 .await;
                         }
                     }
@@ -10098,6 +10172,16 @@ async fn respond(ctx: &Context, command: &CommandInteraction, content: &str) -> 
 async fn respond_raw(ctx: &Context, command: &CommandInteraction, content: &str) -> Result<()> {
     command.edit_response(ctx, raw_feedback(content)).await?;
     Ok(())
+}
+
+fn transcript_message(content: &str) -> CreateMessage {
+    CreateMessage::new()
+        .content(content)
+        .allowed_mentions(CreateAllowedMentions::new())
+}
+
+fn event_management_command(name: &str) -> CreateCommand {
+    CreateCommand::new(name).default_member_permissions(Permissions::MANAGE_EVENTS)
 }
 
 fn raw_feedback(content: &str) -> EditInteractionResponse {
@@ -11747,11 +11831,11 @@ async fn apply_lockdown(
 }
 
 fn required_permission(command: &str) -> Option<Permissions> {
+    if let Some(required) = helper_core::manual_moderation::permissions(command) {
+        return Some(Permissions::from_bits_retain(required.actor));
+    }
     match command {
-        "warn" | "violation" | "timeout" | "untimeout" | "note" | "reason" | "quarantine"
-        | "unquarantine" | "modlogs" | "cases" => Some(Permissions::MODERATE_MEMBERS),
-        "kick" => Some(Permissions::KICK_MEMBERS),
-        "ban" | "unban" | "tempban" | "softban" => Some(Permissions::BAN_MEMBERS),
+        "reason" | "modlogs" | "cases" => Some(Permissions::MODERATE_MEMBERS),
         "purge" => Some(Permissions::MANAGE_MESSAGES),
         "ticket-panel" | "ticket-config" | "ticket-update" => Some(Permissions::MANAGE_CHANNELS),
         "slowmode" | "lockdown" | "unlock" => Some(Permissions::MANAGE_CHANNELS),
@@ -11761,9 +11845,8 @@ fn required_permission(command: &str) -> Option<Permissions> {
         "anti-raid" => Some(Permissions::MANAGE_GUILD),
         "security-mode" => Some(Permissions::MANAGE_GUILD),
         "anti-nuke" => Some(Permissions::MANAGE_GUILD),
-        "event-create" | "event-edit" | "event-cancel" | "event-attendees" => {
-            Some(Permissions::CREATE_EVENTS)
-        }
+        "event-create" | "event-attendees" => Some(Permissions::CREATE_EVENTS),
+        "event-edit" | "event-cancel" => Some(Permissions::MANAGE_EVENTS),
         "invites" => Some(Permissions::MANAGE_GUILD),
         "temp-channel" => Some(Permissions::MANAGE_CHANNELS),
         "embed" => Some(Permissions::MANAGE_MESSAGES),
@@ -13367,6 +13450,109 @@ fn approved_wallet_contract(value: &str) -> bool {
             })
 }
 
+fn join_gate_publisher(
+    store: &Store,
+    guild_id: &str,
+    role_id: u64,
+) -> Option<serenity::all::UserId> {
+    let record = store
+        .get_feature_setting(guild_id, "protection.join_gate")
+        .ok()??;
+    if !record.enabled {
+        return None;
+    }
+    let config: serde_json::Value = serde_json::from_str(&record.config_json).ok()?;
+    if !["verifiedRole", "autoRole"]
+        .iter()
+        .any(|key| config[*key].as_str().and_then(|id| id.parse::<u64>().ok()) == Some(role_id))
+    {
+        return None;
+    }
+    record
+        .updated_by
+        .parse::<u64>()
+        .ok()
+        .filter(|id| *id > 0)
+        .map(serenity::all::UserId::new)
+}
+
+async fn join_gate_role_allowed(
+    ctx: &Context,
+    store: &Store,
+    guild_id: serenity::all::GuildId,
+    role_id: u64,
+) -> bool {
+    let Some(publisher) = join_gate_publisher(store, &guild_id.to_string(), role_id) else {
+        return false;
+    };
+    let Ok(roles) = guild_id.roles(&ctx.http).await else {
+        return false;
+    };
+    role_publisher_allowed(ctx, guild_id, publisher, &roles, &[role_id])
+        .await
+        .unwrap_or(false)
+}
+
+fn stored_role_panel_publisher(panel: Option<&serde_json::Value>) -> Option<serenity::all::UserId> {
+    panel?
+        .get("publisher_id")?
+        .as_str()?
+        .parse::<u64>()
+        .ok()
+        .filter(|id| *id != 0)
+        .map(serenity::all::UserId::new)
+}
+
+async fn role_publisher_allowed(
+    ctx: &Context,
+    guild_id: serenity::all::GuildId,
+    publisher_id: serenity::all::UserId,
+    roles: &HashMap<RoleId, serenity::all::Role>,
+    role_ids: &[u64],
+) -> Result<bool> {
+    let guild = guild_id.to_partial_guild(&ctx.http).await?;
+    let actor = guild_id.member(&ctx.http, publisher_id).await?;
+    let bot_user = ctx.http.get_current_user().await?;
+    let bot = guild_id.member(&ctx.http, bot_user.id).await?;
+    let top = |ids: &[RoleId]| -> Option<i64> {
+        ids.iter()
+            .map(|id| roles.get(id).map(|role| i64::from(role.position)))
+            .collect::<Option<Vec<_>>>()
+            .map(|positions| positions.into_iter().max().unwrap_or(0))
+    };
+    let permissions = |ids: &[RoleId]| -> u64 {
+        roles
+            .values()
+            .filter(|role| role.id.get() == guild_id.get() || ids.contains(&role.id))
+            .fold(0, |bits, role| bits | role.permissions.bits())
+    };
+    let (Some(actor_top_position), Some(bot_top_position)) = (top(&actor.roles), top(&bot.roles))
+    else {
+        return Ok(false);
+    };
+    let authority = helper_core::RoleOfferAuthority {
+        actor_is_owner: guild.owner_id == publisher_id,
+        actor_permissions: permissions(&actor.roles),
+        actor_top_position,
+        bot_permissions: permissions(&bot.roles),
+        bot_top_position,
+    };
+    Ok(!role_ids.is_empty()
+        && role_ids.iter().all(|id| {
+            if *id == 0 {
+                return false;
+            }
+            let role = roles.get(&RoleId::new(*id));
+            helper_core::role_offer_allowed(
+                guild_id.get(),
+                *id,
+                role.map(|role| i64::from(role.position)),
+                role.is_none_or(|role| role.managed),
+                &authority,
+            )
+        }))
+}
+
 fn stored_role_panel_role_ids(panel: Option<&serde_json::Value>) -> Vec<u64> {
     let Some(roles) = panel
         .and_then(|value| value.get("role_ids"))
@@ -13395,6 +13581,145 @@ fn stored_role_panel_role_ids(panel: Option<&serde_json::Value>) -> Vec<u64> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn event_edit_and_cancel_require_manage_events_in_registration_and_runtime() {
+        for name in ["event-edit", "event-cancel"] {
+            assert_eq!(
+                super::required_permission(name),
+                Some(serenity::all::Permissions::MANAGE_EVENTS)
+            );
+            let command = serde_json::to_value(super::event_management_command(name)).unwrap();
+            assert_eq!(
+                command["default_member_permissions"],
+                serenity::all::Permissions::MANAGE_EVENTS.bits().to_string()
+            );
+            assert!(
+                !serenity::all::Permissions::CREATE_EVENTS
+                    .contains(super::required_permission(name).unwrap())
+            );
+        }
+        assert_eq!(
+            super::required_permission("event-create"),
+            Some(serenity::all::Permissions::CREATE_EVENTS)
+        );
+        assert_eq!(
+            super::required_permission("event-attendees"),
+            Some(serenity::all::Permissions::CREATE_EVENTS)
+        );
+    }
+
+    #[test]
+    fn transcript_chunks_preserve_untrusted_text_without_parsing_mentions() {
+        let transcript = "Ticket transcript for <@7>\nuser: @everyone @here <@&42> <@8>";
+        let payload = serde_json::to_value(super::transcript_message(transcript)).unwrap();
+        assert_eq!(payload["content"], transcript);
+        assert_eq!(payload["allowed_mentions"]["parse"], serde_json::json!([]));
+        for field in ["roles", "users"] {
+            assert!(
+                payload["allowed_mentions"]
+                    .get(field)
+                    .is_none_or(|value| value == &serde_json::json!([]))
+            );
+        }
+    }
+    #[test]
+    fn join_gate_requires_publisher_and_role_binding_from_canonical_publication() {
+        let store = helper_store::Store::open(":memory:").unwrap();
+        store
+            .set_setting("1", "security.join_gate.role_id", "2")
+            .unwrap();
+        assert!(super::join_gate_publisher(&store, "1", 2).is_none());
+        store
+            .publish_feature_setting(
+                "1",
+                "protection.join_gate",
+                true,
+                r#"{"verifiedRole":"2","autoRole":"3"}"#,
+                None,
+                "42",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            super::join_gate_publisher(&store, "1", 2).unwrap().get(),
+            42
+        );
+        assert_eq!(
+            super::join_gate_publisher(&store, "1", 3).unwrap().get(),
+            42
+        );
+        assert!(super::join_gate_publisher(&store, "1", 4).is_none());
+        store
+            .publish_feature_setting(
+                "1",
+                "protection.join_gate",
+                false,
+                r#"{"verifiedRole":"2"}"#,
+                None,
+                "42",
+                &[],
+            )
+            .unwrap();
+        assert!(super::join_gate_publisher(&store, "1", 2).is_none());
+    }
+
+    #[test]
+    fn verify_panel_tracks_canonical_join_gate_enable_and_disable() {
+        let store = helper_store::Store::open(":memory:").unwrap();
+        let adapter = helper_core::feature_adapter("protection.join_gate").unwrap();
+        let config =
+            serde_json::json!({"verifiedRole":"2", "autoRole":"3", "minimumAccountDays":7});
+        for enabled in [true, false] {
+            let mut projections = adapter.runtime_projection(&config);
+            projections.push(("feature.protection.join_gate".into(), enabled.to_string()));
+            projections.push((
+                "feature.config.protection.join_gate".into(),
+                config.to_string(),
+            ));
+            store
+                .publish_feature_setting(
+                    "1",
+                    "protection.join_gate",
+                    enabled,
+                    &config.to_string(),
+                    None,
+                    "42",
+                    &projections,
+                )
+                .unwrap();
+            assert_eq!(
+                super::feature_enabled(
+                    &store,
+                    "1",
+                    "protection.join_gate",
+                    Some("security.join_gate.enabled")
+                ),
+                enabled
+            );
+            assert_eq!(
+                super::join_gate_publisher(&store, "1", 3).is_some(),
+                enabled
+            );
+        }
+    }
+
+    #[test]
+    fn role_panel_requires_verified_stored_publisher_identity() {
+        for value in [
+            serde_json::json!({}),
+            serde_json::json!({"publisher_id": "0"}),
+            serde_json::json!({"publisher_id": "invalid"}),
+            serde_json::json!({"publisher_id": 42}),
+        ] {
+            assert!(super::stored_role_panel_publisher(Some(&value)).is_none());
+        }
+        assert_eq!(
+            super::stored_role_panel_publisher(Some(&serde_json::json!({"publisher_id":"42"})))
+                .unwrap()
+                .get(),
+            42
+        );
+    }
 
     #[test]
     fn stored_role_panel_ids_accept_api_strings_and_legacy_numbers() {

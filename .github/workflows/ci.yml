@@ -17,6 +17,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@59a558e8c538bf4a23bbffa19e5a278b703f2920 # 1.97.1
         with:
           components: rustfmt, clippy
+      - name: Test backup verifier safety
+        run: python3 -m unittest discover -s tests -p 'test_verify_backup.py' -v
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked --version 0.22.2
       - name: Audit Rust dependencies
