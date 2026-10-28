@@ -128,3 +128,21 @@ restart sem password. Ver `Vozen-bot/docs/DEPLOY-VPS.md` §12 como referência.
 - [ ] `npm run register` corrido
 - [ ] `vozen-helper.service` `active (running)`, `/ping` responde
 - [ ] IDs de canais/cargos colados em `src/config.ts`
+
+
+## Optional legacy TypeScript ID configuration
+
+The optional `HELPER_*_ID` / `HELPER_*_IDS` fields in `.env.example` override the
+legacy TypeScript moderation/community defaults. Blank or unset values preserve
+those defaults; invalid IDs stop startup instead of silently changing routing.
+Lists use comma-separated Discord snowflakes. `HELPER_GENERAL_CHANNEL_ID` is
+shared by level announcements, bump reminders and the default welcome DM;
+suggestions/starboard overrides also update that DM. `HELPER_LOG_CHANNEL_ID`
+sets the common default for all five log categories. Thresholds and enabled flags
+are unchanged. Existing database settings keep their normal override precedence.
+
+The manually invoked `tools/post-ticket-panel.mjs` separately accepts
+`HELPER_TICKET_PANEL_CHANNEL_ID` and `HELPER_TICKET_COUNTER_CHANNEL_ID`, validated
+before login. This documentation does not execute the tool or modify the active
+Rust service/environment. Existing deployment IDs remain compatibility defaults;
+these overrides make them configurable, rather than removing Git history.
