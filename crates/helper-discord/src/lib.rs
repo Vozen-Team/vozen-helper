@@ -6375,7 +6375,7 @@ impl Handler {
                     })
             };
             let Some(target) = target else {
-                return respond(ctx, command, "Specify a valid target user.").await;
+                return respond(ctx, command, "Indica um membro.").await;
             };
             if !manual_moderation::allowed(
                 &ctx.http,
@@ -6387,7 +6387,12 @@ impl Handler {
             )
             .await
             {
-                return respond(ctx, command, "Current moderation permissions or member hierarchy could not be verified. No action was applied.").await;
+                return respond(
+                    ctx,
+                    command,
+                    "Unable to perform the action; check permissions and role hierarchy.",
+                )
+                .await;
             }
         }
         if let Some(guild_id) = command.guild_id
@@ -8098,7 +8103,7 @@ impl Handler {
                     return respond(ctx, command, "Esse membro não está em quarantine.").await;
                 };
                 if !manual_moderation::allowed(&ctx.http, guild_id.get(), command.user.id.get(), target.get(), "unquarantine", &record.role_ids).await {
-                    return respond(ctx, command, "Saved roles exceed your current restoration authority. No roles were changed.").await;
+                    return respond(ctx, command, "Unable to perform the action; check permissions and role hierarchy.").await;
                 }
                 let member = guild_id.member(&ctx.http, target).await?;
                 let role_member = &member;
@@ -8141,12 +8146,12 @@ impl Handler {
                 let role_ids = match role_ids {
                     Ok(ids) => ids,
                     Err(_) if !enabled && option_role(command, "role").is_none() => Vec::new(),
-                    Err(_) => return respond(ctx, command, "Configure valid Join Gate roles first.").await,
+                    Err(_) => return respond(ctx, command, "Indica pelo menos um cargo válido.").await,
                 };
                 if enabled || option_role(command, "role").is_some() {
                     let roles = guild_id.roles(&ctx.http).await?;
                     if !role_ids.is_empty() && !role_publisher_allowed(ctx, guild_id, command.user.id, &roles, &role_ids).await.unwrap_or(false) {
-                        return respond(ctx, command, "Join Gate roles must be unmanaged and below your highest role and the Helper.").await;
+                        return respond(ctx, command, "Unable to perform the action; check permissions and role hierarchy.").await;
                     }
                 }
                 let mut projections = adapter.runtime_projection(&config);
@@ -8181,7 +8186,7 @@ impl Handler {
                     return respond(ctx, command, "Ativa primeiro o `/join-gate`; o painel não deve ficar exposto enquanto o gate está desligado.").await;
                 }
                 if !join_gate_role_allowed(ctx, &self.store, guild_id, verified_role_id).await {
-                    return respond(ctx, command, "Join Gate needs staff reconfiguration before publishing verification.").await;
+                    return respond(ctx, command, "Configure a verified-member role in Join Gate before posting a verification panel.").await;
                 }
                 command.channel_id.send_message(
                     &ctx.http,
@@ -9174,7 +9179,7 @@ impl Handler {
                     return respond(ctx, command, "Indica pelo menos um cargo válido.").await;
                 }
                 if !role_publisher_allowed(ctx, guild_id, command.user.id, &guild_roles, &role_ids).await.unwrap_or(false) {
-                    return respond(ctx, command, "Only offer unmanaged roles below your highest role and the Helper. Guild owners remain limited by the Helper hierarchy.").await;
+                    return respond(ctx, command, "Unable to perform the action; check permissions and role hierarchy.").await;
                 }
                 let panel_channel = setting_string(&self.store, &guild_text, "community.role_panels.channel_id")
                     .and_then(|value| value.parse::<u64>().ok())
@@ -9543,19 +9548,16 @@ impl Handler {
                     )
                 });
             let Some(publisher_id) = stored_role_panel_publisher(panel.as_ref()) else {
-                return respond_component(
-                    ctx,
-                    component,
-                    "This role panel needs staff repair or republication before roles can change.",
-                )
-                .await;
+                return respond_component(ctx, component, "This role panel is no longer valid.")
+                    .await;
             };
             let roles = guild_id.roles(&ctx.http).await?;
             if !role_publisher_allowed(ctx, guild_id, publisher_id, &roles, &panel_roles)
                 .await
                 .unwrap_or(false)
             {
-                return respond_component(ctx, component, "The publisher's current role authority could not be verified. Ask staff to repair this panel.").await;
+                return respond_component(ctx, component, "This role panel is no longer valid.")
+                    .await;
             }
             let member = guild_id.member(&ctx.http, component.user.id).await?;
             let decision = evaluate_role_panel(&RolePanelObservation {
@@ -9651,7 +9653,7 @@ impl Handler {
                 return respond_component(
                     ctx,
                     component,
-                    "Join Gate needs staff reconfiguration before roles can change.",
+                    "This verification panel needs a configured verified-member role.",
                 )
                 .await;
             }
