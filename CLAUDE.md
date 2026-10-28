@@ -22,8 +22,8 @@ Guia para agentes de IA a trabalhar no **Vozen Helper** (bot de moderação priv
   Discord (`PANEL_ALLOWED_USER_ID`). Continua single-guild (só o `GUILD_ID`). Trata-se como
   superfície hostil: auth verificada no servidor, CORS trancado, SQL parametrizado. Plano e
   fases em `docs/PLAN-PAINEL.md`.
-- **Não open source.** `"license": "UNLICENSED"`, repo privado. Não copiar código
-  para fora.
+- **Licença AGPL-3.0-only.** Preservar o ficheiro `LICENSE` e os avisos e licenças
+  dos componentes de terceiros.
 - **TDD obrigatório.** Teste a falhar primeiro (RED) → código mínimo (GREEN) →
   refactor. Lógica pura em módulos testáveis (`config`, `guildGuard`, `db`,
   handlers) com testes em `tests/` nomeados a partir do módulo. Terminar sempre com

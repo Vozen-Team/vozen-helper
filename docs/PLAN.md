@@ -25,7 +25,7 @@ Ter um bot de moderação completo para UM servidor: ações de mod com casos e 
 
 ### Out
 - Multi-tenancy, i18n, dashboard web, site, verificação Discord (nunca chega a 100 servidores).
-- **Open source**: repo privado, sem licença OSS — código proprietário (nota no README).
+- **Licença do código**: AGPL-3.0-only, conforme o ficheiro `LICENSE` na raiz.
 - Fora de moderação: leveling/XP, música, tickets, starboard, giveaways, welcome decorativo.
 - ML/AI: classificação NSFW de imagens, OCR de scams em imagem, deteção de toxicidade por LLM (candidatos a v2).
 - Backups/restore automático do servidor (estilo Wick) — apenas alerta+quarentena nesta iteração.

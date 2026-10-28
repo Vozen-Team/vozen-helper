@@ -2,8 +2,8 @@
   "name": "vozen-helper",
   "version": "0.0.0",
   "private": true,
-  "license": "UNLICENSED",
-  "description": "Vozen Helper — bot de moderação privado, single-guild (proprietário, não open source).",
+  "license": "AGPL-3.0-only",
+  "description": "Vozen Helper — bot de moderação Discord sob a licença AGPL-3.0-only.",
   "type": "module",
   "engines": {
     "node": ">=22.12.0"
