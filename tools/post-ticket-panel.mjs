@@ -12,8 +12,8 @@ import {
   ChannelType,
 } from 'discord.js';
 
-const TICKET_CHANNEL = process.env.HELPER_TICKET_PANEL_CHANNEL_ID?.trim() || '1526360537938657493';
-const COUNTER_CHANNEL = process.env.HELPER_TICKET_COUNTER_CHANNEL_ID?.trim() || '1526360728456396931';
+const TICKET_CHANNEL = process.env.HELPER_TICKET_PANEL_CHANNEL_ID?.trim() || '';
+const COUNTER_CHANNEL = process.env.HELPER_TICKET_COUNTER_CHANNEL_ID?.trim() || '';
 
 for (const [name, value] of [
   ['HELPER_TICKET_PANEL_CHANNEL_ID', TICKET_CHANNEL],
