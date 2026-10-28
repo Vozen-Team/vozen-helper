@@ -1,4 +1,4 @@
-import { createHmac, timingSafeEqual } from 'node:crypto';
+import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
 
 // Token de sessão assinado (HMAC-SHA256), enviado no header `Authorization: Bearer`.
 // Usa-se em vez de cookie de terceiros porque o painel (github.io) e a API (túnel)
@@ -18,8 +18,16 @@ export function signSessionToken(
   return `${payload}.${sig}`;
 }
 
-/** Devolve o `userId` se o token for válido e não expirou; senão `null`. */
-export function verifySessionToken(token: string, secret: string, now: number): string | null {
+export interface SessionTokenClaims {
+  userId: string;
+  expiresAt: number;
+}
+
+export function verifySessionTokenClaims(
+  token: string,
+  secret: string,
+  now: number,
+): SessionTokenClaims | null {
   const parts = (token ?? '').split('.');
   if (parts.length !== 3) return null;
   const [userId, expStr, sig] = parts;
@@ -31,6 +39,17 @@ export function verifySessionToken(token: string, secret: string, now: number): 
   if (a.length !== b.length || !timingSafeEqual(a, b)) return null;
 
   const exp = Number.parseInt(expStr, 10);
-  if (!Number.isFinite(exp) || exp * 1000 < now) return null;
-  return userId;
+  const expiresAt = exp * 1000;
+  if (!Number.isFinite(exp) || expiresAt <= now) return null;
+  return { userId, expiresAt };
+}
+
+/** Devolve o `userId` se o token for válido e não expirou; senão `null`. */
+export function verifySessionToken(token: string, secret: string, now: number): string | null {
+  return verifySessionTokenClaims(token, secret, now)?.userId ?? null;
+}
+
+/** Digest para indexar sessões revogadas sem reter o token original. */
+export function sessionTokenDigest(token: string): string {
+  return createHash('sha256').update(token).digest('base64url');
 }
