@@ -1,5 +1,6 @@
 //! Pure configuration and policy primitives. No Discord or HTTP side effects.
 
+pub mod manual_moderation;
 pub mod member_counter;
 
 use anyhow::{Context, Result};

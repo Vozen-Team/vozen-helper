@@ -61,7 +61,9 @@ mod activity_observer;
 mod economy_shop;
 pub mod giveaway_card;
 mod giveaway_display;
+mod guild_delivery;
 pub mod leaderboard_card;
+mod manual_moderation;
 pub mod poll_card;
 mod poll_display;
 mod private_replies;
@@ -1764,7 +1766,7 @@ impl EventHandler for Handler {
                     .required(false),
                 ),
             CreateCommand::new("event-list").description("List native Discord scheduled events"),
-            CreateCommand::new("event-edit")
+            event_management_command("event-edit")
                 .description("Edit a native Discord scheduled event")
                 .add_option(
                     CreateCommandOption::new(
@@ -1840,7 +1842,7 @@ impl EventHandler for Handler {
                     )
                     .required(true),
                 ),
-            CreateCommand::new("event-cancel")
+            event_management_command("event-cancel")
                 .description("Cancel a native Discord scheduled event")
                 .add_option(
                     CreateCommandOption::new(
@@ -4469,11 +4471,13 @@ async fn process_youtube_subscription(
         &video,
         &subscription.source_channel_id,
     );
-    let channel_id = subscription
-        .target_channel_id
-        .parse::<u64>()
-        .map_err(|_| anyhow::anyhow!("invalid_discord_channel_id"))?;
-    ChannelId::new(channel_id).say(http, content).await?;
+    guild_delivery::send(
+        http,
+        &subscription.guild_id,
+        &subscription.target_channel_id,
+        content,
+    )
+    .await?;
     store.update_youtube_poll(subscription.id, Some(&video.id), next(), 0, None)?;
     Ok(())
 }
@@ -4573,11 +4577,14 @@ async fn process_rss_subscription(
         return Ok(());
     }
     let content = format_rss_message(&subscription.message_template, &subscription.mention, &item);
-    let channel_id = subscription
-        .target_channel_id
-        .parse::<u64>()
-        .map_err(|_| anyhow::anyhow!("invalid_discord_channel_id"))?;
-    if let Err(error) = ChannelId::new(channel_id).say(http, content).await {
+    if let Err(error) = guild_delivery::send(
+        http,
+        &subscription.guild_id,
+        &subscription.target_channel_id,
+        content,
+    )
+    .await
+    {
         let failures = subscription.failure_count.saturating_add(1).min(8);
         let backoff = rss_retry_seconds(subscription.interval_seconds, failures);
         // Do not advance last_item_id until Discord confirms delivery.  The
@@ -4590,7 +4597,7 @@ async fn process_rss_subscription(
             failures,
             Some("discord_delivery_failed"),
         )?;
-        return Err(error.into());
+        return Err(error);
     }
     store.update_rss_poll(subscription.id, Some(&item.id), next(), 0, None)?;
     Ok(())
@@ -5239,11 +5246,13 @@ async fn process_bluesky_subscription(
     }
     let content =
         format_bluesky_message(&subscription.message_template, &subscription.mention, &post);
-    let channel_id = subscription
-        .target_channel_id
-        .parse::<u64>()
-        .map_err(|_| anyhow::anyhow!("invalid_discord_channel_id"))?;
-    ChannelId::new(channel_id).say(http, content).await?;
+    guild_delivery::send(
+        http,
+        &subscription.guild_id,
+        &subscription.target_channel_id,
+        content,
+    )
+    .await?;
     store.update_bluesky_poll(subscription.id, Some(&post.uri), next(), 0, None)?;
     Ok(())
 }
@@ -5425,11 +5434,13 @@ async fn process_tiktok_subscription(
         &subscription.source_label,
         &video,
     );
-    let channel_id = subscription
-        .target_channel_id
-        .parse::<u64>()
-        .map_err(|_| anyhow::anyhow!("invalid_discord_channel_id"))?;
-    ChannelId::new(channel_id).say(http, content).await?;
+    guild_delivery::send(
+        http,
+        &subscription.guild_id,
+        &subscription.target_channel_id,
+        content,
+    )
+    .await?;
     store.update_tiktok_poll(subscription.id, Some(&video.id), next(), 0, None)?;
     Ok(())
 }
@@ -5540,11 +5551,13 @@ async fn process_instagram_subscription(
         &subscription.source_label,
         &item,
     );
-    let channel_id = subscription
-        .target_channel_id
-        .parse::<u64>()
-        .map_err(|_| anyhow::anyhow!("invalid_discord_channel_id"))?;
-    ChannelId::new(channel_id).say(http, content).await?;
+    guild_delivery::send(
+        http,
+        &subscription.guild_id,
+        &subscription.target_channel_id,
+        content,
+    )
+    .await?;
     store.update_instagram_poll(subscription.id, Some(&item.id), next(), 0, None)?;
     Ok(())
 }
@@ -5645,11 +5658,13 @@ async fn process_kick_subscription(
         &subscription.source_handle,
         &stream,
     );
-    let channel_id = subscription
-        .target_channel_id
-        .parse::<u64>()
-        .map_err(|_| anyhow::anyhow!("invalid_discord_channel_id"))?;
-    ChannelId::new(channel_id).say(http, content).await?;
+    guild_delivery::send(
+        http,
+        &subscription.guild_id,
+        &subscription.target_channel_id,
+        content,
+    )
+    .await?;
     store.update_kick_poll(subscription.id, Some(&stream.id), next(), 0, None)?;
     Ok(())
 }
@@ -5722,11 +5737,14 @@ async fn process_twitch_subscription(
             .as_deref()
             .unwrap_or_default(),
     );
-    let channel_id = subscription
-        .target_channel_id
-        .parse::<u64>()
-        .map_err(|_| anyhow::anyhow!("invalid_discord_channel_id"))?;
-    if let Err(error) = ChannelId::new(channel_id).say(http, content).await {
+    if let Err(error) = guild_delivery::send(
+        http,
+        &subscription.guild_id,
+        &subscription.target_channel_id,
+        content,
+    )
+    .await
+    {
         let failures = subscription.failure_count.saturating_add(1).min(8);
         let backoff = 5_i64 * (1_i64 << failures.min(6));
         store.retry_twitch_event(
@@ -5736,7 +5754,7 @@ async fn process_twitch_subscription(
             failures,
             Some("discord_delivery_failed"),
         )?;
-        return Err(error.into());
+        return Err(error);
     }
     store.ack_twitch_event(subscription.id, event_id, i64::MAX, 0, None)?;
     Ok(())
@@ -6337,6 +6355,39 @@ impl Handler {
                     "Não tens a permissão necessária para este comando.",
                 )
                 .await;
+            }
+        }
+        if helper_core::manual_moderation::permissions(&command.data.name).is_some()
+            && let Some(guild_id) = command.guild_id
+        {
+            let target = if command.data.name == "unban" {
+                option_string(command, "user_id")
+                    .and_then(|id| id.parse::<u64>().ok())
+                    .filter(|id| *id > 0)
+            } else {
+                command
+                    .data
+                    .options
+                    .iter()
+                    .find_map(|option| match option.value {
+                        CommandDataOptionValue::User(user) => Some(user.get()),
+                        _ => None,
+                    })
+            };
+            let Some(target) = target else {
+                return respond(ctx, command, "Specify a valid target user.").await;
+            };
+            if !manual_moderation::allowed(
+                &ctx.http,
+                guild_id.get(),
+                command.user.id.get(),
+                target,
+                &command.data.name,
+                &[],
+            )
+            .await
+            {
+                return respond(ctx, command, "Current moderation permissions or member hierarchy could not be verified. No action was applied.").await;
             }
         }
         if let Some(guild_id) = command.guild_id
@@ -8046,6 +8097,9 @@ impl Handler {
                 let Some(record) = self.store.get_quarantine(&guild_id.to_string(), &target.to_string())? else {
                     return respond(ctx, command, "Esse membro não está em quarantine.").await;
                 };
+                if !manual_moderation::allowed(&ctx.http, guild_id.get(), command.user.id.get(), target.get(), "unquarantine", &record.role_ids).await {
+                    return respond(ctx, command, "Saved roles exceed your current restoration authority. No roles were changed.").await;
+                }
                 let member = guild_id.member(&ctx.http, target).await?;
                 let role_member = &member;
                 let role_http = &ctx.http;
@@ -10023,7 +10077,7 @@ impl Handler {
                         for chunk in transcript.as_bytes().chunks(1_800) {
                             let text = String::from_utf8_lossy(chunk);
                             let _ = ChannelId::new(transcript_channel)
-                                .say(&ctx.http, text)
+                                .send_message(&ctx.http, transcript_message(&text))
                                 .await;
                         }
                     }
@@ -10116,6 +10170,16 @@ async fn respond(ctx: &Context, command: &CommandInteraction, content: &str) -> 
 async fn respond_raw(ctx: &Context, command: &CommandInteraction, content: &str) -> Result<()> {
     command.edit_response(ctx, raw_feedback(content)).await?;
     Ok(())
+}
+
+fn transcript_message(content: &str) -> CreateMessage {
+    CreateMessage::new()
+        .content(content)
+        .allowed_mentions(CreateAllowedMentions::new())
+}
+
+fn event_management_command(name: &str) -> CreateCommand {
+    CreateCommand::new(name).default_member_permissions(Permissions::MANAGE_EVENTS)
 }
 
 fn raw_feedback(content: &str) -> EditInteractionResponse {
@@ -11765,11 +11829,11 @@ async fn apply_lockdown(
 }
 
 fn required_permission(command: &str) -> Option<Permissions> {
+    if let Some(required) = helper_core::manual_moderation::permissions(command) {
+        return Some(Permissions::from_bits_retain(required.actor));
+    }
     match command {
-        "warn" | "violation" | "timeout" | "untimeout" | "note" | "reason" | "quarantine"
-        | "unquarantine" | "modlogs" | "cases" => Some(Permissions::MODERATE_MEMBERS),
-        "kick" => Some(Permissions::KICK_MEMBERS),
-        "ban" | "unban" | "tempban" | "softban" => Some(Permissions::BAN_MEMBERS),
+        "reason" | "modlogs" | "cases" => Some(Permissions::MODERATE_MEMBERS),
         "purge" => Some(Permissions::MANAGE_MESSAGES),
         "ticket-panel" | "ticket-config" | "ticket-update" => Some(Permissions::MANAGE_CHANNELS),
         "slowmode" | "lockdown" | "unlock" => Some(Permissions::MANAGE_CHANNELS),
@@ -11779,9 +11843,8 @@ fn required_permission(command: &str) -> Option<Permissions> {
         "anti-raid" => Some(Permissions::MANAGE_GUILD),
         "security-mode" => Some(Permissions::MANAGE_GUILD),
         "anti-nuke" => Some(Permissions::MANAGE_GUILD),
-        "event-create" | "event-edit" | "event-cancel" | "event-attendees" => {
-            Some(Permissions::CREATE_EVENTS)
-        }
+        "event-create" | "event-attendees" => Some(Permissions::CREATE_EVENTS),
+        "event-edit" | "event-cancel" => Some(Permissions::MANAGE_EVENTS),
         "invites" => Some(Permissions::MANAGE_GUILD),
         "temp-channel" => Some(Permissions::MANAGE_CHANNELS),
         "embed" => Some(Permissions::MANAGE_MESSAGES),
@@ -13516,6 +13579,47 @@ fn stored_role_panel_role_ids(panel: Option<&serde_json::Value>) -> Vec<u64> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn event_edit_and_cancel_require_manage_events_in_registration_and_runtime() {
+        for name in ["event-edit", "event-cancel"] {
+            assert_eq!(
+                super::required_permission(name),
+                Some(serenity::all::Permissions::MANAGE_EVENTS)
+            );
+            let command = serde_json::to_value(super::event_management_command(name)).unwrap();
+            assert_eq!(
+                command["default_member_permissions"],
+                serenity::all::Permissions::MANAGE_EVENTS.bits().to_string()
+            );
+            assert!(
+                !serenity::all::Permissions::CREATE_EVENTS
+                    .contains(super::required_permission(name).unwrap())
+            );
+        }
+        assert_eq!(
+            super::required_permission("event-create"),
+            Some(serenity::all::Permissions::CREATE_EVENTS)
+        );
+        assert_eq!(
+            super::required_permission("event-attendees"),
+            Some(serenity::all::Permissions::CREATE_EVENTS)
+        );
+    }
+
+    #[test]
+    fn transcript_chunks_preserve_untrusted_text_without_parsing_mentions() {
+        let transcript = "Ticket transcript for <@7>\nuser: @everyone @here <@&42> <@8>";
+        let payload = serde_json::to_value(super::transcript_message(transcript)).unwrap();
+        assert_eq!(payload["content"], transcript);
+        assert_eq!(payload["allowed_mentions"]["parse"], serde_json::json!([]));
+        for field in ["roles", "users"] {
+            assert!(
+                payload["allowed_mentions"]
+                    .get(field)
+                    .is_none_or(|value| value == &serde_json::json!([]))
+            );
+        }
+    }
     #[test]
     fn join_gate_requires_publisher_and_role_binding_from_canonical_publication() {
         let store = helper_store::Store::open(":memory:").unwrap();
