@@ -4,7 +4,7 @@
 //  1. `loadEnv` — segredos e IDs que variam por ambiente (token, guild), lidos do
 //     ambiente e VALIDADOS no arranque (falha rápida com mensagem clara).
 //  2. `loadModConfig` / `modConfig` - validated environment ID overrides with
-//     backwards-compatible defaults; moderation thresholds remain versioned.
+//     required environment IDs; moderation thresholds remain versioned.
 
 /** Níveis de log aceites (do menos ao mais severo). */
 export const LOG_LEVELS = ['debug', 'info', 'warn', 'error'] as const;
@@ -319,28 +319,21 @@ export interface LogConfig {
 const DAY = 24 * 60 * 60 * 1000;
 const HOUR = 60 * 60 * 1000;
 
-// Optional ID overrides preserve legacy defaults when unset or blank.
+// Deployment IDs must be supplied explicitly; never infer routing from old IDs.
 function isSnowflake(value: string): boolean {
   return /^[1-9]\d{16,19}$/.test(value) && BigInt(value) <= 18446744073709551615n;
 }
 
-function idFromEnv(
-  env: Record<string, string | undefined>,
-  name: string,
-  fallback: string,
-): string {
-  const value = env[name]?.trim() || fallback;
+function idFromEnv(env: Record<string, string | undefined>, name: string): string {
+  const value = env[name]?.trim() || '';
+  if (!value) throw new ConfigError(`${name} is required.`);
   if (!isSnowflake(value)) throw new ConfigError(`${name} must be a valid Discord snowflake.`);
   return value;
 }
 
-function idsFromEnv(
-  env: Record<string, string | undefined>,
-  name: string,
-  fallback: string[],
-): string[] {
+function idsFromEnv(env: Record<string, string | undefined>, name: string): string[] {
   const raw = env[name]?.trim();
-  if (!raw) return fallback;
+  if (!raw) throw new ConfigError(`${name} is required.`);
   const values = raw.split(',').map((value) => value.trim());
   if (!values.every(isSnowflake)) {
     throw new ConfigError(`${name} must contain comma-separated Discord snowflakes.`);
@@ -349,22 +342,15 @@ function idsFromEnv(
 }
 
 export function loadModConfig(env: Record<string, string | undefined>): ModConfig {
-  const generalChannelId = idFromEnv(env, 'HELPER_GENERAL_CHANNEL_ID', '1523496056359489636');
-  const suggestionsChannelId = idFromEnv(
-    env,
-    'HELPER_SUGGESTIONS_CHANNEL_ID',
-    '1526360535501639771',
-  );
-  const starboardChannelId = idFromEnv(env, 'HELPER_STARBOARD_CHANNEL_ID', '1526360536705404948');
-  const logChannelId = idFromEnv(env, 'HELPER_LOG_CHANNEL_ID', '1524488901320769666');
+  const generalChannelId = idFromEnv(env, 'HELPER_GENERAL_CHANNEL_ID');
+  const suggestionsChannelId = idFromEnv(env, 'HELPER_SUGGESTIONS_CHANNEL_ID');
+  const starboardChannelId = idFromEnv(env, 'HELPER_STARBOARD_CHANNEL_ID');
+  const logChannelId = idFromEnv(env, 'HELPER_LOG_CHANNEL_ID');
   return {
     // Comandos só no canal #mod-helper-bot.
-    commandChannelIds: idsFromEnv(env, 'HELPER_COMMAND_CHANNEL_IDS', ['1526248625305292870']),
+    commandChannelIds: idsFromEnv(env, 'HELPER_COMMAND_CHANNEL_IDS'),
     // Staff isenta de automod/anti-spam/filtros: ⭐Developer + 👮Staff.
-    modRoleIds: idsFromEnv(env, 'HELPER_MOD_ROLE_IDS', [
-      '1523492883011997776',
-      '1523499171246772355',
-    ]),
+    modRoleIds: idsFromEnv(env, 'HELPER_MOD_ROLE_IDS'),
     whitelistIds: [],
     strikeWindowMs: 30 * DAY,
     escalationLadder: [
@@ -466,7 +452,7 @@ export function loadModConfig(env: Record<string, string | undefined>): ModConfi
     },
     verification: {
       // Auto-role: toda a gente que entra recebe o ☀️Member.
-      autoRoleId: idFromEnv(env, 'HELPER_AUTO_ROLE_ID', '1523498442653958294'),
+      autoRoleId: idFromEnv(env, 'HELPER_AUTO_ROLE_ID'),
       verifiedRoleId: null,
       stickyRolesEnabled: true,
     },
@@ -515,34 +501,27 @@ export function loadModConfig(env: Record<string, string | undefined>): ModConfi
           'Have fun and make sure to read the rules. Any questions, reach out to the staff!',
       },
       memberCounter: {
-        channelId: idFromEnv(env, 'HELPER_MEMBER_COUNTER_CHANNEL_ID', '1526361580487573635'),
+        channelId: idFromEnv(env, 'HELPER_MEMBER_COUNTER_CHANNEL_ID'),
         template: '📊 Members: {count}',
       },
       leveling: {
         enabled: true,
         announceChannelId: generalChannelId, // #general-chat
-        noXpChannelIds: idsFromEnv(env, 'HELPER_NO_XP_CHANNEL_IDS', [
-          '1526248625305292870',
-          '1523486728042840124',
-        ]), // mod-helper-bot, bot-testing
+        noXpChannelIds: idsFromEnv(env, 'HELPER_NO_XP_CHANNEL_IDS'), // mod-helper-bot, bot-testing
         minXp: 15,
         maxXp: 25,
         cooldownMs: 60_000,
         levelRoles: [
-          { level: 5, roleId: idFromEnv(env, 'HELPER_LEVEL_5_ROLE_ID', '1526360728880283770') }, // 🥉 Nível 5
-          { level: 10, roleId: idFromEnv(env, 'HELPER_LEVEL_10_ROLE_ID', '1526360730499285103') }, // 🥈 Nível 10
-          { level: 20, roleId: idFromEnv(env, 'HELPER_LEVEL_20_ROLE_ID', '1526360731618906122') }, // 🥇 Nível 20
+          { level: 5, roleId: idFromEnv(env, 'HELPER_LEVEL_5_ROLE_ID') }, // 🥉 Nível 5
+          { level: 10, roleId: idFromEnv(env, 'HELPER_LEVEL_10_ROLE_ID') }, // 🥈 Nível 10
+          { level: 20, roleId: idFromEnv(env, 'HELPER_LEVEL_20_ROLE_ID') }, // 🥇 Nível 20
         ],
         stackRoles: false,
       },
       tickets: {
         enabled: true,
-        staffRoleId: idFromEnv(env, 'HELPER_TICKET_STAFF_ROLE_ID', '1523499171246772355'),
-        transcriptChannelId: idFromEnv(
-          env,
-          'HELPER_TICKET_TRANSCRIPT_CHANNEL_ID',
-          '1526362020041981992',
-        ),
+        staffRoleId: idFromEnv(env, 'HELPER_TICKET_STAFF_ROLE_ID'),
+        transcriptChannelId: idFromEnv(env, 'HELPER_TICKET_TRANSCRIPT_CHANNEL_ID'),
       },
       starboard: { enabled: true, channelId: starboardChannelId, threshold: 3, emoji: '⭐' },
       birthdays: { enabled: false, channelId: null, roleId: null },

@@ -136,22 +136,22 @@ restart sem password. Ver `Vozen-bot/docs/DEPLOY-VPS.md` §12 como referência.
 - [ ] `.env` com os 3 valores
 - [ ] `npm run register` corrido
 - [ ] `vozen-helper.service` `active (running)`, `/ping` responde
-- [ ] IDs de canais/cargos colados em `src/config.ts`
+- [ ] IDs de canais/cargos preenchidos nas variáveis `HELPER_*` do `.env`
 
 
-## Optional legacy TypeScript ID configuration
+## Required legacy TypeScript ID configuration
 
-The optional `HELPER_*_ID` / `HELPER_*_IDS` fields in `.env.example` override the
-legacy TypeScript moderation/community defaults. Blank or unset values preserve
-those defaults; invalid IDs stop startup instead of silently changing routing.
-Lists use comma-separated Discord snowflakes. `HELPER_GENERAL_CHANNEL_ID` is
-shared by level announcements, bump reminders and the default welcome DM;
-suggestions/starboard overrides also update that DM. `HELPER_LOG_CHANNEL_ID`
-sets the common default for all five log categories. Thresholds and enabled flags
-are unchanged. Existing database settings keep their normal override precedence.
+Fill the `HELPER_*_ID` / `HELPER_*_IDS` fields in `.env.example` before running
+legacy TypeScript bot/API processes. There are no built-in deployment IDs;
+missing, blank or malformed IDs stop startup before a Discord login. Lists use
+comma-separated snowflakes. General/suggestions/starboard IDs also populate the
+welcome-DM mentions; the general channel serves leveling and bump reminders.
+`HELPER_LOG_CHANNEL_ID` sets all five log categories. Existing database settings
+keep their normal override precedence; thresholds and enabled flags are unchanged.
 
-The manually invoked `tools/post-ticket-panel.mjs` separately accepts
-`HELPER_TICKET_PANEL_CHANNEL_ID` and `HELPER_TICKET_COUNTER_CHANNEL_ID`, validated
-before login. This documentation does not execute the tool or modify the active
-Rust service/environment. Existing deployment IDs remain compatibility defaults;
-these overrides make them configurable, rather than removing Git history.
+The manual `tools/post-ticket-panel.mjs` additionally requires
+`HELPER_TICKET_PANEL_CHANNEL_ID` and `HELPER_TICKET_COUNTER_CHANNEL_ID` before
+login. Transfer the previous effective values to your private environment before
+upgrading. Tests use a separate synthetic environment fixture. Active Rust
+services do not consume this legacy configuration; the `legacy-typescript`
+branch remains a historical recovery snapshot. Git history is not rewritten.

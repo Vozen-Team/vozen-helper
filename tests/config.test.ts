@@ -1,4 +1,5 @@
 import { spawnSync } from 'node:child_process';
+import { MOD_ENV } from './fixtures/mod-env.js';
 import { describe, it, expect } from 'vitest';
 import { loadEnv, loadModConfig, ConfigError } from '../src/config.js';
 
@@ -60,18 +61,22 @@ describe('loadModConfig environment overrides', () => {
   const second = '100000000000000002';
   const third = '100000000000000003';
 
-  it('preserves defaults for blank variables and returns independent configurations', () => {
-    const defaults = loadModConfig({});
-    expect(loadModConfig({ HELPER_GENERAL_CHANNEL_ID: ' ', HELPER_MOD_ROLE_IDS: '' })).toEqual(
-      defaults,
-    );
-    const changed = loadModConfig({});
+  it('requires every deployment ID and returns independent configurations', () => {
+    expect(() => loadModConfig({})).toThrow(ConfigError);
+    for (const name of Object.keys(MOD_ENV)) {
+      for (const value of [undefined, '', ' ']) {
+        expect(() => loadModConfig({ ...MOD_ENV, [name]: value })).toThrow(name);
+      }
+    }
+    const original = loadModConfig(MOD_ENV);
+    const changed = loadModConfig(MOD_ENV);
     changed.commandChannelIds.push(first);
-    expect(loadModConfig({})).toEqual(defaults);
+    expect(loadModConfig(MOD_ENV)).toEqual(original);
   });
 
   it('uses validated IDs in settings and welcome-DM mentions without changing thresholds', () => {
     const cfg = loadModConfig({
+      ...MOD_ENV,
       HELPER_COMMAND_CHANNEL_IDS: ` ${first}, ${second} `,
       HELPER_MOD_ROLE_IDS: `${second},${third}`,
       HELPER_GENERAL_CHANNEL_ID: first,
@@ -106,15 +111,17 @@ describe('loadModConfig environment overrides', () => {
     expect(cfg.community.tickets.transcriptChannelId).toBe(third);
     for (const id of [first, second, third])
       expect(cfg.community.welcomeDm.message).toContain(`<#${id}>`);
-    expect(cfg.spam).toEqual(loadModConfig({}).spam);
-    expect(cfg.escalationLadder).toEqual(loadModConfig({}).escalationLadder);
+    expect(cfg.spam).toEqual(loadModConfig(MOD_ENV).spam);
+    expect(cfg.escalationLadder).toEqual(loadModConfig(MOD_ENV).escalationLadder);
   });
 
   it('rejects malformed, empty CSV entries and overflowing IDs before startup', () => {
     for (const value of ['invalid', '000000000000000000', '99999999999999999999']) {
-      expect(() => loadModConfig({ HELPER_AUTO_ROLE_ID: value })).toThrow('HELPER_AUTO_ROLE_ID');
+      expect(() => loadModConfig({ ...MOD_ENV, HELPER_AUTO_ROLE_ID: value })).toThrow(
+        'HELPER_AUTO_ROLE_ID',
+      );
     }
-    expect(() => loadModConfig({ HELPER_MOD_ROLE_IDS: `${first},,${second}` })).toThrow(
+    expect(() => loadModConfig({ ...MOD_ENV, HELPER_MOD_ROLE_IDS: `${first},,${second}` })).toThrow(
       'HELPER_MOD_ROLE_IDS',
     );
   });
@@ -123,19 +130,23 @@ describe('loadModConfig environment overrides', () => {
 describe('manual ticket tool configuration', () => {
   it('rejects invalid channel IDs before attempting Discord login', () => {
     for (const invalid of ['HELPER_TICKET_PANEL_CHANNEL_ID', 'HELPER_TICKET_COUNTER_CHANNEL_ID']) {
-      const result = spawnSync(process.execPath, ['tools/post-ticket-panel.mjs'], {
-        encoding: 'utf8',
-        timeout: 5000,
-        env: {
-          ...process.env,
-          DISCORD_TOKEN: '',
-          HELPER_TICKET_PANEL_CHANNEL_ID: '100000000000000001',
-          HELPER_TICKET_COUNTER_CHANNEL_ID: '100000000000000002',
-          [invalid]: 'invalid',
-        },
-      });
-      expect(result.status).toBe(1);
-      expect(result.stderr).toContain(`${invalid} must be a valid Discord snowflake`);
+      for (const value of ['invalid', '', ' ']) {
+        const result = spawnSync(process.execPath, ['tools/post-ticket-panel.mjs'], {
+          encoding: 'utf8',
+          timeout: 5000,
+          env: {
+            ...process.env,
+            DISCORD_TOKEN: '',
+            DOTENV_CONFIG_PATH: 'tests/fixtures/nonexistent.env',
+            DOTENV_CONFIG_OVERRIDE: 'false',
+            HELPER_TICKET_PANEL_CHANNEL_ID: '100000000000000001',
+            HELPER_TICKET_COUNTER_CHANNEL_ID: '100000000000000002',
+            [invalid]: value,
+          },
+        });
+        expect(result.status).toBe(1);
+        expect(result.stderr).toContain(`${invalid} must be a valid Discord snowflake`);
+      }
     }
   });
 });
