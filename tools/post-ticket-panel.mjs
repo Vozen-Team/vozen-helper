@@ -12,8 +12,17 @@ import {
   ChannelType,
 } from 'discord.js';
 
-const TICKET_CHANNEL = '1526360537938657493';
-const COUNTER_CHANNEL = '1526360728456396931';
+const TICKET_CHANNEL = process.env.HELPER_TICKET_PANEL_CHANNEL_ID?.trim() || '1526360537938657493';
+const COUNTER_CHANNEL = process.env.HELPER_TICKET_COUNTER_CHANNEL_ID?.trim() || '1526360728456396931';
+
+for (const [name, value] of [
+  ['HELPER_TICKET_PANEL_CHANNEL_ID', TICKET_CHANNEL],
+  ['HELPER_TICKET_COUNTER_CHANNEL_ID', COUNTER_CHANNEL],
+]) {
+  if (!/^[1-9]\d{16,19}$/.test(value) || BigInt(value) > 18446744073709551615n) {
+    throw new Error(`${name} must be a valid Discord snowflake.`);
+  }
+}
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
