@@ -1786,6 +1786,78 @@ pub struct RolePanelObservation {
     pub remove_on_unselect: bool,
 }
 
+/// Authority of the publisher, not the member receiving a self-role.
+#[derive(Debug, Clone, Copy)]
+pub struct RoleOfferAuthority {
+    pub actor_is_owner: bool,
+    pub actor_permissions: u64,
+    pub actor_top_position: i64,
+    pub bot_permissions: u64,
+    pub bot_top_position: i64,
+}
+
+#[must_use]
+pub fn role_offer_allowed(
+    guild_id: u64,
+    role_id: u64,
+    position: Option<i64>,
+    managed: bool,
+    authority: &RoleOfferAuthority,
+) -> bool {
+    let manage_roles = (1 << 28) | (1 << 3);
+    position.is_some_and(|position| {
+        guild_id != 0
+            && role_id != 0
+            && role_id != guild_id
+            && position >= 0
+            && !managed
+            && authority.bot_permissions & manage_roles != 0
+            && position < authority.bot_top_position
+            && (authority.actor_is_owner
+                || (authority.actor_permissions & manage_roles != 0
+                    && position < authority.actor_top_position))
+    })
+}
+
+#[cfg(test)]
+mod role_offer_security_tests {
+    use super::*;
+
+    fn publisher() -> RoleOfferAuthority {
+        RoleOfferAuthority {
+            actor_is_owner: false,
+            actor_permissions: 1 << 28,
+            actor_top_position: 5,
+            bot_permissions: 1 << 28,
+            bot_top_position: 10,
+        }
+    }
+
+    #[test]
+    fn lower_manager_cannot_offer_higher_privileged_or_equal_roles() {
+        let authority = publisher();
+        assert!(!role_offer_allowed(1, 2, Some(8), false, &authority));
+        assert!(!role_offer_allowed(1, 2, Some(5), false, &authority));
+        assert!(role_offer_allowed(1, 2, Some(4), false, &authority));
+        assert!(!role_offer_allowed(1, 1, Some(0), false, &authority));
+        assert!(!role_offer_allowed(1, 0, Some(0), false, &authority));
+        assert!(!role_offer_allowed(1, 2, None, false, &authority));
+        assert!(!role_offer_allowed(1, 2, Some(4), true, &authority));
+    }
+
+    #[test]
+    fn owner_exemption_stays_below_bot_and_current_permissions_are_required() {
+        let mut authority = publisher();
+        authority.actor_permissions = 0;
+        assert!(!role_offer_allowed(1, 2, Some(4), false, &authority));
+        authority.actor_is_owner = true;
+        assert!(role_offer_allowed(1, 2, Some(8), false, &authority));
+        assert!(!role_offer_allowed(1, 2, Some(10), false, &authority));
+        authority.bot_permissions = 0;
+        assert!(!role_offer_allowed(1, 2, Some(4), false, &authority));
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RolePanelDecision {
     pub allowed: bool,

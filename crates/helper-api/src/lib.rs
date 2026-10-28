@@ -4,10 +4,14 @@
 
 mod achievements;
 mod activity_feed;
+#[cfg(test)]
+mod discord_channel_tests;
 mod discord_context;
 mod discord_read;
 mod economy_shop;
 mod oauth_limits;
+#[cfg(test)]
+mod role_panel_authority_tests;
 mod session_authorization;
 mod starboard_channel;
 mod ticket_panel;
@@ -1873,7 +1877,7 @@ async fn test_youtube_delivery(
         )
     };
     let content = content.chars().take(2_000).collect::<String>();
-    discord_send_channel_message(&state.discord_token, &target, &content)
+    discord_send_channel_message(&state.discord_token, &claims.guild_id, &target, &content)
         .await
         .map_err(|error| {
             let status = if error == "discord_http_403" || error == "discord_http_401" {
@@ -2083,7 +2087,7 @@ async fn test_rss_delivery(
         )
     };
     let content = content.chars().take(2_000).collect::<String>();
-    discord_send_channel_message(&state.discord_token, &target, &content)
+    discord_send_channel_message(&state.discord_token, &claims.guild_id, &target, &content)
         .await
         .map_err(|error| {
             let status = if error == "discord_http_403" || error == "discord_http_401" {
@@ -3272,7 +3276,7 @@ async fn test_tiktok_delivery(
         )
     };
     let content = content.chars().take(2_000).collect::<String>();
-    discord_send_channel_message(&state.discord_token, &target, &content)
+    discord_send_channel_message(&state.discord_token, &claims.guild_id, &target, &content)
         .await
         .map_err(|error| {
             let status = if error == "discord_http_403" || error == "discord_http_401" {
@@ -4251,7 +4255,7 @@ async fn test_twitch_delivery(
         .chars()
         .take(2_000)
         .collect::<String>();
-    discord_send_channel_message(&state.discord_token, &target, &content)
+    discord_send_channel_message(&state.discord_token, &claims.guild_id, &target, &content)
         .await
         .map_err(|error| {
             let status = if error == "discord_http_403" || error == "discord_http_401" {
@@ -5154,6 +5158,31 @@ async fn discord_json(
 
 async fn discord_send_channel_message(
     discord_token: &str,
+    expected_guild_id: &str,
+    channel_id: &str,
+    content: &str,
+) -> Result<(), String> {
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|_| "discord_request_failed".to_string())?;
+    discord_send_channel_message_at(
+        &client,
+        DISCORD_API_BASE,
+        discord_token,
+        expected_guild_id,
+        channel_id,
+        content,
+    )
+    .await
+}
+
+async fn discord_send_channel_message_at(
+    client: &Client,
+    api_base: &str,
+    discord_token: &str,
+    expected_guild_id: &str,
     channel_id: &str,
     content: &str,
 ) -> Result<(), String> {
@@ -5167,12 +5196,19 @@ async fn discord_send_channel_message(
     {
         return Err("invalid_discord_channel_id".into());
     }
-    let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(8))
-        .build()
-        .map_err(|_| "discord_request_failed".to_string())?;
+    if !is_discord_snowflake(expected_guild_id) {
+        return Err("invalid_discord_guild_id".into());
+    }
+    let auth = format!("Bot {discord_token}");
+    let channel =
+        discord_read::get_json(client, &auth, &format!("{api_base}/channels/{channel_id}")).await?;
+    if channel["id"].as_str() != Some(channel_id)
+        || channel["guild_id"].as_str() != Some(expected_guild_id)
+    {
+        return Err("discord_channel_guild_mismatch".into());
+    }
     let response = client
-        .post(format!("{DISCORD_API_BASE}/channels/{channel_id}/messages"))
+        .post(format!("{api_base}/channels/{channel_id}/messages"))
         .header(header::AUTHORIZATION, format!("Bot {discord_token}"))
         .json(&serde_json::json!({
             "content": content,
@@ -5717,6 +5753,48 @@ fn ticket_staff_notification_issues(
     issues
 }
 
+async fn require_role_offers(
+    state: &ApiState,
+    guild_id: &str,
+    publisher_id: &str,
+    role_ids: &[String],
+) -> Result<(), (StatusCode, Json<ApiError>)> {
+    let (authority, roles) = state
+        .guild_authorization
+        .role_offer_context(state, guild_id, publisher_id)
+        .await?;
+    let guild_id = guild_id
+        .parse::<u64>()
+        .map_err(|_| client_error(StatusCode::FORBIDDEN, "role_not_offerable"))?;
+    if role_ids.is_empty()
+        || role_ids.iter().any(|id| {
+            let role = roles
+                .iter()
+                .find(|role| role["id"].as_str() == Some(id.as_str()));
+            !id.parse::<u64>().ok().is_some_and(|id| {
+                helper_core::role_offer_allowed(
+                    guild_id,
+                    id,
+                    role.and_then(|role| role["position"].as_i64()),
+                    role.and_then(|role| role["managed"].as_bool())
+                        .unwrap_or(true),
+                    &authority,
+                )
+            })
+        })
+    {
+        return Err(client_error(StatusCode::FORBIDDEN, "role_not_offerable"));
+    }
+    Ok(())
+}
+
+fn role_reference_is_assigned(path: &str) -> bool {
+    !matches!(
+        path.split(['.', '[']).next().unwrap_or(path),
+        "staffRole" | "requiredRole" | "ignoredRoles"
+    )
+}
+
 fn role_hierarchy_issues(
     guild_id: &str,
     bot_role_ids: &[String],
@@ -5737,10 +5815,9 @@ fn role_hierarchy_issues(
         .max()
         .unwrap_or(0);
     for (path, id) in configured_roles {
-        let field = path.split(['.', '[']).next().unwrap_or(path);
         // These roles are references used for authorization/exemptions. They
         // are never assigned by the bot, so hierarchy must not block them.
-        if matches!(field, "staffRole" | "requiredRole" | "ignoredRoles") {
+        if !role_reference_is_assigned(path) {
             continue;
         }
         let Some(role) = roles
@@ -5906,6 +5983,19 @@ async fn generic_feature_preflight(
         );
     }
 
+    if request.enabled && key == "community.role_panels" {
+        let role_ids = request.config["roleIds"]
+            .as_array()
+            .map(|ids| {
+                ids.iter()
+                    .filter_map(|id| id.as_str().map(str::to_owned))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if !role_ids.is_empty() {
+            require_role_offers(&state, &claims.guild_id, &claims.user_id, &role_ids).await?;
+        }
+    }
     let snapshot = fetch_discord_guild_snapshot(&claims.guild_id, &state.discord_token).await;
     let bot_permissions =
         effective_bot_permissions(&claims.guild_id, &snapshot.roles, &snapshot.bot_role_ids);
@@ -6103,6 +6193,16 @@ async fn generic_feature_preflight(
                 "The Helper bot needs Manage Roles to assign achievement reward roles.".into(),
                 "error",
             );
+        }
+    }
+    if request.enabled && needs_role_management {
+        let assigned = configured_roles
+            .iter()
+            .filter(|(path, _)| role_reference_is_assigned(path))
+            .map(|(_, id)| id.clone())
+            .collect::<Vec<_>>();
+        if !assigned.is_empty() {
+            require_role_offers(&state, &claims.guild_id, &claims.user_id, &assigned).await?;
         }
     }
     if request.enabled && needs_role_management && snapshot.roles_ready && bot_context_available {
@@ -6657,6 +6757,7 @@ async fn discord_create_role(
 async fn discord_publish_role_panel(
     state: &ApiState,
     guild_id: &str,
+    publisher_id: &str,
     config: &serde_json::Value,
     reuse_existing: bool,
     source: &str,
@@ -6682,6 +6783,7 @@ async fn discord_publish_role_panel(
     if channel_id.is_empty() || role_ids.is_empty() {
         return Ok(None);
     }
+    require_role_offers(state, guild_id, publisher_id, &role_ids).await?;
     if reuse_existing
         && state
             .store
@@ -6796,7 +6898,8 @@ async fn discord_publish_role_panel(
                 "role_ids": role_ids,
                 "selection_mode": selection_mode,
                 "remove_on_unselect": remove_on_unselect,
-                "source": source
+                "source": source,
+                "publisher_id": publisher_id
             })
             .to_string(),
         )
@@ -6989,11 +7092,16 @@ async fn create_role_panel(
             "role_panel_quota_exceeded",
         ));
     }
-    let message_id = discord_publish_role_panel(&state, &claims.guild_id, &config, false, "panel")
-        .await?
-        .ok_or_else(|| {
-            client_error(StatusCode::BAD_GATEWAY, "discord_role_panel_publish_failed")
-        })?;
+    let message_id = discord_publish_role_panel(
+        &state,
+        &claims.guild_id,
+        &claims.user_id,
+        &config,
+        false,
+        "panel",
+    )
+    .await?
+    .ok_or_else(|| client_error(StatusCode::BAD_GATEWAY, "discord_role_panel_publish_failed"))?;
     let enabled_value = "true".to_owned();
     let mut projections = vec![
         (feature_key("community.role_panels"), enabled_value),
@@ -7081,11 +7189,16 @@ async fn update_role_panel(
             "feature_preflight_failed",
         ));
     }
-    let new_id = discord_publish_role_panel(&state, &claims.guild_id, &config, false, "update")
-        .await?
-        .ok_or_else(|| {
-            client_error(StatusCode::BAD_GATEWAY, "discord_role_panel_publish_failed")
-        })?;
+    let new_id = discord_publish_role_panel(
+        &state,
+        &claims.guild_id,
+        &claims.user_id,
+        &config,
+        false,
+        "update",
+    )
+    .await?
+    .ok_or_else(|| client_error(StatusCode::BAD_GATEWAY, "discord_role_panel_publish_failed"))?;
     if !old_channel_id.is_empty() {
         let _ = discord_delete_role_panel(&state, &old_channel_id, &message_id).await;
     }
@@ -7203,11 +7316,16 @@ async fn repair_role_panel(
         "selectionMode": panel.get("selection_mode").and_then(serde_json::Value::as_str).unwrap_or("multiple"),
         "removeOnUnselect": panel.get("remove_on_unselect").and_then(serde_json::Value::as_bool).unwrap_or(true),
     });
-    let new_id = discord_publish_role_panel(&state, &claims.guild_id, &config, false, "repair")
-        .await?
-        .ok_or_else(|| {
-            client_error(StatusCode::BAD_GATEWAY, "discord_role_panel_publish_failed")
-        })?;
+    let new_id = discord_publish_role_panel(
+        &state,
+        &claims.guild_id,
+        &claims.user_id,
+        &config,
+        false,
+        "repair",
+    )
+    .await?
+    .ok_or_else(|| client_error(StatusCode::BAD_GATEWAY, "discord_role_panel_publish_failed"))?;
     // Publish first so a Discord failure never destroys the last known-good
     // panel. Cleanup is best-effort after the replacement is stored.
     if !channel_id.is_empty() {
@@ -7304,6 +7422,18 @@ async fn quick_setup_step(
             "invalid_quick_setup_status",
         ));
     }
+    if step == "roles"
+        && update.status == "applied"
+        && update.enabled
+        && state
+            .guild_authorization
+            .permissions(&state, &claims)
+            .await?
+            & ((1 << 28) | 8)
+            == 0
+    {
+        return Err(client_error(StatusCode::FORBIDDEN, "role_not_offerable"));
+    }
     let mut value = read_quick_setup(&state, &claims.guild_id);
     let revision = value["revision"].as_u64().unwrap_or(0);
     if update
@@ -7386,6 +7516,17 @@ async fn quick_setup_step(
                 &normalized_config,
             )?,
             "roles" => {
+                if update.enabled {
+                    let ids = normalized_config["roleIds"]
+                        .as_array()
+                        .map(|ids| {
+                            ids.iter()
+                                .filter_map(|id| id.as_str().map(str::to_owned))
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    require_role_offers(&state, &claims.guild_id, &claims.user_id, &ids).await?;
+                }
                 publish_quick_setup_feature(
                     &state,
                     &claims.guild_id,
@@ -7398,6 +7539,7 @@ async fn quick_setup_step(
                     && let Some(message_id) = discord_publish_role_panel(
                         &state,
                         &claims.guild_id,
+                        &claims.user_id,
                         &normalized_config,
                         true,
                         "quick_setup",

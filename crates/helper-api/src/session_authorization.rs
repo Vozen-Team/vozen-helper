@@ -11,6 +11,109 @@ pub struct GuildAuthorization {
 }
 
 impl GuildAuthorization {
+    #[cfg(test)]
+    pub(super) fn with_test_base(base: String) -> Self {
+        Self {
+            base,
+            ..Self::new().unwrap()
+        }
+    }
+
+    pub(super) async fn role_offer_context(
+        &self,
+        state: &ApiState,
+        guild: &str,
+        user: &str,
+    ) -> Result<
+        (helper_core::RoleOfferAuthority, Vec<serde_json::Value>),
+        (StatusCode, Json<ApiError>),
+    > {
+        let context = async {
+            let guild_value = read(
+                &self.client,
+                &self.base,
+                &state.discord_token,
+                &format!("/guilds/{guild}"),
+            )
+            .await?;
+            let owner = guild_value["owner_id"]
+                .as_str()
+                .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+            let roles = read(
+                &self.client,
+                &self.base,
+                &state.discord_token,
+                &format!("/guilds/{guild}/roles"),
+            )
+            .await?;
+            let roles = roles
+                .as_array()
+                .cloned()
+                .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+            let bot = read(&self.client, &self.base, &state.discord_token, "/users/@me").await?;
+            let bot_id = bot["id"].as_str().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+            let bot_member = read(
+                &self.client,
+                &self.base,
+                &state.discord_token,
+                &format!("/guilds/{guild}/members/{bot_id}"),
+            )
+            .await?;
+            let actor = read(
+                &self.client,
+                &self.base,
+                &state.discord_token,
+                &format!("/guilds/{guild}/members/{user}"),
+            )
+            .await?;
+            let member_roles = |value: &serde_json::Value| -> Result<Vec<String>, StatusCode> {
+                value["roles"]
+                    .as_array()
+                    .ok_or(StatusCode::SERVICE_UNAVAILABLE)?
+                    .iter()
+                    .map(|role| {
+                        role.as_str()
+                            .map(str::to_owned)
+                            .ok_or(StatusCode::SERVICE_UNAVAILABLE)
+                    })
+                    .collect()
+            };
+            let bot_roles = member_roles(&bot_member)?;
+            let actor_roles = member_roles(&actor)?;
+            let top = |ids: &[String]| -> Result<i64, StatusCode> {
+                let mut top = 0;
+                for id in ids {
+                    let role = roles
+                        .iter()
+                        .find(|role| role["id"].as_str() == Some(id))
+                        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+                    top = top.max(
+                        role["position"]
+                            .as_i64()
+                            .ok_or(StatusCode::SERVICE_UNAVAILABLE)?,
+                    );
+                }
+                Ok(top)
+            };
+            Ok((
+                helper_core::RoleOfferAuthority {
+                    actor_is_owner: owner == user,
+                    actor_permissions: effective_bot_permissions(guild, &roles, &actor_roles)
+                        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?,
+                    actor_top_position: top(&actor_roles)?,
+                    bot_permissions: effective_bot_permissions(guild, &roles, &bot_roles)
+                        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?,
+                    bot_top_position: top(&bot_roles)?,
+                },
+                roles,
+            ))
+        };
+        tokio::time::timeout(StdDuration::from_secs(8), context)
+            .await
+            .unwrap_or(Err(StatusCode::SERVICE_UNAVAILABLE))
+            .map_err(|status| client_error(status, "role_offer_authority_unavailable"))
+    }
+
     pub fn new() -> Result<Self> {
         Ok(Self {
             client: Client::builder()
