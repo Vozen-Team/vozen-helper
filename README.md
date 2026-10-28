@@ -4,8 +4,8 @@ Bot de moderação de Discord **privado** e **self-hosted**, desenhado para corr
 **um único servidor** (o servidor do Diogo). Irmão do Vozen (bot TTS), mas projeto
 independente.
 
-> ⚠️ **Proprietário / não open source.** Repositório privado, sem licença OSS
-> (`"license": "UNLICENSED"`). Não distribuir nem publicar o código.
+> **Licença do código: AGPL-3.0-only.** Consulta o ficheiro [LICENSE](LICENSE).
+> Os componentes de terceiros conservam as respetivas licenças e avisos.
 
 ## O que faz (visão)
 
