@@ -211,6 +211,7 @@ mod tests {
         let mut authorization = GuildAuthorization::new().unwrap();
         authorization.base = format!("http://{address}");
         state.guild_authorization = Arc::new(authorization);
+        state.allowed_origin = Some("https://bot.example.com".into());
         let now = Utc::now();
         let claims = SessionClaims {
             session_id: Uuid::new_v4(),
@@ -270,6 +271,32 @@ mod tests {
             Some("before")
         );
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn logout_still_revokes_after_manager_permissions_are_lost() {
+        for bearer in [false, true] {
+            let (app, store, token, discord, server) = fixture().await;
+            discord.permissions.store(0, Ordering::SeqCst);
+            assert_eq!(request(&app, &token, None).await, StatusCode::FORBIDDEN);
+            let mut logout = Request::builder().method("POST").uri("/api/logout");
+            if bearer {
+                logout = logout.header(header::AUTHORIZATION, format!("Bearer {token}"));
+            } else {
+                logout = logout
+                    .header(header::COOKIE, format!("vh_session={token}"))
+                    .header(header::ORIGIN, "https://bot.example.com");
+            }
+            let response = app
+                .oneshot(logout.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let signed =
+                verify_session(&token, "test-session-secret-with-at-least-32-bytes").unwrap();
+            assert!(store.load_session(signed.session_id).unwrap().is_none());
+            server.abort();
+        }
     }
 
     #[tokio::test]

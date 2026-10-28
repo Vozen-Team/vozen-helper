@@ -5064,11 +5064,15 @@ fn create_session_response(
     Ok(response)
 }
 
-async fn logout(State(state): State<Arc<ApiState>>, headers: HeaderMap) -> impl IntoResponse {
+async fn logout(
+    State(state): State<Arc<ApiState>>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiError>)> {
+    require_cookie_origin(&state, &headers)?;
     if let Some(claims) = authenticate(&state, &headers) {
         let _ = state.store.revoke_session(claims.session_id);
     }
-    (
+    Ok((
         [(
             header::SET_COOKIE,
             format!(
@@ -5077,7 +5081,7 @@ async fn logout(State(state): State<Arc<ApiState>>, headers: HeaderMap) -> impl 
             ),
         )],
         Json(serde_json::json!({"ok":true})),
-    )
+    ))
 }
 
 async fn me(
@@ -11849,26 +11853,38 @@ async fn require_mutation_auth(
     state: &ApiState,
     headers: &HeaderMap,
 ) -> Result<SessionClaims, (StatusCode, Json<ApiError>)> {
-    let bearer_present = headers
+    // Reject cookies before authentication can refresh their idle timestamp.
+    if headers.contains_key(header::COOKIE) {
+        require_cookie_origin(state, headers)?;
+    }
+    let claims = require_auth(state, headers).await?;
+    require_cookie_origin(state, headers)?;
+    Ok(claims)
+}
+
+fn require_cookie_origin(
+    state: &ApiState,
+    headers: &HeaderMap,
+) -> Result<(), (StatusCode, Json<ApiError>)> {
+    if headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
-        .is_some_and(|value| !value.trim().is_empty());
-    let claims = require_auth(state, headers).await?;
-    if bearer_present {
-        return Ok(claims);
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        return Ok(());
     }
-    let origin = headers
-        .get(header::ORIGIN)
-        .and_then(|value| value.to_str().ok());
-    if !state
-        .allowed_origin
-        .as_deref()
-        .is_some_and(|allowed| origin.is_some_and(|value| origin_allowed(allowed, value)))
+    let mut origins = headers.get_all(header::ORIGIN).iter();
+    let origin = origins.next().and_then(|value| value.to_str().ok());
+    if origins.next().is_some()
+        || !state
+            .allowed_origin
+            .as_deref()
+            .is_some_and(|allowed| origin.is_some_and(|value| origin_allowed(allowed, value)))
     {
         return Err(client_error(StatusCode::FORBIDDEN, "csrf_origin_invalid"));
     }
-    Ok(claims)
+    Ok(())
 }
 fn origin_allowed(allowed: &str, origin: &str) -> bool {
     allowed.split(',').any(|value| value.trim() == origin)
@@ -15080,6 +15096,135 @@ mod tests {
         assert_eq!(body["planLimit"], 25);
         assert_eq!(body["maxWorkflows"], 4);
         assert_eq!(body["maxReplyLength"], 240);
+    }
+
+    #[tokio::test]
+    async fn logout_rejects_cookie_origins_without_session_side_effects() {
+        let allowed = "https://bot.example.com";
+        for origins in [
+            vec![],
+            vec!["https://attacker.invalid"],
+            vec!["null"],
+            vec![""],
+            vec!["https://bot.example.com.attacker.invalid"],
+            vec!["https://bot.example.com, https://attacker.invalid"],
+            vec![allowed, allowed],
+            vec![allowed, "https://attacker.invalid"],
+        ] {
+            for authorization in [None, Some("Basic invalid"), Some("Bearer    ")] {
+                let store = Store::open(":memory:").unwrap();
+                let mut session = claims("guild-a");
+                session.last_seen_at = Utc::now() - Duration::minutes(2);
+                store.save_session(&session).unwrap();
+                let before = store.load_session(session.session_id).unwrap().unwrap();
+                let mut api = state(store.clone());
+                api.allowed_origin = Some(allowed.into());
+                let token = sign_session(&session, &api.session_secret);
+                let mut request = Request::builder()
+                    .method("POST")
+                    .uri("/api/logout")
+                    .header(header::COOKIE, format!("{COOKIE}={token}"));
+                for origin in &origins {
+                    request = request.header(header::ORIGIN, *origin);
+                }
+                if let Some(value) = authorization {
+                    request = request.header(header::AUTHORIZATION, value);
+                }
+                let response = router(api)
+                    .oneshot(request.body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    response.status(),
+                    StatusCode::FORBIDDEN,
+                    "{origins:?} {authorization:?}"
+                );
+                assert!(!response.headers().contains_key(header::SET_COOKIE));
+                let after = store.load_session(session.session_id).unwrap().unwrap();
+                assert_eq!(after.last_seen_at, before.last_seen_at);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn logout_preserves_explicit_bearer_and_its_existing_cookie_precedence() {
+        for origin in [None, Some("https://attacker.invalid")] {
+            let store = Store::open(":memory:").unwrap();
+            let session = claims("guild-a");
+            let cookie_session = claims("guild-a");
+            store.save_session(&session).unwrap();
+            store.save_session(&cookie_session).unwrap();
+            let api = state(store.clone());
+            let token = sign_session(&session, &api.session_secret);
+            let cookie = sign_session(&cookie_session, &api.session_secret);
+            let mut request = Request::builder()
+                .method("POST")
+                .uri("/api/logout")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .header(header::COOKIE, format!("{COOKIE}={cookie}"));
+            if let Some(origin) = origin {
+                request = request.header(header::ORIGIN, origin);
+            }
+            let response = router(api)
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(
+                response.headers()[header::SET_COOKIE]
+                    .to_str()
+                    .unwrap()
+                    .contains("Max-Age=0")
+            );
+            assert!(store.load_session(session.session_id).unwrap().is_none());
+            assert!(
+                store
+                    .load_session(cookie_session.session_id)
+                    .unwrap()
+                    .is_some()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn logout_trusted_origin_remains_idempotent_without_a_live_session() {
+        for expired in [false, true] {
+            let store = Store::open(":memory:").unwrap();
+            let mut api = state(store.clone());
+            api.allowed_origin = Some("https://bot.example.com".into());
+            let mut request = Request::builder()
+                .method("POST")
+                .uri("/api/logout")
+                .header(header::ORIGIN, "https://bot.example.com");
+            if expired {
+                let mut session = claims("guild-a");
+                session.expires_at = Utc::now() - Duration::minutes(1);
+                store.save_session(&session).unwrap();
+                request = request.header(
+                    header::COOKIE,
+                    format!("{COOKIE}={}", sign_session(&session, &api.session_secret)),
+                );
+            }
+            let app = router(api);
+            for _ in 0..2 {
+                let response = app
+                    .clone()
+                    .oneshot(request.body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                assert!(
+                    response.headers()[header::SET_COOKIE]
+                        .to_str()
+                        .unwrap()
+                        .contains("Max-Age=0")
+                );
+                request = Request::builder()
+                    .method("POST")
+                    .uri("/api/logout")
+                    .header(header::ORIGIN, "https://bot.example.com");
+            }
+        }
     }
 
     #[tokio::test]
