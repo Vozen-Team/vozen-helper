@@ -137,21 +137,19 @@ fn validate_patch(mut fields: Map<String, Value>) -> Result<Map<String, Value>, 
     {
         return Err(client_error(StatusCode::BAD_REQUEST, "invalid_bot_profile"));
     }
-    if let Some(value) = fields.get_mut("nick") {
-        if !value.is_null() {
-            let nick = value
-                .as_str()
-                .ok_or_else(|| client_error(StatusCode::BAD_REQUEST, "invalid_nickname"))?;
-            let decision = evaluate_nickname(&json!({"nickname": nick}));
-            if !decision.allowed {
-                return Err(client_error(StatusCode::BAD_REQUEST, "invalid_nickname"));
-            }
-            *value = if decision.nickname.is_empty() {
-                Value::Null
-            } else {
-                Value::String(decision.nickname)
-            };
+    if let Some(value) = fields.get_mut("nick").filter(|value| !value.is_null()) {
+        let nick = value
+            .as_str()
+            .ok_or_else(|| client_error(StatusCode::BAD_REQUEST, "invalid_nickname"))?;
+        let decision = evaluate_nickname(&json!({"nickname": nick}));
+        if !decision.allowed {
+            return Err(client_error(StatusCode::BAD_REQUEST, "invalid_nickname"));
         }
+        *value = if decision.nickname.is_empty() {
+            Value::Null
+        } else {
+            Value::String(decision.nickname)
+        };
     }
     for key in ["avatar", "banner"] {
         if fields
