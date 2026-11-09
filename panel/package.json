@@ -2,6 +2,7 @@
   "name": "vozen-helper-panel",
   "private": true,
   "version": "0.2.0",
+  "license": "AGPL-3.0-only",
   "type": "module",
   "scripts": {
     "build": "tsc -b && vite build",

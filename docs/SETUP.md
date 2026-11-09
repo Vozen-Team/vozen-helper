@@ -22,7 +22,9 @@ Vozen: **sem** ffmpeg, Piper, modelos, Caddy ou API web.
 
 ## Parte B — Pôr o código no VPS
 
-O código é **privado** (não open source). Duas formas de o levar ao VPS:
+O código está licenciado sob **AGPL-3.0-only**; consulta o ficheiro `LICENSE`.
+A configuração privada e os segredos não fazem parte da licença do código.
+Duas formas de levar o código ao VPS:
 
 ### Opção 1 — Repositório Git privado (recomendado, permite auto-deploy)
 
