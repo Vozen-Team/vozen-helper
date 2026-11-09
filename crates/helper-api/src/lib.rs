@@ -7,6 +7,7 @@ use config_import::import_config;
 
 mod achievements;
 mod activity_feed;
+mod bot_profile;
 #[cfg(test)]
 mod discord_channel_tests;
 mod discord_context;
@@ -24,7 +25,7 @@ use anyhow::Result;
 use axum::{
     Form, Json, Router,
     body::Bytes,
-    extract::{Path, Query, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Redirect, Response},
     routing::{get, patch, post, put},
@@ -80,6 +81,7 @@ const SESSION_RESPONSE_HEADER: &str = "x-vozen-session";
 const SESSION_MAX_HOURS: i64 = 8;
 const IDLE_MINUTES: i64 = 30;
 static TICKET_PANEL_SAVE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+static NICKNAME_SAVE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[derive(Clone)]
 pub struct ApiState {
@@ -282,6 +284,12 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/config/twitch/{id}/test", post(test_twitch_delivery))
         .route("/api/guilds", get(guilds))
         .route("/api/guild-context", get(guild_context))
+        .route(
+            "/api/guilds/{guild_id}/bot-profile",
+            get(bot_profile::read)
+                .put(bot_profile::update)
+                .layer(DefaultBodyLimit::max(6 * 1024 * 1024)),
+        )
         .route("/api/preflight", post(preflight))
         .route("/api/quick-setup", get(quick_setup))
         .route("/api/quick-setup/dismiss", post(quick_setup_dismiss))
@@ -9431,6 +9439,11 @@ async fn update_feature_detail(
     } else {
         None
     };
+    let _nickname_save_guard = if key == "management.nickname" {
+        Some(NICKNAME_SAVE_LOCK.lock().await)
+    } else {
+        None
+    };
     let Some(_definition) = feature_definition(&key) else {
         return Err(client_error(StatusCode::BAD_REQUEST, "unknown_feature"));
     };
@@ -12565,6 +12578,78 @@ mod tests {
             .expect("response");
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn bot_profile_rejects_cross_server_writes_and_free_image_uploads() {
+        let store = Store::open(":memory:").unwrap();
+        let session = claims("100");
+        store.save_session(&session).unwrap();
+        store
+            .replace_session_guilds(
+                session.session_id,
+                &[("100".into(), "Sample".into(), Some("8".into()))],
+            )
+            .unwrap();
+        let mut api_state = state(store);
+        api_state.allowed_origin = Some("https://vozen.org".into());
+        let token = sign_session(&session, &api_state.session_secret);
+        let app = router(api_state);
+        let png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aZ1sAAAAASUVORK5CYII=";
+        for (guild, cookie, origin, fields, expected) in [
+            (
+                "100",
+                false,
+                None,
+                serde_json::json!({"nick":"Example"}),
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                "100",
+                true,
+                None,
+                serde_json::json!({"nick":"Example"}),
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                "101",
+                true,
+                Some("https://vozen.org"),
+                serde_json::json!({"nick":"Example"}),
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                "100",
+                true,
+                Some("https://vozen.org"),
+                serde_json::json!({"roles":["1"]}),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "100",
+                true,
+                Some("https://vozen.org"),
+                serde_json::json!({"avatar":png}),
+                StatusCode::FORBIDDEN,
+            ),
+        ] {
+            let mut request = Request::builder()
+                .method("PUT")
+                .uri(format!("/api/guilds/{guild}/bot-profile"))
+                .header(header::CONTENT_TYPE, "application/json");
+            if cookie {
+                request = request.header(header::COOKIE, format!("vh_session={token}"));
+            }
+            if let Some(origin) = origin {
+                request = request.header(header::ORIGIN, origin);
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(Body::from(fields.to_string())).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+        }
     }
 
     #[tokio::test]
