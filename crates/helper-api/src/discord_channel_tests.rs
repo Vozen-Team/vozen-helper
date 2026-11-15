@@ -342,3 +342,65 @@ async fn own_guild_channel_allows_paused_create_update_and_foreign_update_preser
     );
     server.abort();
 }
+
+#[tokio::test]
+async fn quick_setup_rejects_foreign_guild_channel_before_saving_or_publishing() {
+    let guild = Arc::new(std::sync::Mutex::new("100000000000000099".to_string()));
+    let saved = guild.clone();
+    let mock = Router::new().route(
+        "/channels/{channel}",
+        get(move || {
+            let saved = saved.clone();
+            async move {
+                Json(serde_json::json!({"id":CHANNEL,"guild_id":saved.lock().unwrap().clone(),"type":0}))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+    let (state, claims) = subscription_state();
+    let payload =
+        serde_json::json!({"status":"applied","enabled":true,"config":{"channel":CHANNEL}});
+    let (status, body) = request_subscription(
+        state.clone(),
+        &claims,
+        base.clone(),
+        "PUT",
+        "/api/quick-setup/steps/welcome",
+        payload.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(
+        state
+            .store
+            .get_feature_setting(GUILD, "support.welcome")
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        read_quick_setup(&state, GUILD)["revision"].as_u64(),
+        Some(0)
+    );
+
+    *guild.lock().unwrap() = GUILD.into();
+    let (status, body) = request_subscription(
+        state.clone(),
+        &claims,
+        base,
+        "PUT",
+        "/api/quick-setup/steps/welcome",
+        payload,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        state
+            .store
+            .get_feature_setting(GUILD, "support.welcome")
+            .unwrap()
+            .is_some_and(|record| record.enabled)
+    );
+    server.abort();
+}

@@ -83,6 +83,14 @@ for (const font of [
 // rejecting valid Portuguese accents.  The second byte of a UTF-8 mojibake
 // pair is in the U+0080–U+00BF range; a valid Portuguese Ã (for example) is
 // followed by a different uppercase character.
+const api = read('src/api.ts');
+check(
+  /if \(oauthLoginPending\) persistSessionBearer\(oauthSession\)/.test(api) &&
+    api.includes("sessionStorage.removeItem('vh_oauth_verifier')") &&
+    (api.match(/persistSessionBearer\(oauthSession\)/g) ?? []).length === 1,
+  '#session= fragment must only be accepted after a login started in this tab (login CSRF)',
+);
+
 const mojibake = /Ã[\u0080-\u00bf]|Â[\u0080-\u00bf]|â[\u0080-\u00bf]|�/u;
 for (const relativePath of [
   'src/App.tsx',
