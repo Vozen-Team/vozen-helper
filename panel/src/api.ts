@@ -350,9 +350,20 @@ try {
 } catch {
   /* opcional */
 }
+// Legacy (non-cookie) OAuth redirects deliver the session in `#session=`.
+// Only accept it when this tab started a login (marker set by startOAuth), so a
+// crafted link cannot sign the visitor into another account (login CSRF). The
+// marker is single-use: it is cleared on every load.
+let oauthLoginPending = false;
+try {
+  oauthLoginPending = Boolean(sessionStorage.getItem('vh_oauth_verifier'));
+  sessionStorage.removeItem('vh_oauth_verifier');
+} catch {
+  /* sessionStorage pode estar bloqueado */
+}
 const oauthSession = window.location.hash.match(/^#session=([A-Za-z0-9._~-]{32,4096})$/)?.[1];
 if (oauthSession) {
-  persistSessionBearer(oauthSession);
+  if (oauthLoginPending) persistSessionBearer(oauthSession);
   window.history.replaceState(null, '', `${window.location.pathname}${window.location.search}#/`);
 }
 

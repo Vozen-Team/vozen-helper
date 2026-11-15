@@ -5106,13 +5106,9 @@ fn create_session_response(
     }
     response.headers_mut().insert(
         header::SET_COOKIE,
-        format!(
-            "{COOKIE}={token};{} HttpOnly; Secure; SameSite=None; Path=/; Max-Age={}",
-            cookie_domain(&state),
-            SESSION_MAX_HOURS * 3600
-        )
-        .parse()
-        .unwrap(),
+        session_cookie(&state, &token, SESSION_MAX_HOURS * 3600)
+            .parse()
+            .unwrap(),
     );
     response.headers_mut().insert(
         SESSION_RESPONSE_HEADER,
@@ -5132,13 +5128,7 @@ async fn logout(
         let _ = state.store.revoke_session(claims.session_id);
     }
     Ok((
-        [(
-            header::SET_COOKIE,
-            format!(
-                "{COOKIE}=;{} HttpOnly; Secure; SameSite=None; Path=/; Max-Age=0",
-                cookie_domain(&state)
-            ),
-        )],
+        [(header::SET_COOKIE, session_cookie(&state, "", 0))],
         Json(serde_json::json!({"ok":true})),
     ))
 }
@@ -7642,6 +7632,26 @@ async fn quick_setup_step(
         normalized_config["roleIds"] = serde_json::Value::Array(role_ids);
     }
     if update.status == "applied" {
+        if step == "roles" && update.enabled {
+            let ids = normalized_config["roleIds"]
+                .as_array()
+                .map(|ids| {
+                    ids.iter()
+                        .filter_map(|id| id.as_str().map(str::to_owned))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            require_role_offers(&state, &claims.guild_id, &claims.user_id, &ids).await?;
+        }
+        if let Some(channel_id) = normalized_config
+            .get(channel_key)
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        {
+            // Same guild binding as the normal feature/provider paths: a channel
+            // id from another guild must never be saved or published here.
+            require_subscription_channel(&state, &claims.guild_id, channel_id).await?;
+        }
         match step.as_str() {
             "welcome" => publish_quick_setup_feature(
                 &state,
@@ -7652,17 +7662,6 @@ async fn quick_setup_step(
                 &normalized_config,
             )?,
             "roles" => {
-                if update.enabled {
-                    let ids = normalized_config["roleIds"]
-                        .as_array()
-                        .map(|ids| {
-                            ids.iter()
-                                .filter_map(|id| id.as_str().map(str::to_owned))
-                                .collect::<Vec<_>>()
-                        })
-                        .unwrap_or_default();
-                    require_role_offers(&state, &claims.guild_id, &claims.user_id, &ids).await?;
-                }
                 publish_quick_setup_feature(
                     &state,
                     &claims.guild_id,
@@ -7797,13 +7796,9 @@ async fn switch_session_guild(
     .into_response();
     response.headers_mut().insert(
         header::SET_COOKIE,
-        format!(
-            "{COOKIE}={token};{} HttpOnly; Secure; SameSite=None; Path=/; Max-Age={}",
-            cookie_domain(&state),
-            SESSION_MAX_HOURS * 3600
-        )
-        .parse()
-        .unwrap(),
+        session_cookie(&state, &token, SESSION_MAX_HOURS * 3600)
+            .parse()
+            .unwrap(),
     );
     Ok(response)
 }
@@ -11608,7 +11603,7 @@ async fn privacy_delete(
     Json(request): Json<PrivacyDeleteRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
     // Destructive privacy operations must not be authorisable by the ambient
-    // SameSite=None session cookie; require an explicit bearer token to limit
+    // session cookie; require an explicit bearer token to limit
     // cross-site request-forgery impact.
     let bearer_present = headers
         .get(header::AUTHORIZATION)
@@ -12124,6 +12119,15 @@ fn require_cookie_origin(
 }
 fn origin_allowed(allowed: &str, origin: &str) -> bool {
     allowed.split(',').any(|value| value.trim() == origin)
+}
+/// `vh_session` is only needed same-site: the panel (vozen.org) and the API
+/// (api.vozen.org) share a registrable domain, and the OAuth callback sets the
+/// cookie on a top-level navigation. Lax keeps it out of cross-site requests.
+fn session_cookie(state: &ApiState, token: &str, max_age: i64) -> String {
+    format!(
+        "{COOKIE}={token};{} HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age={max_age}",
+        cookie_domain(state)
+    )
 }
 fn cookie_domain(state: &ApiState) -> &'static str {
     if state.oauth_redirect_uri.contains(".vozen.org") {
@@ -15483,6 +15487,12 @@ mod tests {
                     .to_str()
                     .unwrap()
                     .contains("Max-Age=0")
+            );
+            assert!(
+                response.headers()[header::SET_COOKIE]
+                    .to_str()
+                    .unwrap()
+                    .contains("SameSite=Lax")
             );
             assert!(store.load_session(session.session_id).unwrap().is_none());
             assert!(

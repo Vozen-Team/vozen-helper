@@ -78,6 +78,7 @@ pub(super) async fn get(
 async fn validate_role(
     state: &ApiState,
     guild: &str,
+    actor: &str,
     input: &ShopProductInput,
 ) -> Result<(), (StatusCode, Json<ApiError>)> {
     if input.delivery != "role" {
@@ -87,6 +88,9 @@ async fn validate_role(
         .role_id
         .as_deref()
         .ok_or_else(|| client_error(StatusCode::BAD_REQUEST, "shop_invalid_product"))?;
+    // The actor must be able to hand out this role themselves (Manage Roles and
+    // role below their top role), not just the bot.
+    require_role_offers(state, guild, actor, &[role_id.to_owned()]).await?;
     let snapshot = fetch_discord_guild_snapshot(guild, &state.discord_token).await;
     if !snapshot.roles_ready || !snapshot.bot_ready {
         return Err(client_error(
@@ -124,7 +128,7 @@ pub(super) async fn create(
 ) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
     let claims = require_mutation_auth(&state, &headers).await?;
     scope(&claims, &query)?;
-    validate_role(&state, &claims.guild_id, &input).await?;
+    validate_role(&state, &claims.guild_id, &claims.user_id, &input).await?;
     state
         .store
         .save_shop_product(&claims.guild_id, None, 0, &input)
@@ -140,7 +144,7 @@ pub(super) async fn update(
 ) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
     let claims = require_mutation_auth(&state, &headers).await?;
     scope(&claims, &query)?;
-    validate_role(&state, &claims.guild_id, &input.product).await?;
+    validate_role(&state, &claims.guild_id, &claims.user_id, &input.product).await?;
     state
         .store
         .save_shop_product(&claims.guild_id, Some(id), input.version, &input.product)

@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# Secrets (.env, data) are written below: keep everything owner-only by default.
+umask 077
 
 version="${1:?release version required}"
 root=/home/vozen/vozen-helper-rust
@@ -67,7 +69,7 @@ printf 'HELPER_DATABASE_URL=%s/vozen-helper.db\n' "$node_root" >> "$root/shared/
 printf 'HELPER_PRODUCT_ROOT=%s/current\n' "$root" >> "$root/shared/.env"
 printf 'HELPER_BIND_ADDR=127.0.0.1:8788\n' >> "$root/shared/.env"
 printf 'HELPER_SESSION_SECRET=%s\n' "$(openssl rand -hex 32)" >> "$root/shared/.env"
-printf 'HELPER_ALLOWED_ORIGIN=https://vozen.org,https://rexy40407.github.io\nHELPER_API_ONLY=false\nHELPER_ALLOW_LEGACY_SESSION=false\n' >> "$root/shared/.env"
+printf 'HELPER_ALLOWED_ORIGIN=https://vozen.org\nHELPER_API_ONLY=false\nHELPER_ALLOW_LEGACY_SESSION=false\n' >> "$root/shared/.env"
 if [[ -n "$private_tracker_client_id" || -n "$private_tracker_owner_id" ]]; then
   : "${private_tracker_client_id:?set HELPER_PRIVATE_TRACKER_CLIENT_ID and HELPER_PRIVATE_TRACKER_OWNER_ID together}"
   : "${private_tracker_owner_id:?set HELPER_PRIVATE_TRACKER_CLIENT_ID and HELPER_PRIVATE_TRACKER_OWNER_ID together}"
