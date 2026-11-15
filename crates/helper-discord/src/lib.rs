@@ -2676,12 +2676,27 @@ impl EventHandler for Handler {
                 .as_ref()
                 .map(|g| g.name.as_str())
                 .unwrap_or("this server");
-            let channel = welcome["channel"]
+            let channel = match welcome["channel"]
                 .as_str()
                 .and_then(|id| id.parse::<u64>().ok())
                 .filter(|id| *id > 0)
-                .map(ChannelId::new)
-                .or_else(|| guild.as_ref().and_then(|g| g.system_channel_id));
+            {
+                // A stored channel id must belong to this guild before posting.
+                Some(configured) => match guild_delivery::require_guild_channel(
+                    &ctx.http,
+                    &guild_text,
+                    &configured.to_string(),
+                )
+                .await
+                {
+                    Ok(channel_id) => Some(channel_id),
+                    Err(error) => {
+                        warn!(guild_id = %guild_text, channel_id = configured, %error, "welcome channel rejected");
+                        None
+                    }
+                },
+                None => guild.as_ref().and_then(|g| g.system_channel_id),
+            };
             let public_text = unified_welcome_text(
                 &self.store,
                 &guild_text,
@@ -3493,13 +3508,16 @@ impl EventHandler for Handler {
                 } else {
                     String::new()
                 };
+                // Edited content is member-controlled: never let it ping anyone.
                 let _ = ChannelId::new(log_channel)
-                    .say(
+                    .send_message(
                         &ctx.http,
-                        format!(
-                            "Audit: message {} edited in <#{}> by <@{}>.{}",
-                            event.id, event.channel_id, author_id, content
-                        ),
+                        CreateMessage::new()
+                            .content(format!(
+                                "Audit: message {} edited in <#{}> by <@{}>.{}",
+                                event.id, event.channel_id, author_id, content
+                            ))
+                            .allowed_mentions(CreateAllowedMentions::new()),
                     )
                     .await;
             }
@@ -4217,7 +4235,19 @@ impl EventHandler for Handler {
                     continue;
                 };
                 if let Some(reply) = decision.reply {
-                    let _ = message.channel_id.say(&ctx.http, reply).await;
+                    let _ = message
+                        .channel_id
+                        .send_message(
+                            &ctx.http,
+                            CreateMessage::new().content(reply).allowed_mentions(
+                                workflow_reply_mentions(
+                                    policy.allow_mentions,
+                                    &workflow.payload,
+                                    message.author.id,
+                                ),
+                            ),
+                        )
+                        .await;
                 }
                 if let Some(reaction) = decision.reaction {
                     let _ = message
@@ -4476,6 +4506,7 @@ async fn process_youtube_subscription(
         &subscription.guild_id,
         &subscription.target_channel_id,
         content,
+        &subscription.mention,
     )
     .await?;
     store.update_youtube_poll(subscription.id, Some(&video.id), next(), 0, None)?;
@@ -4582,6 +4613,7 @@ async fn process_rss_subscription(
         &subscription.guild_id,
         &subscription.target_channel_id,
         content,
+        &subscription.mention,
     )
     .await
     {
@@ -5251,6 +5283,7 @@ async fn process_bluesky_subscription(
         &subscription.guild_id,
         &subscription.target_channel_id,
         content,
+        &subscription.mention,
     )
     .await?;
     store.update_bluesky_poll(subscription.id, Some(&post.uri), next(), 0, None)?;
@@ -5439,6 +5472,7 @@ async fn process_tiktok_subscription(
         &subscription.guild_id,
         &subscription.target_channel_id,
         content,
+        &subscription.mention,
     )
     .await?;
     store.update_tiktok_poll(subscription.id, Some(&video.id), next(), 0, None)?;
@@ -5556,6 +5590,7 @@ async fn process_instagram_subscription(
         &subscription.guild_id,
         &subscription.target_channel_id,
         content,
+        &subscription.mention,
     )
     .await?;
     store.update_instagram_poll(subscription.id, Some(&item.id), next(), 0, None)?;
@@ -5663,6 +5698,7 @@ async fn process_kick_subscription(
         &subscription.guild_id,
         &subscription.target_channel_id,
         content,
+        &subscription.mention,
     )
     .await?;
     store.update_kick_poll(subscription.id, Some(&stream.id), next(), 0, None)?;
@@ -5742,6 +5778,7 @@ async fn process_twitch_subscription(
         &subscription.guild_id,
         &subscription.target_channel_id,
         content,
+        &subscription.mention,
     )
     .await
     {
@@ -6342,11 +6379,19 @@ impl Handler {
 
     async fn handle_command(&self, ctx: &Context, command: &CommandInteraction) -> Result<()> {
         if let Some(required) = required_permission(command.data.name.as_str()) {
-            let permissions = command
-                .member
-                .as_deref()
-                .and_then(|member| member.permissions)
-                .unwrap_or_else(Permissions::empty);
+            // Interaction member permissions include this channel's overwrites,
+            // so they only authorise commands confined to this channel.
+            let permissions = if permission_is_channel_scoped(command.data.name.as_str()) {
+                command
+                    .member
+                    .as_deref()
+                    .and_then(|member| member.permissions)
+                    .unwrap_or_else(Permissions::empty)
+            } else {
+                interaction_guild_permissions(ctx, command)
+                    .await
+                    .unwrap_or_else(Permissions::empty)
+            };
             if !permissions.contains(required) && !permissions.contains(Permissions::ADMINISTRATOR)
             {
                 return respond(
@@ -11828,6 +11873,52 @@ async fn apply_lockdown(
     Ok(changed)
 }
 
+/// Commands whose effect stays inside the channel where they are invoked.
+/// Every other privileged command changes guild-wide state (all channels,
+/// server config, events, members) and is authorised at guild level.
+fn permission_is_channel_scoped(command: &str) -> bool {
+    matches!(command, "purge" | "slowmode" | "embed")
+}
+
+/// Guild-level permissions from the member's roles, ignoring channel
+/// overwrites, the same way `role_publisher_allowed` computes authority.
+async fn interaction_guild_permissions(
+    ctx: &Context,
+    command: &CommandInteraction,
+) -> Option<Permissions> {
+    let guild_id = command.guild_id?;
+    let member = command.member.as_deref()?;
+    let guild = guild_id.to_partial_guild(&ctx.http).await.ok()?;
+    Some(guild_level_permissions(
+        guild.owner_id == member.user.id,
+        guild_id,
+        guild.roles.values().map(|role| (role.id, role.permissions)),
+        &member.roles,
+    ))
+}
+
+fn guild_level_permissions(
+    is_owner: bool,
+    guild_id: serenity::all::GuildId,
+    roles: impl IntoIterator<Item = (RoleId, Permissions)>,
+    member_roles: &[RoleId],
+) -> Permissions {
+    if is_owner {
+        return Permissions::all();
+    }
+    let permissions = roles
+        .into_iter()
+        .filter(|(id, _)| id.get() == guild_id.get() || member_roles.contains(id))
+        .fold(Permissions::empty(), |bits, (_, permissions)| {
+            bits | permissions
+        });
+    if permissions.contains(Permissions::ADMINISTRATOR) {
+        Permissions::all()
+    } else {
+        permissions
+    }
+}
+
 fn required_permission(command: &str) -> Option<Permissions> {
     if let Some(required) = helper_core::manual_moderation::permissions(command) {
         return Some(Permissions::from_bits_retain(required.actor));
@@ -12119,6 +12210,18 @@ fn feature_maturity_allows_runtime(key: &str) -> bool {
         (helper_contracts::FeatureMaturity::Blocked, _) => false,
         _ => feature_is_configurable(key),
     }
+}
+
+fn monetization_role_configured(config_json: &str, role_id: RoleId) -> bool {
+    serde_json::from_str::<serde_json::Value>(config_json)
+        .ok()
+        .and_then(|config| {
+            config
+                .get("targetRoleId")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|raw| raw.trim().parse::<u64>().ok())
+        })
+        .is_some_and(|configured| configured != 0 && configured == role_id.get())
 }
 
 fn feature_explicitly_disabled(store: &Store, guild_id: &str, key: &str) -> bool {
@@ -12429,6 +12532,42 @@ fn ticket_opening_message(
         ),
         None => format!("Hello <@{opener_id}>! Tell us what you need."),
     }
+}
+
+/// Workflow replies can embed member text via `{message}`, so Discord must
+/// only parse mentions the admin wrote into the workflow payload itself (and
+/// only when the guild enabled workflow mentions). Nothing is parsed otherwise.
+fn workflow_reply_mentions(
+    allow_mentions: bool,
+    payload: &str,
+    author_id: serenity::all::UserId,
+) -> CreateAllowedMentions {
+    let allowed = CreateAllowedMentions::new();
+    if !allow_mentions {
+        return allowed;
+    }
+    let ids = |prefix: &str| {
+        payload
+            .split(prefix)
+            .skip(1)
+            .filter_map(|rest| rest.split_once('>'))
+            .filter_map(|(id, _)| id.parse::<u64>().ok())
+            .filter(|id| *id > 0)
+            .collect::<Vec<_>>()
+    };
+    let mut users = ids("<@!");
+    users.extend(ids("<@"));
+    let mut users = users
+        .into_iter()
+        .map(serenity::all::UserId::new)
+        .collect::<Vec<_>>();
+    if payload.contains("{user}") {
+        users.push(author_id);
+    }
+    allowed
+        .everyone(payload.contains("@everyone") || payload.contains("@here"))
+        .users(users)
+        .roles(ids("<@&").into_iter().map(RoleId::new).collect::<Vec<_>>())
 }
 
 fn ticket_opening_mentions(
@@ -13312,6 +13451,16 @@ async fn deliver_scheduled_action(
             .and_then(|raw| raw.parse::<u64>().ok())
             .map(RoleId::new)
             .ok_or_else(|| anyhow::anyhow!("invalid monetization role"))?;
+        // Checkout metadata is not authority: only the role the guild configured
+        // for monetization may be granted.
+        let configured = store
+            .get_feature_setting(guild_id, "growth.monetization")?
+            .is_some_and(|record| monetization_role_configured(&record.config_json, role_id));
+        if !configured {
+            warn!(%guild_id, role_id = role_id.get(), "monetization role is not the configured subscriber role");
+            store.delete_scheduled_action(id)?;
+            return Ok(());
+        }
         let guild = guild_id
             .parse::<u64>()
             .map(serenity::all::GuildId::new)
@@ -13321,7 +13470,7 @@ async fn deliver_scheduled_action(
             store.delete_scheduled_action(id)?;
             return Ok(());
         };
-        if role.managed {
+        if role.managed || !helper_core::shop_role_permissions_safe(role.permissions.bits()) {
             store.delete_scheduled_action(id)?;
             return Ok(());
         }
@@ -13659,6 +13808,98 @@ fn stored_role_panel_role_ids(panel: Option<&serde_json::Value>) -> Vec<u64> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn guild_wide_commands_ignore_channel_overwrites() {
+        use serenity::all::{GuildId, Permissions, RoleId};
+        for name in [
+            "lockdown",
+            "unlock",
+            "ticket-config",
+            "event-edit",
+            "event-cancel",
+            "setup",
+            "ban",
+        ] {
+            assert!(!super::permission_is_channel_scoped(name), "{name}");
+        }
+        for name in ["purge", "slowmode", "embed"] {
+            assert!(super::permission_is_channel_scoped(name), "{name}");
+        }
+        let guild = GuildId::new(1);
+        let roles = || {
+            [
+                (RoleId::new(1), Permissions::VIEW_CHANNEL),
+                (RoleId::new(2), Permissions::MANAGE_CHANNELS),
+                (RoleId::new(3), Permissions::ADMINISTRATOR),
+            ]
+        };
+        // A member whose only Manage Channels comes from a channel overwrite
+        // has no guild-level Manage Channels.
+        let plain = super::guild_level_permissions(false, guild, roles(), &[]);
+        assert!(!plain.contains(Permissions::MANAGE_CHANNELS));
+        assert!(plain.contains(Permissions::VIEW_CHANNEL));
+        assert!(
+            super::guild_level_permissions(false, guild, roles(), &[RoleId::new(2)])
+                .contains(Permissions::MANAGE_CHANNELS)
+        );
+        assert!(
+            super::guild_level_permissions(false, guild, roles(), &[RoleId::new(3)])
+                .contains(Permissions::MANAGE_EVENTS)
+        );
+        assert_eq!(
+            super::guild_level_permissions(true, guild, roles(), &[]),
+            Permissions::all()
+        );
+    }
+
+    #[test]
+    fn monetization_grants_only_the_configured_subscriber_role() {
+        use serenity::all::RoleId;
+        let config = r#"{"productName":"VIP","targetRoleId":"123456789012345678"}"#;
+        assert!(super::monetization_role_configured(
+            config,
+            RoleId::new(123456789012345678)
+        ));
+        assert!(!super::monetization_role_configured(
+            config,
+            RoleId::new(999999999999999999)
+        ));
+        assert!(!super::monetization_role_configured(
+            r#"{"targetRoleId":""}"#,
+            RoleId::new(123456789012345678)
+        ));
+        assert!(!super::monetization_role_configured(
+            "not json",
+            RoleId::new(123456789012345678)
+        ));
+        // Dangerous roles are refused even when configured.
+        assert!(!helper_core::shop_role_permissions_safe(8));
+        assert!(!helper_core::shop_role_permissions_safe(1 << 28));
+        assert!(helper_core::shop_role_permissions_safe(0));
+    }
+
+    #[test]
+    fn workflow_replies_never_parse_member_supplied_mentions() {
+        let author = serenity::all::UserId::new(7);
+        let json = |allow: bool, payload: &str| {
+            serde_json::to_value(super::workflow_reply_mentions(allow, payload, author)).unwrap()
+        };
+        let denied = json(false, "@everyone <@&42> {user} {message}");
+        assert_eq!(denied["parse"], serde_json::json!([]));
+        assert!(denied["roles"].as_array().is_none_or(Vec::is_empty));
+        assert!(denied["users"].as_array().is_none_or(Vec::is_empty));
+        // With mentions enabled, only what the admin wrote in the payload pings;
+        // anything arriving through {message} stays inert.
+        let only_message = json(true, "Thanks: {message}");
+        assert_eq!(only_message["parse"], serde_json::json!([]));
+        assert!(only_message["roles"].as_array().is_none_or(Vec::is_empty));
+        assert!(only_message["users"].as_array().is_none_or(Vec::is_empty));
+        let admin = json(true, "Hi {user}, see <@&42> and <@!9> @here");
+        assert_eq!(admin["parse"], serde_json::json!(["everyone"]));
+        assert_eq!(admin["roles"], serde_json::json!(["42"]));
+        assert_eq!(admin["users"], serde_json::json!(["9", "7"]));
+    }
+
     #[test]
     fn event_edit_and_cancel_require_manage_events_in_registration_and_runtime() {
         for name in ["event-edit", "event-cancel"] {

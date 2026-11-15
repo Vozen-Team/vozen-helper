@@ -1,7 +1,7 @@
 //! Guild-bound delivery for persisted provider subscriptions, including legacy rows.
 use anyhow::{Result, bail};
 use serenity::{
-    all::{Channel, ChannelId},
+    all::{Channel, ChannelId, CreateAllowedMentions, CreateMessage, RoleId},
     http::Http,
 };
 use std::time::Duration;
@@ -11,18 +11,61 @@ pub(super) async fn send(
     guild_id: &str,
     channel_id: &str,
     content: String,
+    mention: &str,
 ) -> Result<()> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(8))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()?;
     send_at(
         http,
-        &client,
+        &delivery_client()?,
         "https://discord.com/api/v10",
         guild_id,
         channel_id,
         content,
+        mention,
+    )
+    .await
+}
+
+/// Provider text (titles, descriptions, captions) is third-party controlled, so
+/// Discord must never parse mentions from it. Only the single mention the admin
+/// configured on the subscription (validated by the API as `@everyone`,
+/// `@here` or `<@&role>`) is allowed to ping.
+fn alert_allowed_mentions(mention: &str) -> CreateAllowedMentions {
+    let allowed = CreateAllowedMentions::new();
+    let mention = mention.trim();
+    if mention == "@everyone" || mention == "@here" {
+        return allowed.everyone(true);
+    }
+    match mention
+        .strip_prefix("<@&")
+        .and_then(|rest| rest.strip_suffix('>'))
+        .and_then(|id| id.parse::<u64>().ok())
+        .filter(|id| *id > 0)
+    {
+        Some(role) => allowed.roles(vec![RoleId::new(role)]),
+        None => allowed,
+    }
+}
+
+fn delivery_client() -> Result<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .timeout(Duration::from_secs(8))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?)
+}
+
+/// Fresh check that `channel_id` is a guild channel of `guild_id`. Used before
+/// any bot post to a channel id that came from stored configuration.
+pub(super) async fn require_guild_channel(
+    http: &Http,
+    guild_id: &str,
+    channel_id: &str,
+) -> Result<ChannelId> {
+    require_guild_channel_at(
+        http,
+        &delivery_client()?,
+        "https://discord.com/api/v10",
+        guild_id,
+        channel_id,
     )
     .await
 }
@@ -34,7 +77,27 @@ async fn send_at(
     guild_id: &str,
     channel_id: &str,
     content: String,
+    mention: &str,
 ) -> Result<()> {
+    require_guild_channel_at(http, client, api_base, guild_id, channel_id)
+        .await?
+        .send_message(
+            http,
+            CreateMessage::new()
+                .content(content)
+                .allowed_mentions(alert_allowed_mentions(mention)),
+        )
+        .await?;
+    Ok(())
+}
+
+async fn require_guild_channel_at(
+    http: &Http,
+    client: &reqwest::Client,
+    api_base: &str,
+    guild_id: &str,
+    channel_id: &str,
+) -> Result<ChannelId> {
     let guild_id = guild_id
         .parse::<u64>()
         .ok()
@@ -61,8 +124,7 @@ async fn send_at(
     let Channel::Guild(_) = serde_json::from_value::<Channel>(value)? else {
         bail!("discord_channel_guild_mismatch");
     };
-    ChannelId::new(channel_id).say(http, content).await?;
-    Ok(())
+    Ok(ChannelId::new(channel_id))
 }
 
 #[cfg(test)]
@@ -75,6 +137,28 @@ mod tests {
             atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering},
         },
     };
+
+    #[test]
+    fn alert_mentions_only_allow_the_configured_mention() {
+        let json = |mention: &str| serde_json::to_value(alert_allowed_mentions(mention)).unwrap();
+        for mention in ["", "<@123>", "<@&0>", "<@&abc>", "@someone"] {
+            let value = json(mention);
+            assert_eq!(value["parse"], serde_json::json!([]), "{mention}");
+            assert!(
+                value["roles"].as_array().is_none_or(Vec::is_empty),
+                "{mention}"
+            );
+            assert!(
+                value["users"].as_array().is_none_or(Vec::is_empty),
+                "{mention}"
+            );
+        }
+        assert_eq!(json("@everyone")["parse"], serde_json::json!(["everyone"]));
+        assert_eq!(json("@here")["parse"], serde_json::json!(["everyone"]));
+        let role = json("<@&42>");
+        assert_eq!(role["parse"], serde_json::json!([]));
+        assert_eq!(role["roles"], serde_json::json!(["42"]));
+    }
 
     #[tokio::test]
     async fn fresh_channel_check_blocks_foreign_dm_missing_and_failed_metadata_before_post() {
@@ -134,10 +218,21 @@ mod tests {
             .ratelimiter_disabled(true)
             .build();
         let checks = async {
-            send_at(&http, &client, &api_base, "1", "20", "fixture".into())
+            send_at(&http, &client, &api_base, "1", "20", "fixture".into(), "")
                 .await
                 .unwrap();
             assert_eq!(posts.load(Ordering::SeqCst), 1);
+            assert!(
+                require_guild_channel_at(&http, &client, &api_base, "9", "20")
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                require_guild_channel_at(&http, &client, &api_base, "1", "20")
+                    .await
+                    .unwrap(),
+                ChannelId::new(20)
+            );
             for body in [
                 serde_json::json!({"id":"20","guild_id":"9","type":0,"name":"foreign"}),
                 serde_json::json!({"id":"20","type":0,"name":"missing guild"}),
@@ -146,7 +241,7 @@ mod tests {
             ] {
                 *metadata.lock().unwrap() = body;
                 assert!(
-                    send_at(&http, &client, &api_base, "1", "20", "blocked".into())
+                    send_at(&http, &client, &api_base, "1", "20", "blocked".into(), "")
                         .await
                         .is_err()
                 );
@@ -154,7 +249,7 @@ mod tests {
             for code in [404, 403, 503] {
                 status.store(code, Ordering::SeqCst);
                 assert!(
-                    send_at(&http, &client, &api_base, "1", "20", "blocked".into())
+                    send_at(&http, &client, &api_base, "1", "20", "blocked".into(), "")
                         .await
                         .is_err()
                 );
@@ -162,12 +257,12 @@ mod tests {
             assert_eq!(posts.load(Ordering::SeqCst), 1);
             let before = reads.load(Ordering::SeqCst);
             assert!(
-                send_at(&http, &client, &api_base, "0", "20", "blocked".into())
+                send_at(&http, &client, &api_base, "0", "20", "blocked".into(), "")
                     .await
                     .is_err()
             );
             assert!(
-                send_at(&http, &client, &api_base, "1", "0", "blocked".into())
+                send_at(&http, &client, &api_base, "1", "0", "blocked".into(), "")
                     .await
                     .is_err()
             );

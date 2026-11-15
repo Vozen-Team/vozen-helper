@@ -222,3 +222,39 @@ async fn config_import_rechecks_publisher_hierarchy_and_manage_roles() {
         server.abort();
     }
 }
+
+#[tokio::test]
+async fn shop_role_products_require_actor_role_authority_before_storage() {
+    for (method, uri) in [
+        ("POST", format!("/api/economy/products?guildId={GUILD}")),
+        ("PUT", format!("/api/economy/products/1?guildId={GUILD}")),
+    ] {
+        let (state, claims, _, server) = fixture().await;
+        let store = state.store.clone();
+        let product = serde_json::json!({"name":"VIP","price":10,"delivery":"role","roleId":HIGH});
+        let payload = if method == "PUT" {
+            serde_json::json!({"version":0,"product":product})
+        } else {
+            product
+        };
+        let token = sign_session(&claims, &state.session_secret);
+        let response = router(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(method)
+                    .uri(&uri)
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{uri}");
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(body["code"], "role_not_offerable", "{uri}: {body}");
+        assert!(store.shop_products(GUILD).unwrap().is_empty());
+        server.abort();
+    }
+}
