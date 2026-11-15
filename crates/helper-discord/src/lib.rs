@@ -6397,7 +6397,12 @@ impl Handler {
         }
         if let Some(guild_id) = command.guild_id
             && let Some(feature_key) = command_feature_key(command.data.name.as_str())
-            && !feature_enabled(&self.store, &guild_id.to_string(), feature_key, None)
+            && !command_feature_available(
+                &self.store,
+                &guild_id.to_string(),
+                command.data.name.as_str(),
+                feature_key,
+            )?
         {
             let message = format!(
                 "This command is disabled because **{}** is disabled in this server. Enable it in the dashboard first.",
@@ -8236,24 +8241,17 @@ impl Handler {
                 let Some(guild_id) = command.guild_id else {
                     return respond(ctx, command, "Este comando só pode ser usado num servidor.").await;
                 };
-                let enabled = option_bool(command, "enabled").unwrap_or(false);
-                let joins = option_i64(command, "joins").unwrap_or(10).clamp(2, 100);
-                let window_seconds = option_i64(command, "window_seconds").unwrap_or(10).clamp(3, 60);
+                let enabled = option_bool(command, "enabled")
+                    .ok_or_else(|| anyhow::anyhow!("missing anti-raid enabled option"))?;
                 let guild_text = guild_id.to_string();
-                self.store.set_setting(
+                let (joins, window_seconds) = save_anti_raid_settings(
+                    &self.store,
                     &guild_text,
-                    "security.anti_raid.enabled",
-                    if enabled { "true" } else { "false" },
-                )?;
-                self.store.set_setting(
-                    &guild_text,
-                    "security.anti_raid.joins",
-                    &joins.to_string(),
-                )?;
-                self.store.set_setting(
-                    &guild_text,
-                    "security.anti_raid.window_seconds",
-                    &window_seconds.to_string(),
+                    &command.user.id.to_string(),
+                    enabled,
+                    option_i64(command, "joins"),
+                    option_i64(command, "window_seconds"),
+                    option_i64(command, "incident_minutes"),
                 )?;
                 if enabled {
                     format!("Anti-raid enabled: {joins} joins in {window_seconds}s enable the join gate.")
@@ -11996,6 +11994,20 @@ async fn refresh_invite_snapshots(
     info!(%guild_text, observed, "invite tracker snapshots primed");
 }
 
+fn command_feature_available(
+    store: &Store,
+    guild_id: &str,
+    command: &str,
+    feature_key: &str,
+) -> Result<bool> {
+    if feature_enabled(store, guild_id, feature_key, None) {
+        return Ok(true);
+    }
+    Ok(command == "anti-raid"
+        && feature_maturity_allows_runtime(feature_key)
+        && store.get_feature_setting(guild_id, feature_key)?.is_some())
+}
+
 fn feature_enabled(store: &Store, guild_id: &str, key: &str, legacy_key: Option<&str>) -> bool {
     if key == "support.welcome" {
         return store
@@ -12496,6 +12508,72 @@ fn setting_u64(store: &Store, guild_id: &str, key: &str, default: u64) -> u64 {
 
 fn setting_u64_optional(store: &Store, guild_id: &str, key: &str) -> Option<u64> {
     setting_string(store, guild_id, key).and_then(|value| value.parse::<u64>().ok())
+}
+
+fn save_anti_raid_settings(
+    store: &Store,
+    guild_id: &str,
+    actor_id: &str,
+    enabled: bool,
+    joins: Option<i64>,
+    window_seconds: Option<i64>,
+    incident_minutes: Option<i64>,
+) -> Result<(i64, i64)> {
+    let feature_key = "protection.anti_raid";
+    let record = store.get_feature_setting(guild_id, feature_key)?;
+    let config_key = format!("feature.config.{feature_key}");
+    let stored_config = match &record {
+        Some(record) => Some(record.config_json.clone()),
+        None => store.get_setting(guild_id, &config_key)?,
+    };
+    let mut config: serde_json::Value =
+        serde_json::from_str(stored_config.as_deref().unwrap_or("{}"))?;
+    let fields = config
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("invalid anti-raid feature configuration"))?;
+    let mut settings = vec![
+        ("security.anti_raid.enabled".into(), enabled.to_string()),
+        (format!("feature.{feature_key}"), enabled.to_string()),
+    ];
+    let mut bounded = |requested: Option<i64>, field: &str, setting: &str, min, max| {
+        let previous = fields
+            .get(field)
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(10);
+        let value = requested
+            .unwrap_or_else(|| setting_i64(store, guild_id, setting, previous))
+            .clamp(min, max);
+        fields.insert(field.into(), value.into());
+        settings.push((setting.into(), value.to_string()));
+        value
+    };
+    let joins = bounded(joins, "joinThreshold", "security.anti_raid.joins", 2, 100);
+    let window_seconds = bounded(
+        window_seconds,
+        "windowSeconds",
+        "security.anti_raid.window_seconds",
+        3,
+        60,
+    );
+    bounded(
+        incident_minutes,
+        "incidentMinutes",
+        "security.anti_raid.incident_minutes",
+        1,
+        120,
+    );
+    let config_json = config.to_string();
+    settings.push((config_key, config_json.clone()));
+    store.publish_feature_setting(
+        guild_id,
+        feature_key,
+        enabled,
+        &config_json,
+        Some(record.as_ref().map_or(0, |record| record.revision)),
+        actor_id,
+        &settings,
+    )?;
+    Ok((joins, window_seconds))
 }
 
 fn setting_i64(store: &Store, guild_id: &str, key: &str, default: i64) -> i64 {
@@ -14995,6 +15073,135 @@ mod tests {
         }
         assert_eq!(command_feature_key("ping"), None);
         assert_eq!(command_feature_key("dashboard"), None);
+    }
+
+    #[test]
+    fn anti_raid_slash_saves_the_requested_bounded_duration_for_containment() {
+        let store = Store::open(":memory:").unwrap();
+        for (supplied, expected) in [(47, 47), (121, 120), (0, 1)] {
+            super::save_anti_raid_settings(
+                &store,
+                "guild",
+                "mod",
+                true,
+                Some(10),
+                Some(10),
+                Some(supplied),
+            )
+            .unwrap();
+            assert_eq!(
+                super::setting_i64(&store, "guild", "security.anti_raid.incident_minutes", 10),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn anti_raid_slash_switch_changes_the_runtime_and_dashboard_together() {
+        let store = Store::open(":memory:").unwrap();
+        let key = "protection.anti_raid";
+        store
+            .publish_feature_setting(
+                "guild",
+                key,
+                true,
+                r#"{"joinThreshold":15,"windowSeconds":30,"incidentMinutes":27,"alertOnly":true}"#,
+                Some(0),
+                "mod",
+                &[],
+            )
+            .unwrap();
+        for enabled in [false, true] {
+            super::save_anti_raid_settings(&store, "guild", "mod", enabled, None, None, None)
+                .unwrap();
+            assert_eq!(
+                super::feature_enabled(&store, "guild", key, Some("security.anti_raid.enabled")),
+                enabled
+            );
+            let record = store.get_feature_setting("guild", key).unwrap().unwrap();
+            assert_eq!(record.enabled, enabled);
+            assert!(super::command_feature_available(&store, "guild", "anti-raid", key).unwrap());
+            assert!(
+                !super::command_feature_available(&store, "unconfigured", "anti-raid", key)
+                    .unwrap()
+            );
+            let config: serde_json::Value = serde_json::from_str(&record.config_json).unwrap();
+            assert_eq!(config["incidentMinutes"], 27);
+            assert_eq!(config["joinThreshold"], 15);
+            assert_eq!(config["windowSeconds"], 30);
+            assert_eq!(config["alertOnly"], true);
+        }
+    }
+
+    #[test]
+    fn anti_raid_slash_keeps_dashboard_config_and_does_not_reset_omitted_duration() {
+        let store = Store::open(":memory:").unwrap();
+        let key = "protection.anti_raid";
+        let projection = "security.anti_raid.incident_minutes";
+        store
+            .publish_feature_setting(
+                "guild",
+                key,
+                true,
+                r#"{"incidentMinutes":27,"verification":"very_high","alertOnly":true}"#,
+                Some(0),
+                "mod",
+                &[(projection.into(), "27".into())],
+            )
+            .unwrap();
+        super::save_anti_raid_settings(&store, "guild", "mod", true, None, None, None).unwrap();
+        assert_eq!(super::setting_i64(&store, "guild", projection, 10), 27);
+
+        super::save_anti_raid_settings(&store, "guild", "mod", true, Some(10), Some(10), Some(47))
+            .unwrap();
+        let saved = store.get_feature_setting("guild", key).unwrap().unwrap();
+        let config: serde_json::Value = serde_json::from_str(&saved.config_json).unwrap();
+        assert_eq!(config["incidentMinutes"], 47);
+        assert_eq!(config["verification"], "very_high");
+        assert_eq!(config["alertOnly"], true);
+        assert!(saved.enabled);
+    }
+
+    #[test]
+    fn anti_raid_slash_migrates_compatibility_settings_without_changing_other_options() {
+        let store = Store::open(":memory:").unwrap();
+        let guild = "legacy";
+        let key = "protection.anti_raid";
+        store
+            .set_setting(guild, "feature.protection.anti_raid", "true")
+            .unwrap();
+        store
+            .set_setting(
+                guild,
+                "feature.config.protection.anti_raid",
+                r#"{"verification":"very_high","alertOnly":true}"#,
+            )
+            .unwrap();
+        store
+            .set_setting(guild, "security.anti_raid.incident_minutes", "39")
+            .unwrap();
+
+        assert!(super::command_feature_available(&store, guild, "anti-raid", key).unwrap());
+        super::save_anti_raid_settings(&store, guild, "mod", false, None, None, None).unwrap();
+        assert!(!super::feature_enabled(
+            &store,
+            guild,
+            key,
+            Some("security.anti_raid.enabled")
+        ));
+        assert!(super::command_feature_available(&store, guild, "anti-raid", key).unwrap());
+        let saved = store.get_feature_setting(guild, key).unwrap().unwrap();
+        let config: serde_json::Value = serde_json::from_str(&saved.config_json).unwrap();
+        assert_eq!(config["incidentMinutes"], 39);
+        assert_eq!(config["verification"], "very_high");
+        assert_eq!(config["alertOnly"], true);
+        assert_eq!(
+            store
+                .get_setting(guild, "feature.protection.anti_raid")
+                .unwrap()
+                .as_deref(),
+            Some("false")
+        );
     }
 
     #[test]
