@@ -36,6 +36,9 @@ pub struct Config {
     pub api_only: bool,
 }
 
+/// Published placeholder from `.env.example`; anyone could forge sessions with it.
+const EXAMPLE_SESSION_SECRET: &str = "replace-with-at-least-32-random-bytes";
+
 impl Config {
     pub fn from_env() -> Result<Self> {
         let _ = dotenvy::dotenv();
@@ -89,6 +92,9 @@ impl Config {
         }
         if self.session_secret.len() < 32 {
             anyhow::bail!("HELPER_SESSION_SECRET must be at least 32 bytes");
+        }
+        if self.session_secret.trim() == EXAMPLE_SESSION_SECRET {
+            anyhow::bail!("HELPER_SESSION_SECRET still uses the .env.example placeholder");
         }
         if self.oauth_redirect_uri.starts_with("http://") && self.environment == "production" {
             anyhow::bail!("OAuth redirect URI must use HTTPS in production");
@@ -11337,6 +11343,33 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn validate_rejects_the_example_session_secret() {
+        let mut config = Config {
+            discord_token: "x".repeat(40),
+            discord_application_id: 1,
+            database_url: PathBuf::from(":memory:"),
+            bind_addr: "127.0.0.1:0".into(),
+            oauth_client_id: "1".into(),
+            oauth_client_secret: "secret".into(),
+            oauth_redirect_uri: "https://example.test/callback".into(),
+            oauth_success_redirect: "https://example.test/".into(),
+            trusted_vozen_oauth_client_id: None,
+            private_tracker_client_id: None,
+            private_tracker_owner_id: None,
+            allow_legacy_session: false,
+            session_secret: "replace-with-at-least-32-random-bytes".into(),
+            entitlement_url: None,
+            entitlement_secret: None,
+            topgg_token: None,
+            environment: "production".into(),
+            api_only: false,
+        };
+        assert!(config.validate().is_err());
+        config.session_secret = "k".repeat(64);
+        assert!(config.validate().is_ok());
+    }
 
     #[test]
     fn entitlement_settings_must_be_configured_as_a_pair() {
