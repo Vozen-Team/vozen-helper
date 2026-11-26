@@ -2550,6 +2550,7 @@ impl EventHandler for Handler {
                 "protection.join_gate",
                 Some("security.join_gate.enabled"),
             );
+        let mut gate_blocked = false;
         if gate_enabled {
             let minimum_age = self
                 .store
@@ -2620,6 +2621,7 @@ impl EventHandler for Handler {
                     display_name,
                 },
             );
+            gate_blocked = gate_decision.blocked;
             if gate_decision.blocked {
                 let action = gate_decision.action;
                 let gate_reasons = gate_decision.reasons;
@@ -2672,7 +2674,10 @@ impl EventHandler for Handler {
             .store
             .welcome_configuration(&guild_text)
             .unwrap_or((false, serde_json::json!({})));
-        let welcome_claimed = welcome_enabled
+        if welcome_enabled && gate_blocked {
+            info!(guild_id = %guild_text, user = %new_member.user.id, "welcome skipped for a member held by the join gate");
+        }
+        let welcome_claimed = welcome_applies_to_join(welcome_enabled, gate_blocked)
             && self
                 .store
                 .claim_welcome_delivery(
@@ -2689,11 +2694,7 @@ impl EventHandler for Handler {
             if delay > 0 {
                 tokio::time::sleep(Duration::from_secs(delay)).await;
             }
-            if let Some(role) = welcome["autoRole"]
-                .as_str()
-                .and_then(|id| id.parse::<u64>().ok())
-                .filter(|id| *id > 0)
-            {
+            if let Some(role) = welcome_auto_role(&welcome, gate_blocked) {
                 let _ = new_member.add_role(&ctx.http, RoleId::new(role)).await;
             }
             let guild = guild_id.to_partial_guild(&ctx.http).await.ok();
@@ -12641,6 +12642,23 @@ fn welcome_guide_button(
     )
 }
 
+/// Members held by the join gate (including anti-raid containment) are not
+/// welcomed: the welcome role would undo the quarantine and the public message
+/// would advertise an account that still needs verification.
+fn welcome_applies_to_join(welcome_enabled: bool, gate_blocked: bool) -> bool {
+    welcome_enabled && !gate_blocked
+}
+
+fn welcome_auto_role(welcome: &serde_json::Value, gate_blocked: bool) -> Option<u64> {
+    if gate_blocked {
+        return None;
+    }
+    welcome["autoRole"]
+        .as_str()
+        .and_then(|id| id.parse::<u64>().ok())
+        .filter(|id| *id > 0)
+}
+
 /// Resolve a reusable Studio template without allowing arbitrary JSON to leak
 /// into Discord. Templates are opt-in through the templates feature and only
 /// bounded string fields are accepted. Missing or malformed templates fall
@@ -15164,6 +15182,28 @@ mod tests {
         assert!(!decision.assign_verified_role);
         assert!(!decision.remove_quarantine_role);
         assert!(decision.already_verified);
+    }
+
+    #[test]
+    fn blocked_joiners_get_no_welcome_or_welcome_auto_role() {
+        assert!(super::welcome_applies_to_join(true, false));
+        assert!(!super::welcome_applies_to_join(true, true));
+        assert!(!super::welcome_applies_to_join(false, false));
+        let welcome = serde_json::json!({"autoRole": "123"});
+        assert_eq!(super::welcome_auto_role(&welcome, false), Some(123));
+        assert_eq!(super::welcome_auto_role(&welcome, true), None);
+        assert_eq!(
+            super::welcome_auto_role(&serde_json::json!({"autoRole": "0"}), false),
+            None
+        );
+        assert_eq!(
+            super::welcome_auto_role(&serde_json::json!({"autoRole": "abc"}), false),
+            None
+        );
+        assert_eq!(
+            super::welcome_auto_role(&serde_json::json!({}), false),
+            None
+        );
     }
 
     #[test]
