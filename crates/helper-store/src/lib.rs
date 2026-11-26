@@ -5920,6 +5920,59 @@ impl Store {
         )? > 0)
     }
 
+    /// The channel is gone, so no transcript can be produced; closing frees the opener's limit.
+    pub fn close_ticket_for_deleted_channel(
+        &self,
+        guild_id: &str,
+        channel_id: &str,
+    ) -> Result<bool> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        Ok(conn.execute(
+            "UPDATE tickets SET status='closed',closed_at=?3 WHERE guild_id=?1 AND channel_id=?2 AND status='open'",
+            params![guild_id, channel_id, Utc::now().timestamp_millis()],
+        )? > 0)
+    }
+
+    /// Closes this guild's open tickets whose channel is missing from a full
+    /// channel snapshot, such as the one in GUILD_CREATE. Like a deleted
+    /// channel, these tickets get no transcript. An empty snapshot is suspect
+    /// and closes nothing, and tickets opened in the last minute are skipped
+    /// because they may be newer than the snapshot.
+    pub fn close_tickets_without_channel(
+        &self,
+        guild_id: &str,
+        present_channel_ids: &[String],
+    ) -> Result<usize> {
+        if present_channel_ids.is_empty() {
+            return Ok(0);
+        }
+        let present: std::collections::HashSet<&str> =
+            present_channel_ids.iter().map(String::as_str).collect();
+        let now = Utc::now().timestamp_millis();
+        let mut conn = self.conn.lock().expect("store mutex poisoned");
+        let tx = conn.transaction()?;
+        let open_channels = tx
+            .prepare(
+                "SELECT channel_id FROM tickets WHERE guild_id=?1 AND status='open' AND created_at<?2",
+            )?
+            .query_map(params![guild_id, now - 60_000], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut closed = 0;
+        for channel_id in open_channels
+            .iter()
+            .filter(|channel_id| !present.contains(channel_id.as_str()))
+        {
+            closed += tx.execute(
+                "UPDATE tickets SET status='closed',closed_at=?3 WHERE guild_id=?1 AND channel_id=?2 AND status='open'",
+                params![guild_id, channel_id, now],
+            )?;
+        }
+        tx.commit()?;
+        Ok(closed)
+    }
+
     pub fn reopen_ticket(&self, channel_id: &str) -> Result<bool> {
         let conn = self.conn.lock().expect("store mutex poisoned");
         Ok(conn.execute(
@@ -7487,6 +7540,58 @@ mod tests {
             .filter_map(|handle| handle.join().unwrap().then_some(()))
             .count();
         assert_eq!(winners, 1);
+    }
+
+    #[test]
+    fn deleted_ticket_channel_closes_the_ticket_and_frees_the_limit() {
+        let store = Store::open(":memory:").unwrap();
+        assert!(store.try_open_ticket("g", "u", "20", 1).unwrap());
+        assert!(!store.try_open_ticket("g", "u", "21", 1).unwrap());
+        assert!(
+            !store
+                .close_ticket_for_deleted_channel("other", "20")
+                .unwrap()
+        );
+        assert_eq!(
+            store.ticket_by_channel("20").unwrap().unwrap().status,
+            "open"
+        );
+        assert!(store.close_ticket_for_deleted_channel("g", "20").unwrap());
+        let ticket = store.ticket_by_channel("20").unwrap().unwrap();
+        assert_eq!(ticket.status, "closed");
+        assert!(ticket.closed_at.is_some());
+        assert!(!store.close_ticket_for_deleted_channel("g", "20").unwrap());
+        assert!(store.try_open_ticket("g", "u", "21", 1).unwrap());
+    }
+
+    #[test]
+    fn tickets_whose_channel_vanished_are_closed_on_reconnect() {
+        let store = Store::open(":memory:").unwrap();
+        store.open_ticket("g", "a", "20").unwrap();
+        store.open_ticket("g", "b", "21").unwrap();
+        store.open_ticket("g", "d", "22").unwrap();
+        store.open_ticket("g2", "c", "20x").unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE tickets SET created_at=0 WHERE channel_id IN ('20','21','20x')",
+                [],
+            )
+            .unwrap();
+        }
+        let status = |channel: &str| store.ticket_by_channel(channel).unwrap().unwrap().status;
+        assert_eq!(
+            store
+                .close_tickets_without_channel("g", &["21".to_string(), "99".to_string()])
+                .unwrap(),
+            1
+        );
+        assert_eq!(status("20"), "closed");
+        assert_eq!(status("21"), "open");
+        assert_eq!(status("20x"), "open");
+        assert_eq!(status("22"), "open");
+        assert_eq!(store.close_tickets_without_channel("g", &[]).unwrap(), 0);
+        assert_eq!(status("21"), "open");
     }
 
     #[test]

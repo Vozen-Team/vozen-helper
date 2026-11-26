@@ -421,6 +421,20 @@ impl EventHandler for Handler {
         self.temp_channels
             .seed(&ctx.http, &self.store, &guild)
             .await;
+        // Channels deleted while the bot was offline never produce ChannelDelete.
+        let present: Vec<String> = guild.channels.keys().map(|id| id.to_string()).collect();
+        match self
+            .store
+            .close_tickets_without_channel(&guild.id.to_string(), &present)
+        {
+            Ok(0) => {}
+            Ok(closed) => {
+                info!(guild_id = %guild.id, closed, "closed tickets whose channel no longer exists")
+            }
+            Err(error) => {
+                warn!(guild_id = %guild.id, %error, "could not reconcile ticket channels")
+            }
+        }
         // The store makes this idempotent, so startup GuildCreate replays do
         // not inflate acquisition. A first observation is intentionally a
         // join: it gives a newly enabled lifecycle table a valid baseline.
@@ -2064,6 +2078,20 @@ impl EventHandler for Handler {
             .is_some_and(|record| record.guild_id == channel.guild_id.to_string())
         {
             let _ = self.store.remove_temp_channel(&channel.id.to_string());
+        }
+        // Staff often delete ticket channels by hand. Without this the opener stays
+        // counted as having an open ticket and can never open another one.
+        match self.store.close_ticket_for_deleted_channel(
+            &channel.guild_id.to_string(),
+            &channel.id.to_string(),
+        ) {
+            Ok(true) => {
+                info!(guild_id = %channel.guild_id, channel_id = %channel.id, "closed ticket whose channel was deleted")
+            }
+            Ok(false) => {}
+            Err(error) => {
+                warn!(guild_id = %channel.guild_id, channel_id = %channel.id, %error, "could not close ticket for deleted channel")
+            }
         }
     }
 
