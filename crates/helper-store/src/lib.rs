@@ -1075,6 +1075,19 @@ impl Store {
                 )?;
             }
         }
+        // Consecutive delivery failures, so the scheduler can back off and give
+        // up on targets that can never succeed instead of retrying every second.
+        let scheduled_attempts_exists: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('scheduled_actions') WHERE name='attempts'",
+            [],
+            |row| row.get(0),
+        )?;
+        if scheduled_attempts_exists == 0 {
+            conn.execute(
+                "ALTER TABLE scheduled_actions ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
         conn.execute_batch("CREATE TABLE IF NOT EXISTS event_registrations (guild_id TEXT NOT NULL, event_id TEXT NOT NULL, user_id TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'registered', created_at INTEGER NOT NULL, checked_in_at INTEGER, PRIMARY KEY(guild_id,event_id,user_id)); CREATE INDEX IF NOT EXISTS idx_event_registrations_event ON event_registrations(guild_id,event_id,status);")?;
         conn.execute_batch("CREATE TABLE IF NOT EXISTS twitch_subscriptions (id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id TEXT NOT NULL, source_login TEXT NOT NULL, source_user_id TEXT NOT NULL, target_channel_id TEXT NOT NULL, message_template TEXT NOT NULL DEFAULT '{broadcaster} is live!\\nhttps://twitch.tv/{login}', mention TEXT NOT NULL DEFAULT '', enabled INTEGER NOT NULL DEFAULT 1, pending_event_id TEXT, pending_stream_id TEXT, pending_started_at TEXT, last_event_id TEXT, next_poll_at INTEGER NOT NULL, failure_count INTEGER NOT NULL DEFAULT 0, last_error TEXT, created_by TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, UNIQUE(guild_id,source_user_id,target_channel_id)); CREATE INDEX IF NOT EXISTS idx_twitch_due ON twitch_subscriptions(enabled,next_poll_at); CREATE INDEX IF NOT EXISTS idx_twitch_user ON twitch_subscriptions(source_user_id,enabled); CREATE INDEX IF NOT EXISTS idx_twitch_guild ON twitch_subscriptions(guild_id,updated_at DESC);")?;
         let twitch_last_event_exists: i64 = conn.query_row(
@@ -1506,6 +1519,41 @@ impl Store {
             "DELETE FROM scheduled_actions WHERE guild_id=?1 AND type=?2 AND target_id=?3",
             params![guild_id, action_type, target_id],
         )?)
+    }
+
+    /// Failed delivery attempts of one scheduled action; `None` when the job
+    /// no longer exists.
+    pub fn scheduled_action_attempts(&self, id: i64) -> Result<Option<i64>> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        Ok(conn
+            .query_row(
+                "SELECT attempts FROM scheduled_actions WHERE id=?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Counts one more failure and moves the job to its next attempt, which
+    /// takes it out of the due batch until then. False when the job is gone.
+    pub fn retry_scheduled_action(&self, id: i64, next_execute_at: i64) -> Result<bool> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let changed = conn.execute(
+            "UPDATE scheduled_actions SET attempts=attempts+1, execute_at=?2 WHERE id=?1",
+            params![id, next_execute_at],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Reminders a member still has waiting in one guild.
+    pub fn pending_reminder_count(&self, guild_id: &str, user_id: &str) -> Result<u32> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM scheduled_actions WHERE guild_id=?1 AND type='reminder' AND target_id=?2",
+            params![guild_id, user_id],
+            |row| row.get(0),
+        )?;
+        Ok(u32::try_from(count).unwrap_or(u32::MAX))
     }
 
     /// Records a provider event exactly once. The boolean is false for a
@@ -6886,6 +6934,49 @@ mod tests {
             .record_case("g", "tempban", "u", "mod", "again", Some(3_000))
             .unwrap();
         assert!(store.has_ban_case_after("g", "u", ban).unwrap());
+    }
+
+    #[test]
+    fn failed_scheduled_actions_back_off_without_blocking_other_guilds() {
+        let store = Store::open(":memory:").unwrap();
+        for i in 0..100 {
+            store
+                .schedule_typed("bad", "reminder", &i.to_string(), 0, "{}")
+                .unwrap();
+        }
+        let good = store
+            .schedule_typed("good", "reminder", "u", 1, "{}")
+            .unwrap();
+        let due = store.due_scheduled_actions(10, 100).unwrap();
+        assert_eq!(due.len(), 100);
+        assert!(due.iter().all(|job| job.1 == "bad"));
+        for job in &due {
+            assert!(store.retry_scheduled_action(job.0, 30_010).unwrap());
+        }
+        let bad = due[0].0;
+        let due = store.due_scheduled_actions(10, 100).unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].0, good);
+        assert_eq!(due[0].1, "good");
+        assert_eq!(store.scheduled_action_attempts(bad).unwrap(), Some(1));
+        assert_eq!(store.scheduled_action_attempts(good).unwrap(), Some(0));
+        assert_eq!(store.scheduled_action_attempts(i64::MAX).unwrap(), None);
+        assert!(!store.retry_scheduled_action(i64::MAX, 1).unwrap());
+        store.migrate().unwrap();
+        assert_eq!(store.scheduled_action_attempts(bad).unwrap(), Some(1));
+    }
+
+    #[test]
+    fn pending_reminders_are_counted_per_member_and_guild() {
+        let store = Store::open(":memory:").unwrap();
+        store.schedule("g", "u", 10, "{}").unwrap();
+        store.schedule("g", "u", 10, "{}").unwrap();
+        store.schedule("g", "other", 10, "{}").unwrap();
+        store.schedule("g2", "u", 10, "{}").unwrap();
+        store
+            .schedule_typed("g", "event_reminder", "u", 10, "{}")
+            .unwrap();
+        assert_eq!(store.pending_reminder_count("g", "u").unwrap(), 2);
     }
 
     #[test]

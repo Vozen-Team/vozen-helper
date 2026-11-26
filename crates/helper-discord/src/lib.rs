@@ -500,15 +500,12 @@ impl EventHandler for Handler {
                     if let Ok(actions) =
                         store.due_scheduled_actions(chrono::Utc::now().timestamp_millis(), 100)
                     {
-                        for (id, guild_id, action_type, target_id, payload) in actions {
-                            let _ = deliver_scheduled_action(
+                        for job in actions {
+                            run_due_scheduled_action(
                                 &http,
                                 &store,
-                                id,
-                                &guild_id,
-                                &action_type,
-                                &target_id,
-                                &payload,
+                                job,
+                                chrono::Utc::now().timestamp_millis(),
                             )
                             .await;
                         }
@@ -7086,6 +7083,13 @@ impl Handler {
                     };
                     return respond(ctx, command, message).await;
                 }
+                if self
+                    .store
+                    .pending_reminder_count(&guild_text, &command.user.id.to_string())?
+                    >= MAX_PENDING_REMINDERS_PER_MEMBER
+                {
+                    return respond(ctx, command, "You already have 25 pending reminders in this server. Wait for one to fire before adding another.").await;
+                }
                 let payload = serde_json::json!({
                     "channel_id": command.channel_id.to_string(),
                     "text": text,
@@ -12427,6 +12431,80 @@ fn scheduled_action_feature(action_type: &str) -> Option<&'static str> {
     }
 }
 
+const SCHEDULED_RETRY_BASE_MS: i64 = 30_000;
+const SCHEDULED_RETRY_MAX_MS: i64 = 3_600_000;
+const SCHEDULED_MAX_ATTEMPTS: i64 = 12;
+
+/// What the scheduler does with a job whose delivery returned an error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScheduledFailure {
+    /// The target can never accept this job, so it is removed.
+    Drop,
+    /// The job stays and runs again after this many milliseconds.
+    RetryAfterMs(i64),
+}
+
+/// Discord error codes after which this job type can never succeed.
+fn scheduled_drop_codes(action_type: &str) -> &'static [isize] {
+    match action_type {
+        "reminder" | "event_reminder" => &[
+            10_003, 10_004, 10_007, 10_008, 10_011, 10_013, 10_026, 50_001,
+        ],
+        // Discord ends the timeout on its own at the scheduled time.
+        "anti_spam_untimeout" => &[10_003, 10_004, 10_007, 10_008, 10_011, 10_013, 10_026],
+        // The result stays unannounced: its channel or message is gone.
+        "giveaway_end" | "poll_end" => &[10_003, 10_008],
+        // Unknown Ban (10026) is settled inside the delivery itself.
+        "unban" => &[10_013],
+        // Never Unknown Member or Unknown Guild: a buyer may not have joined
+        // yet, and the bot may be invited back to the guild.
+        "monetization_entitlement" | "web3_wallet_role_sync" => &[10_011],
+        _ => &[],
+    }
+}
+
+/// Job types that give up after `SCHEDULED_MAX_ATTEMPTS` failures in a row.
+fn scheduled_attempts_capped(action_type: &str) -> bool {
+    matches!(
+        action_type,
+        "reminder" | "event_reminder" | "anti_spam_untimeout"
+    )
+}
+
+/// `attempts` counts the failures before this one. Unknown job types retry
+/// with backoff and are never dropped.
+fn scheduled_failure_decision(
+    action_type: &str,
+    attempts: i64,
+    discord_code: Option<isize>,
+) -> ScheduledFailure {
+    if discord_code.is_some_and(|code| scheduled_drop_codes(action_type).contains(&code)) {
+        return ScheduledFailure::Drop;
+    }
+    if scheduled_attempts_capped(action_type)
+        && attempts.saturating_add(1) >= SCHEDULED_MAX_ATTEMPTS
+    {
+        return ScheduledFailure::Drop;
+    }
+    ScheduledFailure::RetryAfterMs(
+        SCHEDULED_RETRY_BASE_MS
+            .saturating_mul(1_i64 << attempts.clamp(0, 10))
+            .min(SCHEDULED_RETRY_MAX_MS),
+    )
+}
+
+/// The Discord error code behind a delivery failure, if Discord sent one.
+fn scheduled_error_code(error: &anyhow::Error) -> Option<isize> {
+    error
+        .chain()
+        .find_map(|cause| match cause.downcast_ref::<serenity::Error>() {
+            Some(serenity::Error::Http(serenity::http::HttpError::UnsuccessfulRequest(
+                response,
+            ))) => Some(response.error.code),
+            _ => None,
+        })
+}
+
 fn should_clear_anti_spam_timeout(
     expected_until_unix: i64,
     current_until_unix: Option<i64>,
@@ -13333,6 +13411,61 @@ fn schedule_event_reminder(
     Ok(())
 }
 
+/// One scheduler step: deliver, and on failure either back off or drop the job.
+/// `deliver_scheduled_action` keeps a failed job untouched; the retry policy
+/// lives here so one broken target cannot hold the whole due batch.
+async fn run_due_scheduled_action(
+    http: &serenity::http::Http,
+    store: &Store,
+    job: helper_store::ScheduledAction,
+    now_ms: i64,
+) {
+    let (id, guild_id, action_type, target_id, payload) = job;
+    let Err(error) = deliver_scheduled_action(
+        http,
+        store,
+        id,
+        &guild_id,
+        &action_type,
+        &target_id,
+        &payload,
+    )
+    .await
+    else {
+        return;
+    };
+    let attempts = match store.scheduled_action_attempts(id) {
+        // The delivery already removed the job.
+        Ok(None) => return,
+        Ok(Some(attempts)) => attempts,
+        Err(store_error) => {
+            warn!(job_id = id, %store_error, "could not read scheduled action attempts");
+            // Without this the job would run again on the next tick.
+            if let Err(store_error) =
+                store.retry_scheduled_action(id, now_ms.saturating_add(SCHEDULED_RETRY_BASE_MS))
+            {
+                warn!(job_id = id, %store_error, "could not postpone scheduled action");
+            }
+            return;
+        }
+    };
+    let code = scheduled_error_code(&error);
+    match scheduled_failure_decision(&action_type, attempts, code) {
+        ScheduledFailure::Drop => {
+            warn!(job_id = id, %guild_id, action_type = %action_type, attempts, ?code, %error, "dropping scheduled action that cannot succeed");
+            if let Err(store_error) = store.delete_scheduled_action(id) {
+                warn!(job_id = id, %store_error, "could not drop scheduled action");
+            }
+        }
+        ScheduledFailure::RetryAfterMs(ms) => {
+            warn!(job_id = id, %guild_id, action_type = %action_type, attempts, ?code, %error, retry_in_ms = ms, "scheduled action failed; retrying later");
+            if let Err(store_error) = store.retry_scheduled_action(id, now_ms.saturating_add(ms)) {
+                warn!(job_id = id, %store_error, "could not postpone scheduled action");
+            }
+        }
+    }
+}
+
 async fn deliver_scheduled_action(
     http: &serenity::http::Http,
     store: &Store,
@@ -13686,6 +13819,9 @@ async fn deliver_scheduled_action(
     store.delete_scheduled_action(id)?;
     Ok(())
 }
+
+/// Keeps one member from filling the shared scheduler queue with reminders.
+const MAX_PENDING_REMINDERS_PER_MEMBER: u32 = 25;
 
 fn reminder_repeat_interval_ms(repeat: &str) -> Option<i64> {
     match repeat {
@@ -14287,6 +14423,146 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        let reqs = server.await.unwrap();
+        assert_eq!(reqs.len(), 1);
+        assert!(reqs[0].starts_with("DELETE /api/v10/guilds/1/bans/2 "));
+    }
+
+    #[test]
+    fn scheduled_failures_back_off_and_drop_only_dead_targets() {
+        use super::{ScheduledFailure as F, scheduled_failure_decision as decide};
+        assert_eq!(decide("reminder", 0, None), F::RetryAfterMs(30_000));
+        assert_eq!(decide("reminder", 1, None), F::RetryAfterMs(60_000));
+        assert_eq!(decide("reminder", 7, None), F::RetryAfterMs(3_600_000));
+        assert_eq!(decide("reminder", 11, None), F::Drop);
+        assert_eq!(decide("reminder", i64::MAX, None), F::Drop);
+        assert_eq!(decide("reminder", 0, Some(10_003)), F::Drop);
+        assert_eq!(decide("reminder", 0, Some(50_001)), F::Drop);
+        assert_eq!(decide("reminder", 0, Some(50_013)), F::RetryAfterMs(30_000));
+        assert_eq!(decide("anti_spam_untimeout", 0, Some(10_007)), F::Drop);
+        assert_eq!(decide("poll_end", 0, Some(10_008)), F::Drop);
+        assert_eq!(decide("giveaway_end", 0, Some(10_003)), F::Drop);
+        assert_eq!(decide("poll_end", 0, Some(50_001)), F::RetryAfterMs(30_000));
+        assert_eq!(
+            decide("giveaway_end", 0, Some(10_004)),
+            F::RetryAfterMs(30_000)
+        );
+        assert_eq!(decide("giveaway_end", 40, None), F::RetryAfterMs(3_600_000));
+        assert_eq!(decide("unban", 0, Some(10_013)), F::Drop);
+        assert_eq!(decide("unban", 0, Some(10_004)), F::RetryAfterMs(30_000));
+        assert_eq!(
+            decide("unban", 500, Some(50_013)),
+            F::RetryAfterMs(3_600_000)
+        );
+        assert_eq!(decide("unban", -5, None), F::RetryAfterMs(30_000));
+        assert_eq!(
+            decide("monetization_entitlement", 0, Some(10_007)),
+            F::RetryAfterMs(30_000)
+        );
+        assert_eq!(
+            decide("monetization_entitlement", 0, Some(10_004)),
+            F::RetryAfterMs(30_000)
+        );
+        assert_eq!(decide("monetization_entitlement", 0, Some(10_011)), F::Drop);
+        assert_eq!(
+            decide("web3_wallet_role_sync", 0, Some(10_007)),
+            F::RetryAfterMs(30_000)
+        );
+        assert_eq!(
+            decide("shop_notice", 0, Some(10_003)),
+            F::RetryAfterMs(30_000)
+        );
+        assert_eq!(decide("ticket_sla", 50, None), F::RetryAfterMs(3_600_000));
+    }
+
+    /// A due reminder for channel 5 in guild 1, with reminders enabled.
+    fn due_reminder_store() -> (helper_store::Store, helper_store::ScheduledAction) {
+        let store = helper_store::Store::open(":memory:").unwrap();
+        store
+            .set_setting("1", "feature.utility.reminders", "true")
+            .unwrap();
+        store
+            .schedule("1", "2", 0, r#"{"channel_id":"5","text":"hi"}"#)
+            .unwrap();
+        let job = store.due_scheduled_actions(0, 1).unwrap().pop().unwrap();
+        (store, job)
+    }
+
+    #[tokio::test]
+    async fn scheduled_reminder_is_sent_and_consumed() {
+        let (store, job) = due_reminder_store();
+        let (http, server) = mock_discord_http(vec![(
+            200,
+            serde_json::to_value(serenity::all::Message::default()).unwrap(),
+        )])
+        .await;
+        super::run_due_scheduled_action(&http, &store, job.clone(), 0).await;
+        assert!(
+            store
+                .due_scheduled_actions(i64::MAX, 10)
+                .unwrap()
+                .is_empty()
+        );
+        let reqs = server.await.unwrap();
+        assert_eq!(reqs.len(), 1);
+        assert!(reqs[0].starts_with("POST /api/v10/channels/5/messages "));
+    }
+
+    #[tokio::test]
+    async fn scheduled_reminder_to_a_deleted_channel_is_dropped() {
+        let (store, job) = due_reminder_store();
+        let id = job.0;
+        let (http, server) = mock_discord_http(vec![(
+            404,
+            serde_json::json!({"code": 10003, "message": "Unknown Channel"}),
+        )])
+        .await;
+        super::run_due_scheduled_action(&http, &store, job.clone(), 0).await;
+        assert!(
+            store
+                .due_scheduled_actions(i64::MAX, 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(store.scheduled_action_attempts(id).unwrap(), None);
+        let reqs = server.await.unwrap();
+        assert_eq!(reqs.len(), 1);
+        assert!(reqs[0].starts_with("POST /api/v10/channels/5/messages "));
+    }
+
+    #[tokio::test]
+    async fn scheduled_reminder_waits_after_missing_permissions() {
+        let (store, job) = due_reminder_store();
+        let id = job.0;
+        let (http, server) = mock_discord_http(vec![(
+            403,
+            serde_json::json!({"code": 50013, "message": "Missing Permissions"}),
+        )])
+        .await;
+        super::run_due_scheduled_action(&http, &store, job.clone(), 0).await;
+        assert!(store.due_scheduled_actions(29_999, 10).unwrap().is_empty());
+        assert_eq!(store.due_scheduled_actions(30_000, 10).unwrap().len(), 1);
+        assert_eq!(store.scheduled_action_attempts(id).unwrap(), Some(1));
+        let reqs = server.await.unwrap();
+        assert_eq!(reqs.len(), 1);
+        assert!(reqs[0].starts_with("POST /api/v10/channels/5/messages "));
+    }
+
+    #[tokio::test]
+    async fn scheduled_unban_is_kept_after_missing_permissions() {
+        let store = helper_store::Store::open(":memory:").unwrap();
+        store.schedule_typed("1", "unban", "2", 0, "").unwrap();
+        let job = store.due_scheduled_actions(0, 1).unwrap().pop().unwrap();
+        let id = job.0;
+        let (http, server) = mock_discord_http(vec![(
+            403,
+            serde_json::json!({"code": 50013, "message": "Missing Permissions"}),
+        )])
+        .await;
+        super::run_due_scheduled_action(&http, &store, job.clone(), 0).await;
+        assert!(store.due_scheduled_actions(29_999, 10).unwrap().is_empty());
+        assert_eq!(store.due_scheduled_actions(30_000, 10).unwrap().len(), 1);
+        assert_eq!(store.scheduled_action_attempts(id).unwrap(), Some(1));
         let reqs = server.await.unwrap();
         assert_eq!(reqs.len(), 1);
         assert!(reqs[0].starts_with("DELETE /api/v10/guilds/1/bans/2 "));
