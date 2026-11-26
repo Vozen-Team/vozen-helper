@@ -4049,7 +4049,9 @@ impl Store {
 
     /// Arms the temporary anti-raid containment gate. The original manual
     /// gate state is captured only once, so repeated bursts can extend the
-    /// deadline without accidentally making the temporary gate permanent.
+    /// deadline but never shorten an active one, without accidentally making
+    /// the temporary gate permanent. A deadline left by a released latch, or
+    /// one that cannot be read, is ignored so it can never hold the gate.
     pub fn arm_anti_raid_latch(&self, guild_id: &str, gate_until: i64) -> Result<()> {
         let mut conn = self.conn.lock().expect("store mutex poisoned");
         let tx = conn.transaction()?;
@@ -4060,6 +4062,21 @@ impl Store {
                 |row| row.get(0),
             )
             .optional()?;
+        let stored_gate_until: Option<String> = tx
+            .query_row(
+                "SELECT value FROM settings WHERE guild_id=?1 AND key='security.anti_raid.gate_until'",
+                [guild_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let active_deadline = stored_gate_until
+            .as_deref()
+            .and_then(|value| value.parse::<i64>().ok())
+            .filter(|_| latch_active.as_deref() == Some("true"));
+        let effective_gate_until = match active_deadline {
+            Some(existing) => existing.max(gate_until),
+            None => gate_until,
+        };
         let now = Utc::now().timestamp_millis();
         if latch_active.as_deref() != Some("true") {
             let gate_enabled: Option<String> = tx
@@ -4080,7 +4097,10 @@ impl Store {
         }
         for (key, value) in [
             ("security.join_gate.enabled", "true".to_string()),
-            ("security.anti_raid.gate_until", gate_until.to_string()),
+            (
+                "security.anti_raid.gate_until",
+                effective_gate_until.to_string(),
+            ),
             ("security.anti_raid.latch_active", "true".to_string()),
         ] {
             tx.execute(
@@ -9755,6 +9775,95 @@ mod tests {
                 .as_deref(),
             Some("false")
         );
+    }
+
+    #[test]
+    fn anti_raid_latch_never_shortens_an_active_gate() {
+        let store = Store::open(":memory:").unwrap();
+
+        // A long anti-nuke containment followed by a short anti-raid burst
+        // must keep the longer deadline while the incident is active.
+        store.arm_anti_raid_latch("guild", 7_200).unwrap();
+        store.arm_anti_raid_latch("guild", 600).unwrap();
+
+        assert_eq!(
+            store
+                .get_setting("guild", "security.anti_raid.gate_until")
+                .unwrap()
+                .as_deref(),
+            Some("7200")
+        );
+        assert!(!store.release_expired_anti_raid_latch("guild", 601).unwrap());
+        assert!(
+            !store
+                .release_expired_anti_raid_latch("guild", 7_199)
+                .unwrap()
+        );
+        assert!(
+            store
+                .release_expired_anti_raid_latch("guild", 7_200)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn anti_raid_latch_ignores_released_or_unreadable_deadlines() {
+        let store = Store::open(":memory:").unwrap();
+        store
+            .set_setting("released", "security.anti_raid.latch_active", "false")
+            .unwrap();
+        store
+            .set_setting("released", "security.anti_raid.gate_until", "999999")
+            .unwrap();
+        store
+            .set_setting("corrupt", "security.anti_raid.latch_active", "true")
+            .unwrap();
+        store
+            .set_setting(
+                "corrupt",
+                "security.anti_raid.gate_until",
+                "not-a-timestamp",
+            )
+            .unwrap();
+
+        // A stale deadline from a released incident, or an unreadable one,
+        // must never hold the new gate closed.
+        store.arm_anti_raid_latch("released", 100).unwrap();
+        store.arm_anti_raid_latch("corrupt", 100).unwrap();
+
+        for guild in ["released", "corrupt"] {
+            assert_eq!(
+                store
+                    .get_setting(guild, "security.anti_raid.gate_until")
+                    .unwrap()
+                    .as_deref(),
+                Some("100"),
+                "{guild}"
+            );
+        }
+    }
+
+    #[test]
+    fn anti_raid_latch_arms_a_fresh_gate() {
+        let store = Store::open(":memory:").unwrap();
+        store
+            .set_setting("fresh", "security.join_gate.enabled", "false")
+            .unwrap();
+
+        store.arm_anti_raid_latch("fresh", 600).unwrap();
+
+        for (key, expected) in [
+            ("security.anti_raid.gate_until", "600"),
+            ("security.join_gate.enabled", "true"),
+            ("security.anti_raid.latch_active", "true"),
+            ("security.anti_raid.previous_gate_enabled", "false"),
+        ] {
+            assert_eq!(
+                store.get_setting("fresh", key).unwrap().as_deref(),
+                Some(expected),
+                "{key}"
+            );
+        }
     }
 
     #[test]

@@ -2954,6 +2954,9 @@ impl EventHandler for Handler {
         if !enabled || !is_destructive_audit_action(entry.action) {
             return;
         }
+        if audit_action_is_by_helper(entry.user_id.get(), self.bot_id.load(Ordering::Relaxed)) {
+            return;
+        }
         let threshold = self
             .store
             .get_setting(&guild_text, "security.anti_nuke.actions")
@@ -11633,6 +11636,13 @@ fn is_destructive_audit_action(action: serenity::model::guild::audit_log::Action
     )
 }
 
+/// Audit entries produced by the Helper itself (lockdown restore, temporary
+/// room cleanup, moderation commands) are not evidence of a nuke. `bot_id` is
+/// 0 until `ready`, which means "unknown" and never matches.
+fn audit_action_is_by_helper(executor_id: u64, bot_id: u64) -> bool {
+    bot_id > 0 && executor_id == bot_id
+}
+
 fn join_burst_armed(
     joins: &mut HashMap<String, VecDeque<Instant>>,
     guild_id: &str,
@@ -14784,10 +14794,10 @@ mod tests {
         HELPER_LANGUAGE_SETTING, HELPER_LOCALES, account_age_days,
         adapter::{DiscordAdapter, Effect, FakeDiscordAdapter},
         anti_nuke_containment_deadline, anti_spam_content_metrics, anti_spam_log_message,
-        anti_spam_warning_reason, anti_spam_warning_targets, command_feature_key,
-        custom_command_channel_ignored, custom_command_is_staff, english_bot_text,
-        evaluate_join_gate_verification, evaluate_nickname, feature_enabled, feature_title,
-        helper_command_counts_as_value, helper_gateway_intents, helper_locale,
+        anti_spam_warning_reason, anti_spam_warning_targets, audit_action_is_by_helper,
+        command_feature_key, custom_command_channel_ignored, custom_command_is_staff,
+        english_bot_text, evaluate_join_gate_verification, evaluate_nickname, feature_enabled,
+        feature_title, helper_command_counts_as_value, helper_gateway_intents, helper_locale,
         helper_locale_for_guild, helper_setup_is_complete, instagram_access_allowed,
         is_destructive_audit_action, join_burst_armed, parse_custom_command, parse_duration,
         parse_reminder_delay, parse_scheduled_event_window, permission_passport_message,
@@ -15452,6 +15462,14 @@ mod tests {
         assert!(!is_destructive_audit_action(
             serenity::model::guild::audit_log::Action::GuildUpdate
         ));
+    }
+
+    #[test]
+    fn anti_nuke_ignores_the_helpers_own_audit_actions() {
+        assert!(audit_action_is_by_helper(42, 42));
+        assert!(!audit_action_is_by_helper(41, 42)); // anyone else still counts (normal anti-nuke path)
+        assert!(!audit_action_is_by_helper(42, 0)); // bot id still unknown before `ready`
+        assert!(!audit_action_is_by_helper(0, 0));
     }
 
     #[test]
