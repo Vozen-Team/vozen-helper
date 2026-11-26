@@ -12,6 +12,7 @@ const USER: &str = "100000000000000002";
 const BOT: &str = "100000000000000009";
 const HIGH: &str = "100000000000000030";
 const LOW: &str = "100000000000000040";
+const FOREIGN_CHANNEL: &str = "100000000000000062";
 
 struct Discord {
     permissions: AtomicU64,
@@ -66,7 +67,8 @@ async fn fixture() -> (
             Json(serde_json::json!({"id":"100000000000000061","name":"boas-vindas"}))
         }))
         .route("/channels/{channel}", get(|Path(channel): Path<String>| async move {
-            Json(serde_json::json!({"id":channel,"guild_id":GUILD,"type":0}))
+            let guild = if channel == FOREIGN_CHANNEL { "100000000000000099" } else { GUILD };
+            Json(serde_json::json!({"id":channel,"guild_id":guild,"type":0}))
         }))
         .route("/channels/{channel}/messages", post(|State(d): State<Arc<Discord>>| async move {
             d.posted_messages.fetch_add(1, Ordering::SeqCst);
@@ -519,5 +521,70 @@ async fn quick_setup_roles_reusing_an_existing_role_publishes_one_panel() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(discord.posted_messages.load(Ordering::SeqCst), 1);
     assert_eq!(discord.created_roles.load(Ordering::SeqCst), 0);
+    server.abort();
+}
+
+async fn repair_request(
+    state: ApiState,
+    claims: &SessionClaims,
+    base: String,
+) -> (StatusCode, serde_json::Value) {
+    let token = sign_session(claims, &state.session_secret);
+    crate::discord_channel_tests::TEST_BASE
+        .scope(base, async move {
+            let response = router(state)
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri("/api/role-panels/100000000000000070/repair")
+                        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let body =
+                serde_json::from_slice(&to_bytes(response.into_body(), 1_000_000).await.unwrap())
+                    .unwrap();
+            (status, body)
+        })
+        .await
+}
+
+#[tokio::test]
+async fn role_panel_repair_rejects_foreign_guild_channel_before_posting() {
+    let (mut state, claims, discord, server) = fixture().await;
+    state.discord_token = "synthetic-discord-bot-token".into();
+    let store = state.store.clone();
+    let key = "community.role_panel.100000000000000070";
+    let stored =
+        serde_json::json!({"channel_id":FOREIGN_CHANNEL,"title":"Legacy","role_ids":[LOW]})
+            .to_string();
+    store.set_setting(GUILD, key, &stored).unwrap();
+    let (status, body) = repair_request(state, &claims, discord.base.clone()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["code"], "discord_channel_not_in_guild", "{body}");
+    assert_eq!(discord.posted_messages.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        store.get_setting(GUILD, key).unwrap().as_deref(),
+        Some(stored.as_str())
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn role_panel_repair_in_own_guild_channel_still_posts() {
+    let (mut state, claims, discord, server) = fixture().await;
+    state.discord_token = "synthetic-discord-bot-token".into();
+    let store = state.store.clone();
+    let key = "community.role_panel.100000000000000070";
+    let stored =
+        serde_json::json!({"channel_id":"100000000000000060","title":"Legacy","role_ids":[LOW]})
+            .to_string();
+    store.set_setting(GUILD, key, &stored).unwrap();
+    let (status, body) = repair_request(state, &claims, discord.base.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(discord.posted_messages.load(Ordering::SeqCst), 1);
     server.abort();
 }

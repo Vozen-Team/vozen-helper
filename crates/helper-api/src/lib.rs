@@ -6401,6 +6401,19 @@ async fn generic_feature_preflight_with_import(
             "warning",
         );
     }
+    if request.enabled
+        && key == "community.role_panels"
+        && !snapshot.channels_ready
+        && !configured_channels.is_empty()
+    {
+        add_dependency_issue(
+            &mut issues,
+            "discord_context".into(),
+            "discord_channels_unavailable",
+            "Refresh the Discord context: the role panel channel could not be checked.".into(),
+            "error",
+        );
+    }
 
     let error_count = issues
         .iter()
@@ -6944,6 +6957,10 @@ async fn discord_publish_role_panel(
         return Ok(None);
     }
     require_role_offers(state, guild_id, publisher_id, &role_ids).await?;
+    // Every caller (create, update, repair, Quick Setup) posts here: bind the
+    // destination to the session guild with a fresh Discord read, even when the
+    // preflight snapshot was unavailable or skipped.
+    require_subscription_channel(state, guild_id, channel_id).await?;
     if reuse_existing
         && state
             .store
@@ -14861,6 +14878,98 @@ mod tests {
                 .unwrap();
         assert_eq!(body["operation"], "protection.antispam.publish");
         assert_eq!(body["guildId"], "guild-a");
+    }
+
+    /// Role panel preflight against a fixed Discord snapshot (no network):
+    /// Premium session with every permission in guild `100000000000000001`.
+    async fn role_panel_preflight(channels_ready: bool) -> (StatusCode, serde_json::Value) {
+        const GUILD: &str = "100000000000000001";
+        const CHANNEL: &str = "100000000000000060";
+        let state = state(Store::open(":memory:").unwrap());
+        let now = Utc::now();
+        let session = SessionClaims {
+            session_id: Uuid::new_v4(),
+            user_id: "100000000000000002".into(),
+            guild_id: GUILD.into(),
+            issued_at: now,
+            expires_at: now + Duration::hours(1),
+            last_seen_at: now,
+        };
+        state.store.save_session(&session).unwrap();
+        state
+            .store
+            .replace_session_guilds(
+                session.session_id,
+                &[(GUILD.into(), "Test".into(), Some(u64::MAX.to_string()))],
+            )
+            .unwrap();
+        grant_premium(&state.store, &session);
+        let snapshot = DiscordGuildSnapshot {
+            channels: vec![
+                serde_json::json!({"id":CHANNEL,"guild_id":GUILD,"type":0,"permission_overwrites":[]}),
+            ],
+            roles: vec![
+                serde_json::json!({"id":GUILD,"position":0,"permissions":"0"}),
+                serde_json::json!({"id":"bot-role","position":10,"permissions":"8"}),
+            ],
+            bot_role_ids: vec!["bot-role".into()],
+            bot_user_id: Some("bot-user".into()),
+            channels_ready,
+            roles_ready: true,
+            bot_ready: true,
+            ..Default::default()
+        };
+        let token = sign_session(&session, &state.session_secret);
+        let request = serde_json::json!({"enabled":true,"config":{"channel":CHANNEL,"roleIds":[]}});
+        config_import::TEST_SNAPSHOT
+            .scope(snapshot, async move {
+                let response = router(state)
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/api/config/features/community.role_panels/preflight")
+                            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .body(Body::from(request.to_string()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let body = serde_json::from_slice(
+                    &to_bytes(response.into_body(), 1_000_000).await.unwrap(),
+                )
+                .unwrap();
+                (status, body)
+            })
+            .await
+    }
+
+    fn channel_list_issues(body: &serde_json::Value) -> Vec<serde_json::Value> {
+        body["issues"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|issue| issue["code"] == "discord_channels_unavailable")
+            .cloned()
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn role_panel_preflight_fails_when_channel_list_is_unavailable() {
+        let (status, body) = role_panel_preflight(false).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["ok"], false, "{body}");
+        let issues = channel_list_issues(&body);
+        assert_eq!(issues.len(), 1, "{body}");
+        assert_eq!(issues[0]["severity"], "error", "{body}");
+    }
+
+    #[tokio::test]
+    async fn role_panel_preflight_with_channel_list_has_no_channel_list_error() {
+        let (status, body) = role_panel_preflight(true).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(channel_list_issues(&body).is_empty(), "{body}");
     }
 
     #[tokio::test]

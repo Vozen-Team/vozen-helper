@@ -8498,7 +8498,7 @@ impl Handler {
                 {
                     let _ = ChannelId::new(channel_id).send_message(
                         &ctx.http,
-                        CreateMessage::new().content(format!("New event **{}** is scheduled for <t:{}:F>.", event.name, start.unix_timestamp())),
+                        event_announcement_message(&event.name, start.unix_timestamp()),
                     ).await;
                 }
                 schedule_event_reminder(
@@ -9263,9 +9263,7 @@ impl Handler {
                 let message = panel_channel
                     .send_message(
                         &ctx.http,
-                        serenity::all::CreateMessage::new()
-                            .content(if let Some(description) = description { format!("{title}\n{description}") } else { title.clone() })
-                            .components(vec![CreateActionRow::Buttons(buttons)]),
+                        role_panel_message(&title, description.as_deref(), buttons),
                     )
                     .await?;
                 self.store.set_setting(
@@ -10250,6 +10248,29 @@ async fn respond_raw(ctx: &Context, command: &CommandInteraction, content: &str)
 fn transcript_message(content: &str) -> CreateMessage {
     CreateMessage::new()
         .content(content)
+        .allowed_mentions(CreateAllowedMentions::new())
+}
+
+fn event_announcement_message(name: &str, start_unix: i64) -> CreateMessage {
+    CreateMessage::new()
+        .content(format!(
+            "New event **{name}** is scheduled for <t:{start_unix}:F>."
+        ))
+        .allowed_mentions(CreateAllowedMentions::new())
+}
+
+fn role_panel_message(
+    title: &str,
+    description: Option<&str>,
+    buttons: Vec<CreateButton>,
+) -> CreateMessage {
+    let content = description.map_or_else(
+        || title.to_owned(),
+        |description| format!("{title}\n{description}"),
+    );
+    CreateMessage::new()
+        .content(content)
+        .components(vec![CreateActionRow::Buttons(buttons)])
         .allowed_mentions(CreateAllowedMentions::new())
 }
 
@@ -14117,6 +14138,49 @@ mod tests {
                     .is_none_or(|value| value == &serde_json::json!([]))
             );
         }
+    }
+
+    #[test]
+    fn event_announcement_never_parses_mentions() {
+        let payload = serde_json::to_value(super::event_announcement_message(
+            "@everyone <@&42> festa",
+            1_900_000_000,
+        ))
+        .unwrap();
+        let content = payload["content"].as_str().unwrap();
+        assert!(content.contains("@everyone <@&42> festa"), "{content}");
+        assert!(content.contains("<t:1900000000:F>"), "{content}");
+        assert_eq!(payload["allowed_mentions"]["parse"], serde_json::json!([]));
+        for field in ["roles", "users"] {
+            assert!(
+                payload["allowed_mentions"]
+                    .get(field)
+                    .is_none_or(|value| value == &serde_json::json!([]))
+            );
+        }
+    }
+
+    #[test]
+    fn role_panel_message_never_parses_mentions() {
+        let payload = serde_json::to_value(super::role_panel_message(
+            "@everyone Cargos",
+            Some("<@&42>"),
+            vec![serenity::all::CreateButton::new("role:toggle:1").label("A")],
+        ))
+        .unwrap();
+        assert_eq!(payload["content"], "@everyone Cargos\n<@&42>");
+        assert_eq!(payload["allowed_mentions"]["parse"], serde_json::json!([]));
+        for field in ["roles", "users"] {
+            assert!(
+                payload["allowed_mentions"]
+                    .get(field)
+                    .is_none_or(|value| value == &serde_json::json!([]))
+            );
+        }
+        assert_eq!(
+            payload["components"][0]["components"][0]["custom_id"],
+            "role:toggle:1"
+        );
     }
     #[test]
     fn join_gate_requires_publisher_and_role_binding_from_canonical_publication() {
