@@ -2922,6 +2922,14 @@ impl EventHandler for Handler {
             None,
             "{}",
         );
+        // Once unbanned, any pending release is moot.
+        if let Err(error) = self.store.delete_scheduled_actions_for(
+            &guild_id.to_string(),
+            "unban",
+            &user.id.to_string(),
+        ) {
+            warn!(%error, %guild_id, "pending unban cleanup failed");
+        }
     }
 
     async fn guild_audit_log_entry_create(
@@ -6875,7 +6883,13 @@ impl Handler {
                     return respond(ctx, command, "ID de utilizador inválido.").await;
                 };
                 match guild_id.unban(&ctx.http, serenity::all::UserId::new(user_id)).await {
-                    Ok(()) => "User unbanned.".to_string(),
+                    Ok(()) => {
+                        // The member is free now; a pending tempban release has nothing left to do.
+                        if let Err(error) = self.store.delete_scheduled_actions_for(&guild_id.to_string(), "unban", &user_id.to_string()) {
+                            tracing::warn!(%error, "pending unban cleanup failed");
+                        }
+                        "User unbanned.".to_string()
+                    }
                     Err(error) => {
                         tracing::warn!(%error, "unban failed");
                         "Unable to remove the ban.".to_string()
@@ -6931,24 +6945,29 @@ impl Handler {
                 if !decision.allowed {
                     return respond(ctx, command, &decision.explanation).await;
                 }
+                // Refuse a bad duration before the member is touched; only tempban carries one.
+                let tempban_delay = if command.data.name == "tempban" {
+                    let Some(delay) = parse_duration(option_string(command, "duration").unwrap_or_default()) else {
+                        return respond(ctx, command, "Duração inválida. Usa 10m, 2h ou 1d.").await;
+                    };
+                    Some(delay)
+                } else {
+                    None
+                };
                 let reason = if reason.trim().is_empty() { "No reason provided" } else { reason };
                 let action = guild_id.ban_with_reason(&ctx.http, target, 0, reason).await;
                 if let Err(error) = action {
                     tracing::warn!(%error, action = %command.data.name, "ban action failed");
                     return respond(ctx, command, "Nao foi possivel executar o ban; confirma as permissoes e a hierarquia.").await;
                 }
-                if command.data.name == "softban" {
+                if let Some(delay) = tempban_delay {
+                    let case_id = self.store.record_case(&guild_id.to_string(), "tempban", &target.to_string(), &command.user.id.to_string(), reason, Some(delay))?;
+                    self.store.replace_scheduled_unban(&guild_id.to_string(), &target.to_string(), chrono::Utc::now().timestamp_millis() + delay, case_id)?;
+                    format!("Tempban completed as case #{case_id} for <@{}>; expires in {}.", target, format_duration(delay))
+                } else {
                     let _ = guild_id.unban(&ctx.http, target).await;
                     let case_id = self.store.record_case(&guild_id.to_string(), "softban", &target.to_string(), &command.user.id.to_string(), reason, None)?;
                     format!("Softban completed as case #{case_id} for <@{}>.", target)
-                } else {
-                    let Some(delay) = parse_duration(option_string(command, "duration").unwrap_or_default()) else {
-                        let _ = guild_id.unban(&ctx.http, target).await;
-                        return respond(ctx, command, "Duração inválida. Usa 10m, 2h ou 1d.").await;
-                    };
-                    let case_id = self.store.record_case(&guild_id.to_string(), "tempban", &target.to_string(), &command.user.id.to_string(), reason, Some(delay))?;
-                    self.store.schedule_typed(&guild_id.to_string(), "unban", &target.to_string(), chrono::Utc::now().timestamp_millis() + delay, "")?;
-                    format!("Tempban completed as case #{case_id} for <@{}>; expires in {}.", target, format_duration(delay))
                 }
             }
             "kick" | "ban" | "timeout" => {
@@ -6991,6 +7010,10 @@ impl Handler {
                 match action {
                     Ok(()) => {
                         let case_id = self.store.record_case(&guild_id.to_string(), &command.data.name, &target.to_string(), &command.user.id.to_string(), reason, None)?;
+                        if command.data.name == "ban" {
+                            // A permanent ban outlives any pending tempban release.
+                            self.store.delete_scheduled_actions_for(&guild_id.to_string(), "unban", &target.to_string())?;
+                        }
                         format!("Action {} completed as case #{case_id} for <@{}>.", command.data.name, target)
                     }
                     Err(error) => {
@@ -13393,6 +13416,14 @@ async fn deliver_scheduled_action(
             .parse::<u64>()
             .map(serenity::all::UserId::new)
             .map_err(|_| anyhow::anyhow!("invalid scheduled unban user"))?;
+        // A later ban or tempban owns the member's ban now; this release is stale.
+        if let Some(case_id) = value.get("case_id").and_then(serde_json::Value::as_i64)
+            && store.has_ban_case_after(guild_id, target_id, case_id)?
+        {
+            info!(%guild_id, %target_id, case_id, "skipped stale scheduled unban");
+            store.delete_scheduled_action(id)?;
+            return Ok(());
+        }
         if let Err(error) = guild.unban(http, user).await {
             // Unknown Ban is already released; transient failures retain the job.
             if !discord_error_code(&error, 10026) {
@@ -14152,6 +14183,113 @@ mod tests {
             assert!(store.poll(poll).unwrap().unwrap().closed);
             assert_eq!(store.due_scheduled_actions(0, 1).unwrap().len(), 1);
         }
+    }
+
+    /// Local stand-in for the Discord REST API; nothing leaves the machine.
+    async fn mock_discord_http(
+        replies: Vec<(u16, serde_json::Value)>,
+    ) -> (serenity::http::Http, tokio::task::JoinHandle<Vec<String>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for (status, reply) in replies {
+                let (mut socket, _) =
+                    tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut bytes = [0; 4096];
+                    let count = socket.read(&mut bytes).await.unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&bytes[..count]);
+                    if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&request[..end]);
+                        let length = headers
+                            .lines()
+                            .find_map(|line| {
+                                line.to_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .and_then(|v| v.trim().parse::<usize>().ok())
+                            })
+                            .unwrap_or(0);
+                        if request.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
+                    assert!(request.len() < 100_000);
+                }
+                requests.push(String::from_utf8(request).unwrap());
+                let body = if status == 204 {
+                    String::new()
+                } else {
+                    reply.to_string()
+                };
+                socket.write_all(format!("HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            }
+            requests
+        });
+        (
+            serenity::http::HttpBuilder::new("fixture-only")
+                .proxy(base)
+                .ratelimiter_disabled(true)
+                .build(),
+            task,
+        )
+    }
+
+    #[tokio::test]
+    async fn scheduled_unban_skips_when_a_newer_ban_case_exists() {
+        let store = helper_store::Store::open(":memory:").unwrap();
+        let case = store
+            .record_case("1", "tempban", "2", "mod", "r", Some(1))
+            .unwrap();
+        store.replace_scheduled_unban("1", "2", 0, case).unwrap();
+        store
+            .record_case("1", "ban", "2", "mod", "perm", None)
+            .unwrap();
+        let (http, server) = mock_discord_http(vec![]).await;
+        let job = store.due_scheduled_actions(0, 1).unwrap().pop().unwrap();
+        assert!(
+            super::deliver_scheduled_action(&http, &store, job.0, "1", "unban", &job.3, &job.4)
+                .await
+                .is_ok()
+        );
+        assert!(
+            store
+                .due_scheduled_actions(i64::MAX, 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(server.await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn scheduled_unban_lifts_the_ban_of_its_own_case() {
+        let store = helper_store::Store::open(":memory:").unwrap();
+        let case = store
+            .record_case("1", "tempban", "2", "mod", "r", Some(1))
+            .unwrap();
+        store.replace_scheduled_unban("1", "2", 0, case).unwrap();
+        let (http, server) = mock_discord_http(vec![(204, serde_json::Value::Null)]).await;
+        let job = store.due_scheduled_actions(0, 1).unwrap().pop().unwrap();
+        assert!(
+            super::deliver_scheduled_action(&http, &store, job.0, "1", "unban", &job.3, &job.4)
+                .await
+                .is_ok()
+        );
+        assert!(
+            store
+                .due_scheduled_actions(i64::MAX, 10)
+                .unwrap()
+                .is_empty()
+        );
+        let reqs = server.await.unwrap();
+        assert_eq!(reqs.len(), 1);
+        assert!(reqs[0].starts_with("DELETE /api/v10/guilds/1/bans/2 "));
     }
 
     #[test]

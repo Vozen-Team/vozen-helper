@@ -5733,6 +5733,42 @@ impl Store {
         Ok(conn.last_insert_rowid())
     }
 
+    /// Schedules the release of a tempban, replacing any earlier release for
+    /// the same member so only the most recent tempban decides when it ends.
+    pub fn replace_scheduled_unban(
+        &self,
+        guild_id: &str,
+        user_id: &str,
+        execute_at: i64,
+        case_id: i64,
+    ) -> Result<i64> {
+        let mut conn = self.conn.lock().expect("store mutex poisoned");
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM scheduled_actions WHERE guild_id=?1 AND type='unban' AND target_id=?2",
+            params![guild_id, user_id],
+        )?;
+        // The job remembers its case so a later ban can be told apart.
+        let payload = serde_json::json!({"case_id": case_id}).to_string();
+        tx.execute(
+            "INSERT INTO scheduled_actions(guild_id,type,target_id,execute_at,payload,case_id) VALUES(?1,'unban',?2,?3,?4,?5)",
+            params![guild_id, user_id, execute_at, payload, case_id],
+        )?;
+        let id = tx.last_insert_rowid();
+        tx.commit()?;
+        Ok(id)
+    }
+
+    /// A newer ban or tempban supersedes the release scheduled by `case_id`.
+    pub fn has_ban_case_after(&self, guild_id: &str, user_id: &str, case_id: i64) -> Result<bool> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        Ok(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM cases WHERE guild_id=?1 AND target_id=?2 AND type IN ('ban','tempban') AND id>?3)",
+            params![guild_id, user_id, case_id],
+            |row| row.get(0),
+        )?)
+    }
+
     pub fn open_ticket(&self, guild_id: &str, user_id: &str, channel_id: &str) -> Result<()> {
         let conn = self.conn.lock().expect("store mutex poisoned");
         conn.execute(
@@ -6782,6 +6818,74 @@ mod tests {
         store.set_poll_message(published, "123").unwrap();
         assert!(!store.delete_unpublished_poll("g", published).unwrap());
         assert_eq!(store.due_scheduled_actions(123_456, 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn tempban_unban_jobs_are_replaced_and_know_their_case() {
+        let store = Store::open(":memory:").unwrap();
+        let first = store
+            .record_case("g", "tempban", "u", "mod", "r", Some(1_000))
+            .unwrap();
+        store.replace_scheduled_unban("g", "u", 100, first).unwrap();
+        let second = store
+            .record_case("g", "tempban", "u", "mod", "r", Some(2_000))
+            .unwrap();
+        store
+            .replace_scheduled_unban("g", "u", 200, second)
+            .unwrap();
+        let jobs = store.due_scheduled_actions(i64::MAX, 10).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].2, "unban");
+        assert_eq!(jobs[0].3, "u");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&jobs[0].4).unwrap()["case_id"],
+            second
+        );
+
+        let other_target = store
+            .record_case("g", "tempban", "other", "mod", "r", None)
+            .unwrap();
+        store
+            .replace_scheduled_unban("g", "other", 300, other_target)
+            .unwrap();
+        let other_guild = store
+            .record_case("g2", "tempban", "u", "mod", "r", None)
+            .unwrap();
+        store
+            .replace_scheduled_unban("g2", "u", 400, other_guild)
+            .unwrap();
+        let jobs = store.due_scheduled_actions(i64::MAX, 10).unwrap();
+        assert_eq!(jobs.len(), 3);
+        let own: Vec<_> = jobs
+            .iter()
+            .filter(|job| job.1 == "g" && job.3 == "u")
+            .collect();
+        assert_eq!(own.len(), 1);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&own[0].4).unwrap()["case_id"],
+            second
+        );
+
+        assert!(!store.has_ban_case_after("g", "u", second).unwrap());
+        store
+            .record_case("g", "warn", "u", "mod", "w", None)
+            .unwrap();
+        store
+            .record_case("g2", "ban", "u", "mod", "perm", None)
+            .unwrap();
+        store
+            .record_case("g", "ban", "other", "mod", "perm", None)
+            .unwrap();
+        assert!(!store.has_ban_case_after("g", "u", second).unwrap());
+        let ban = store
+            .record_case("g", "ban", "u", "mod", "perm", None)
+            .unwrap();
+        assert!(store.has_ban_case_after("g", "u", second).unwrap());
+        assert!(!store.has_ban_case_after("g", "u", ban).unwrap());
+        store
+            .record_case("g", "tempban", "u", "mod", "again", Some(3_000))
+            .unwrap();
+        assert!(store.has_ban_case_after("g", "u", ban).unwrap());
     }
 
     #[test]
