@@ -421,6 +421,23 @@ impl EventHandler for Handler {
         self.temp_channels
             .seed(&ctx.http, &self.store, &guild)
             .await;
+        // READY carries no voice states; GUILD_CREATE does. Sessions left open by
+        // leaves missed while disconnected must not be credited later.
+        let in_voice: Vec<(String, String)> = guild
+            .voice_states
+            .iter()
+            .filter_map(|(user, state)| {
+                state
+                    .channel_id
+                    .map(|channel| (user.to_string(), channel.to_string()))
+            })
+            .collect();
+        if let Err(error) = self
+            .store
+            .reconcile_voice_presence(&guild.id.to_string(), &in_voice)
+        {
+            warn!(guild_id = %guild.id, %error, "could not reconcile voice sessions");
+        }
         // Channels deleted while the bot was offline never produce ChannelDelete.
         let present: Vec<String> = guild.channels.keys().map(|id| id.to_string()).collect();
         match self
@@ -1882,10 +1899,12 @@ impl EventHandler for Handler {
         else {
             return;
         };
-        self.temp_channels
+        // Serenity is built without `cache`, so `old` is always `None`; the
+        // previous channel comes from the occupant map instead.
+        let observed_previous = self
+            .temp_channels
             .update(&ctx.http, &self.store, guild_id, &new)
             .await;
-        let old_channel_id = old.as_ref().and_then(|state| state.channel_id);
         let new_channel_id = new.channel_id;
         let guild_text = guild_id.to_string();
         let user_text = new.user_id.to_string();
@@ -1917,9 +1936,12 @@ impl EventHandler for Handler {
             }
         }
 
-        if feature_enabled(&self.store, &guild_text, "management.audit", None) {
+        // Mute, deafen and stream changes keep the channel and are not audited.
+        if let Some((from, to)) = voice_audit_change(observed_previous, new_channel_id)
+            && feature_enabled(&self.store, &guild_text, "management.audit", None)
+        {
             let detail = serde_json::json!({
-                "oldChannelId": old_channel_id.map(|channel| channel.to_string()),
+                "oldChannelId": observed_previous.flatten().map(|channel| channel.to_string()),
                 "newChannelId": new_channel_id.map(|channel| channel.to_string()),
                 "contentAvailable": false,
             })
@@ -1937,12 +1959,6 @@ impl EventHandler for Handler {
                     .filter(|value| !value.trim().is_empty())
                 && let Ok(log_channel) = raw_channel.parse::<u64>()
             {
-                let from = old_channel_id
-                    .map(|channel| format!("<#{}>", channel))
-                    .unwrap_or_else(|| "not connected".into());
-                let to = new_channel_id
-                    .map(|channel| format!("<#{}>", channel))
-                    .unwrap_or_else(|| "not connected".into());
                 let _ = ChannelId::new(log_channel)
                     .say(
                         &ctx.http,
@@ -1957,10 +1973,11 @@ impl EventHandler for Handler {
 
         // Voice XP is session based: joins start a durable snapshot, moves
         // close the old snapshot before starting the new one, and leaves close
-        // it without relying on a background timer. The store operation is
-        // idempotent so duplicate gateway deliveries cannot double-award XP.
-        if old_channel_id != new_channel_id
-            && feature_enabled(&self.store, &guild_text, "community.levels", None)
+        // it without relying on a background timer. The stored session decides
+        // what changed, so a mute in the same channel never restarts it. The
+        // store operation is idempotent so duplicate gateway deliveries cannot
+        // double-award XP.
+        if feature_enabled(&self.store, &guild_text, "community.levels", None)
             && setting_bool(
                 &self.store,
                 &guild_text,
@@ -1988,10 +2005,19 @@ impl EventHandler for Handler {
                 .active_voice_session(&guild_text, &user_text)
                 .ok()
                 .flatten();
-            if old_channel_id.is_some()
-                && let Ok(Some(minutes)) =
-                    self.store
-                        .finish_voice_session(&guild_text, &user_text, now)
+            let change = voice_session_change(
+                previous_session
+                    .as_ref()
+                    .map(|session| session.channel_id.as_str()),
+                new_channel_id.map(|channel| channel.to_string()).as_deref(),
+                is_ignored(new_channel_id),
+            );
+            if matches!(
+                change,
+                VoiceSessionChange::Finish | VoiceSessionChange::FinishAndStart(_)
+            ) && let Ok(Some(minutes)) =
+                self.store
+                    .finish_voice_session(&guild_text, &user_text, now)
             {
                 let before = self.store.level_for(&guild_text, &user_text).unwrap_or(0);
                 let event_key = previous_session
@@ -2050,14 +2076,11 @@ impl EventHandler for Handler {
                     }
                 }
             }
-            if let Some(channel_id) = new_channel_id
-                && !is_ignored(Some(channel_id))
-                && let Err(error) = self.store.start_voice_session(
-                    &guild_text,
-                    &user_text,
-                    &channel_id.to_string(),
-                    now,
-                )
+            if let VoiceSessionChange::Start(channel) | VoiceSessionChange::FinishAndStart(channel) =
+                &change
+                && let Err(error) =
+                    self.store
+                        .start_voice_session(&guild_text, &user_text, channel, now)
             {
                 warn!(%guild_id, user = %new.user_id, %error, "failed to start voice XP session");
             }
@@ -12478,6 +12501,57 @@ fn feature_title(key: &str) -> &'static str {
     }
 }
 
+/// What a voice event does to the stored voice XP session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum VoiceSessionChange {
+    Keep,
+    Start(String),
+    Finish,
+    FinishAndStart(String),
+}
+
+/// Decides from the stored session, not from Serenity's `old` state: without
+/// the `cache` feature `old` is always `None`, so a mute would look like a join.
+/// Staying in the same channel (mute, deafen, stream) never restarts a session.
+fn voice_session_change(
+    stored_channel: Option<&str>,
+    new_channel: Option<&str>,
+    new_channel_ignored: bool,
+) -> VoiceSessionChange {
+    if stored_channel == new_channel {
+        return VoiceSessionChange::Keep;
+    }
+    let start = new_channel
+        .filter(|_| !new_channel_ignored)
+        .map(str::to_owned);
+    match (stored_channel, start) {
+        (None, None) => VoiceSessionChange::Keep,
+        (None, Some(channel)) => VoiceSessionChange::Start(channel),
+        (Some(_), None) => VoiceSessionChange::Finish,
+        (Some(_), Some(channel)) => VoiceSessionChange::FinishAndStart(channel),
+    }
+}
+
+/// The `(from, to)` text for the voice audit log, or `None` when the member
+/// stayed in the same channel. `observed_previous` comes from the occupant map:
+/// `None` means the guild has not been seeded, so the previous channel is unknown.
+fn voice_audit_change(
+    observed_previous: Option<Option<ChannelId>>,
+    new: Option<ChannelId>,
+) -> Option<(String, String)> {
+    if observed_previous == Some(new) {
+        return None;
+    }
+    let describe = |channel: Option<ChannelId>| {
+        channel.map_or_else(|| "not connected".to_owned(), |id| format!("<#{id}>"))
+    };
+    let from = match observed_previous {
+        None => "an unknown channel".to_owned(),
+        Some(previous) => describe(previous),
+    };
+    Some((from, describe(new)))
+}
+
 fn scheduled_action_feature(action_type: &str) -> Option<&'static str> {
     match action_type {
         // Releasing a temporary sanction must survive a feature disable.
@@ -16181,5 +16255,56 @@ mod tests {
             "fallback"
         );
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn voice_transitions_follow_the_stored_session_not_serenity_old() {
+        use super::{VoiceSessionChange as C, voice_session_change as change};
+        assert_eq!(change(Some("1"), Some("1"), false), C::Keep); // mute/deafen/stream
+        assert_eq!(change(None, None, false), C::Keep);
+        assert_eq!(change(Some("1"), None, false), C::Finish); // leave
+        assert_eq!(change(None, Some("2"), false), C::Start("2".into())); // join
+        assert_eq!(change(None, Some("2"), true), C::Keep); // join ignored channel
+        assert_eq!(
+            change(Some("1"), Some("2"), false),
+            C::FinishAndStart("2".into())
+        );
+        assert_eq!(change(Some("1"), Some("2"), true), C::Finish); // move into ignored
+        use serenity::all::ChannelId;
+        assert_eq!(
+            super::voice_audit_change(Some(Some(ChannelId::new(5))), Some(ChannelId::new(5))),
+            None
+        );
+        assert_eq!(
+            super::voice_audit_change(Some(None), Some(ChannelId::new(5))),
+            Some(("not connected".into(), "<#5>".into()))
+        );
+        assert_eq!(
+            super::voice_audit_change(None, Some(ChannelId::new(5))),
+            Some(("an unknown channel".into(), "<#5>".into()))
+        );
+        assert_eq!(
+            super::voice_audit_change(Some(Some(ChannelId::new(5))), None),
+            Some(("<#5>".into(), "not connected".into()))
+        );
+    }
+
+    #[test]
+    fn voice_xp_join_mute_leave_awards_whole_minutes() {
+        use super::{VoiceSessionChange as C, voice_session_change as change};
+        let store = helper_store::Store::open(":memory:").unwrap();
+        assert_eq!(change(None, Some("c"), false), C::Start("c".into()));
+        store.start_voice_session("g", "u", "c", 100).unwrap();
+        let stored = store
+            .active_voice_session("g", "u")
+            .unwrap()
+            .map(|s| s.channel_id);
+        assert_eq!(change(stored.as_deref(), Some("c"), false), C::Keep); // mute: no restart
+        let stored = store
+            .active_voice_session("g", "u")
+            .unwrap()
+            .map(|s| s.channel_id);
+        assert_eq!(change(stored.as_deref(), None, false), C::Finish);
+        assert_eq!(store.finish_voice_session("g", "u", 700).unwrap(), Some(10));
     }
 }

@@ -5580,6 +5580,47 @@ impl Store {
         .map_err(Into::into)
     }
 
+    /// Close voice sessions that a fresh gateway snapshot does not confirm.
+    /// Nothing is credited: the bot cannot know when an absent member left.
+    /// An empty `present` list is valid and means nobody is in voice.
+    pub fn reconcile_voice_presence(
+        &self,
+        guild_id: &str,
+        present: &[(String, String)],
+    ) -> Result<usize> {
+        let present: std::collections::HashSet<(&str, &str)> = present
+            .iter()
+            .map(|(user_id, channel_id)| (user_id.as_str(), channel_id.as_str()))
+            .collect();
+        let mut conn = self.conn.lock().expect("store mutex poisoned");
+        let tx = conn.transaction()?;
+        let mut closed = 0;
+        for (select, delete) in [
+            (
+                "SELECT user_id,channel_id FROM voice_sessions WHERE guild_id=?1",
+                "DELETE FROM voice_sessions WHERE guild_id=?1 AND user_id=?2 AND channel_id=?3",
+            ),
+            (
+                "SELECT user_id,channel_id FROM achievement_voice WHERE guild_id=?1",
+                "DELETE FROM achievement_voice WHERE guild_id=?1 AND user_id=?2 AND channel_id=?3",
+            ),
+        ] {
+            let sessions = tx
+                .prepare(select)?
+                .query_map(params![guild_id], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            for (user_id, channel_id) in sessions.iter().filter(|(user_id, channel_id)| {
+                !present.contains(&(user_id.as_str(), channel_id.as_str()))
+            }) {
+                closed += tx.execute(delete, params![guild_id, user_id, channel_id])?;
+            }
+        }
+        tx.commit()?;
+        Ok(closed)
+    }
+
     pub fn level_for(&self, guild_id: &str, user_id: &str) -> Result<i64> {
         let conn = self.conn.lock().expect("store mutex poisoned");
         Ok(conn
@@ -9115,6 +9156,51 @@ mod tests {
             store.finish_voice_session("g1", "u1", 99_999_999).unwrap(),
             Some(1_440)
         );
+    }
+
+    #[test]
+    fn voice_presence_reconciliation_closes_unconfirmed_sessions_without_credit() {
+        let store = Store::open(":memory:").unwrap();
+        store.start_voice_session("g", "stay", "c1", 100).unwrap();
+        store.start_voice_session("g", "left", "c1", 100).unwrap();
+        store.start_voice_session("g", "moved", "c1", 100).unwrap();
+        store.start_voice_session("g2", "other", "c1", 100).unwrap();
+        store
+            .update_achievement_voice("g", "stay", Some("c1"), 100)
+            .unwrap();
+        store
+            .update_achievement_voice("g", "left", Some("c1"), 100)
+            .unwrap();
+        let present = vec![
+            ("stay".to_string(), "c1".to_string()),
+            ("moved".to_string(), "c2".to_string()),
+        ];
+        // XP sessions of `left` and `moved`, and the achievement session of `left`.
+        assert_eq!(store.reconcile_voice_presence("g", &present).unwrap(), 3);
+        assert_eq!(
+            store
+                .active_voice_session("g", "stay")
+                .unwrap()
+                .unwrap()
+                .started_at,
+            100
+        );
+        assert!(store.active_voice_session("g", "left").unwrap().is_none());
+        assert!(store.active_voice_session("g", "moved").unwrap().is_none());
+        assert!(store.active_voice_session("g2", "other").unwrap().is_some());
+        // Nothing is credited for the time the bot could not see.
+        assert_eq!(
+            store.achievement_progress("g", "left", 100_000).unwrap()[1].value,
+            0
+        );
+        // Nobody in voice is a valid snapshot and closes the rest of the guild.
+        assert_eq!(store.reconcile_voice_presence("g", &[]).unwrap(), 2);
+        assert!(store.active_voice_session("g", "stay").unwrap().is_none());
+        assert_eq!(
+            store.achievement_progress("g", "stay", 100_000).unwrap()[1].value,
+            0
+        );
+        assert!(store.active_voice_session("g2", "other").unwrap().is_some());
     }
 
     #[test]
