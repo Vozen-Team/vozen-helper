@@ -1,9 +1,10 @@
 use super::*;
+use axum::routing::delete;
 use axum::{
     body::{Body, to_bytes},
     extract::Path,
 };
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use tower::ServiceExt;
 
 const GUILD: &str = "100000000000000001";
@@ -16,6 +17,10 @@ struct Discord {
     permissions: AtomicU64,
     owner: AtomicBool,
     unavailable: AtomicBool,
+    base: String,
+    created_roles: AtomicUsize,
+    created_channels: AtomicUsize,
+    posted_messages: AtomicUsize,
 }
 
 async fn fixture() -> (
@@ -24,10 +29,16 @@ async fn fixture() -> (
     Arc<Discord>,
     tokio::task::JoinHandle<()>,
 ) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
     let discord = Arc::new(Discord {
         permissions: AtomicU64::new(32 | (1 << 28)),
         owner: AtomicBool::new(false),
         unavailable: AtomicBool::new(false),
+        base: format!("http://{address}"),
+        created_roles: AtomicUsize::new(0),
+        created_channels: AtomicUsize::new(0),
+        posted_messages: AtomicUsize::new(0),
     });
     let mock = Router::new()
         .route("/users/@me", get(|| async { Json(serde_json::json!({"id":BOT})) }))
@@ -40,23 +51,35 @@ async fn fixture() -> (
         }))
         .route("/guilds/{guild}/roles", get(|State(d): State<Arc<Discord>>| async move {
             Json(serde_json::json!([
-                {"id":GUILD,"position":0,"managed":false,"permissions":"0"},
-                {"id":"100000000000000010","position":5,"managed":false,"permissions":d.permissions.load(Ordering::SeqCst).to_string()},
-                {"id":"100000000000000020","position":10,"managed":false,"permissions":(1u64 << 28).to_string()},
-                {"id":HIGH,"position":8,"managed":false,"permissions":"8"},
-                {"id":LOW,"position":4,"managed":false,"permissions":"0"}
+                {"id":GUILD,"name":"@everyone","position":0,"managed":false,"permissions":"0"},
+                {"id":"100000000000000010","name":"Publisher","position":5,"managed":false,"permissions":d.permissions.load(Ordering::SeqCst).to_string()},
+                {"id":"100000000000000020","name":"Helper","position":10,"managed":false,"permissions":(1u64 << 28).to_string()},
+                {"id":HIGH,"name":"Staff","position":8,"managed":false,"permissions":"8"},
+                {"id":LOW,"name":"Members","position":4,"managed":false,"permissions":"0"}
             ]))
-        })).with_state(discord.clone());
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
+        }).post(|State(d): State<Arc<Discord>>| async move {
+            d.created_roles.fetch_add(1, Ordering::SeqCst);
+            Json(serde_json::json!({"id":"100000000000000050","name":"Novo"}))
+        }))
+        .route("/guilds/{guild}/channels", get(|| async { Json(serde_json::json!([])) }).post(|State(d): State<Arc<Discord>>| async move {
+            d.created_channels.fetch_add(1, Ordering::SeqCst);
+            Json(serde_json::json!({"id":"100000000000000061","name":"boas-vindas"}))
+        }))
+        .route("/channels/{channel}", get(|Path(channel): Path<String>| async move {
+            Json(serde_json::json!({"id":channel,"guild_id":GUILD,"type":0}))
+        }))
+        .route("/channels/{channel}/messages", post(|State(d): State<Arc<Discord>>| async move {
+            d.posted_messages.fetch_add(1, Ordering::SeqCst);
+            Json(serde_json::json!({"id":"100000000000000071"}))
+        }))
+        .route("/channels/{channel}/messages/{message}", delete(|| async { StatusCode::NO_CONTENT }))
+        .with_state(discord.clone());
     let server = tokio::spawn(async move {
         axum::serve(listener, mock).await.unwrap();
     });
     let store = Store::open(":memory:").unwrap();
     let mut state = crate::tests::state(store);
-    state.guild_authorization = Arc::new(GuildAuthorization::with_test_base(format!(
-        "http://{address}"
-    )));
+    state.guild_authorization = Arc::new(GuildAuthorization::with_test_base(discord.base.clone()));
     let now = Utc::now();
     let claims = SessionClaims {
         session_id: Uuid::new_v4(),
@@ -140,11 +163,6 @@ async fn publication_routes_reject_above_publisher_before_discord_or_storage_mut
             "PUT",
             "/api/role-panels/100000000000000070",
             serde_json::json!({"channel":"100000000000000060","title":"Roles","roleIds":[HIGH]}),
-        ),
-        (
-            "PUT",
-            "/api/quick-setup/steps/roles",
-            serde_json::json!({"status":"applied","enabled":true,"config":{"channel":"100000000000000060","roleIds":[HIGH]}}),
         ),
         (
             "POST",
@@ -257,4 +275,249 @@ async fn shop_role_products_require_actor_role_authority_before_storage() {
         assert!(store.shop_products(GUILD).unwrap().is_empty());
         server.abort();
     }
+}
+
+async fn quick_setup_request(
+    state: ApiState,
+    claims: &SessionClaims,
+    base: String,
+    step: &str,
+    payload: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    let token = sign_session(claims, &state.session_secret);
+    let uri = format!("/api/quick-setup/steps/{step}");
+    crate::discord_channel_tests::TEST_BASE
+        .scope(base, async move {
+            let response = router(state)
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("PUT")
+                        .uri(uri)
+                        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(payload.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let body =
+                serde_json::from_slice(&to_bytes(response.into_body(), 1_000_000).await.unwrap())
+                    .unwrap();
+            (status, body)
+        })
+        .await
+}
+
+fn discord_counters(discord: &Discord) -> (usize, usize, usize) {
+    (
+        discord.created_roles.load(Ordering::SeqCst),
+        discord.created_channels.load(Ordering::SeqCst),
+        discord.posted_messages.load(Ordering::SeqCst),
+    )
+}
+
+#[tokio::test]
+async fn quick_setup_roles_reject_reused_role_above_publisher_before_creation() {
+    for config in [
+        serde_json::json!({"channel":"100000000000000060","roleNames":"Staff, Novo"}),
+        // With Manage Channels, a missing channel would be created: the role
+        // check must still come first.
+        serde_json::json!({"createChannel":true,"roleNames":"Staff, Novo"}),
+    ] {
+        let (mut state, claims, discord, server) = fixture().await;
+        discord
+            .permissions
+            .store(32 | (1 << 28) | 16, Ordering::SeqCst);
+        state.discord_token = "synthetic-discord-bot-token".into();
+        let store = state.store.clone();
+        let (status, body) = quick_setup_request(
+            state,
+            &claims,
+            discord.base.clone(),
+            "roles",
+            serde_json::json!({"status":"applied","enabled":true,"config":config}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{config}: {body}");
+        assert_eq!(body["code"], "role_not_offerable", "{config}: {body}");
+        assert_eq!(discord_counters(&discord), (0, 0, 0), "{config}");
+        assert!(
+            store
+                .get_feature_setting(GUILD, "community.role_panels")
+                .unwrap()
+                .is_none()
+        );
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn quick_setup_welcome_rejects_auto_role_above_publisher() {
+    let (mut state, claims, discord, server) = fixture().await;
+    state.discord_token = "synthetic-discord-bot-token".into();
+    let reader = state.clone();
+    let (status, body) = quick_setup_request(
+        state,
+        &claims,
+        discord.base.clone(),
+        "welcome",
+        serde_json::json!({"status":"applied","enabled":true,"config":{"autoRole":HIGH}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["code"], "role_not_offerable", "{body}");
+    assert!(
+        reader
+            .store
+            .get_feature_setting(GUILD, "support.welcome")
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        read_quick_setup(&reader, GUILD)["revision"].as_u64(),
+        Some(0)
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn quick_setup_roles_on_free_guild_is_rejected_before_discord() {
+    let (mut state, claims, discord, server) = fixture().await;
+    state.discord_token = "synthetic-discord-bot-token".into();
+    state
+        .store
+        .save_entitlement(&helper_contracts::EntitlementSnapshot::free(USER))
+        .unwrap();
+    let store = state.store.clone();
+    let (status, body) = quick_setup_request(
+        state,
+        &claims,
+        discord.base.clone(),
+        "roles",
+        serde_json::json!({"status":"applied","enabled":true,"config":{"channel":"100000000000000060","roleNames":"Members"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["code"], "premium_required", "{body}");
+    assert_eq!(discord_counters(&discord), (0, 0, 0));
+    assert!(
+        store
+            .get_feature_setting(GUILD, "community.role_panels")
+            .unwrap()
+            .is_none()
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn quick_setup_skipped_step_touches_nothing() {
+    let (mut state, claims, discord, server) = fixture().await;
+    state.discord_token = "synthetic-discord-bot-token".into();
+    let reader = state.clone();
+    let (status, body) = quick_setup_request(
+        state,
+        &claims,
+        discord.base.clone(),
+        "roles",
+        serde_json::json!({"status":"skipped","config":{"createChannel":true,"roleNames":"Novo"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(discord_counters(&discord), (0, 0, 0));
+    let saved = read_quick_setup(&reader, GUILD);
+    let step = saved["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["key"] == "roles")
+        .unwrap();
+    assert_eq!(step["status"], "skipped", "{saved}");
+    server.abort();
+}
+
+#[tokio::test]
+async fn quick_setup_channel_creation_requires_actor_manage_channels() {
+    let (mut state, claims, discord, server) = fixture().await;
+    discord.permissions.store(32 | (1 << 28), Ordering::SeqCst);
+    state.discord_token = "synthetic-discord-bot-token".into();
+    let store = state.store.clone();
+    let (status, body) = quick_setup_request(
+        state,
+        &claims,
+        discord.base.clone(),
+        "welcome",
+        serde_json::json!({"status":"applied","enabled":true,"config":{"createChannel":true}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(
+        body["code"], "quick_setup_manage_channels_required",
+        "{body}"
+    );
+    assert_eq!(discord.created_channels.load(Ordering::SeqCst), 0);
+    assert!(
+        store
+            .get_feature_setting(GUILD, "support.welcome")
+            .unwrap()
+            .is_none()
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn quick_setup_welcome_panel_draft_with_manage_channels_creates_one_channel() {
+    let (mut state, claims, discord, server) = fixture().await;
+    discord
+        .permissions
+        .store(32 | (1 << 28) | 16, Ordering::SeqCst);
+    state.discord_token = "synthetic-discord-bot-token".into();
+    let store = state.store.clone();
+    let mut config = feature_adapter("support.welcome")
+        .unwrap()
+        .descriptor()
+        .defaults;
+    config["mode"] = serde_json::json!("recommended");
+    config["createChannel"] = serde_json::json!(true);
+    let (status, body) = quick_setup_request(
+        state,
+        &claims,
+        discord.base.clone(),
+        "welcome",
+        serde_json::json!({"status":"applied","enabled":true,"config":config}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(discord.created_channels.load(Ordering::SeqCst), 1);
+    let record = store
+        .get_feature_setting(GUILD, "support.welcome")
+        .unwrap()
+        .unwrap();
+    assert!(record.enabled);
+    assert!(
+        record
+            .config_json
+            .contains(r#""channel":"100000000000000061""#),
+        "{}",
+        record.config_json
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn quick_setup_roles_reusing_an_existing_role_publishes_one_panel() {
+    let (mut state, claims, discord, server) = fixture().await;
+    state.discord_token = "synthetic-discord-bot-token".into();
+    let (status, body) = quick_setup_request(
+        state,
+        &claims,
+        discord.base.clone(),
+        "roles",
+        serde_json::json!({"status":"applied","enabled":true,"config":{"channel":"100000000000000060","roleNames":"Members"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(discord.posted_messages.load(Ordering::SeqCst), 1);
+    assert_eq!(discord.created_roles.load(Ordering::SeqCst), 0);
+    server.abort();
 }

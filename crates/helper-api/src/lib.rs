@@ -83,6 +83,27 @@ const IDLE_MINUTES: i64 = 30;
 static TICKET_PANEL_SAVE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 static NICKNAME_SAVE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// Async locks keyed by guild id: work in one server never waits for another.
+/// An entry nobody holds is dropped on the next lookup, so the map stays small.
+struct GuildLocks(std::sync::Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>);
+
+impl GuildLocks {
+    const fn new() -> Self {
+        Self(std::sync::Mutex::new(BTreeMap::new()))
+    }
+
+    fn for_guild(&self, guild_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+        locks.entry(guild_id.to_owned()).or_default().clone()
+    }
+}
+
+static QUICK_SETUP_LOCKS: GuildLocks = GuildLocks::new();
+
 #[derive(Clone)]
 pub struct ApiState {
     pub store: Store,
@@ -5180,6 +5201,16 @@ async fn guilds(
 
 const DISCORD_API_BASE: &str = "https://discord.com/api/v10";
 
+/// Discord REST base for the Quick Setup/role panel helpers. Tests point it
+/// at a local mock through `discord_channel_tests::TEST_BASE`.
+fn discord_api_base() -> String {
+    #[cfg(test)]
+    if let Ok(base) = discord_channel_tests::TEST_BASE.try_with(Clone::clone) {
+        return base;
+    }
+    DISCORD_API_BASE.to_owned()
+}
+
 #[derive(Debug, Default, Clone)]
 struct DiscordGuildSnapshot {
     channels: Vec<serde_json::Value>,
@@ -6771,7 +6802,8 @@ async fn discord_create_channel(
         .timeout(std::time::Duration::from_secs(8))
         .build()
         .unwrap_or_else(|_| Client::new());
-    let response = client.post(format!("https://discord.com/api/v10/guilds/{guild_id}/channels"))
+    let base = discord_api_base();
+    let response = client.post(format!("{base}/guilds/{guild_id}/channels"))
         .header(header::AUTHORIZATION, format!("Bot {}", state.discord_token))
         .json(&serde_json::json!({"name": if safe_name.is_empty() { "vozen-setup" } else { &safe_name }, "type": 0, "reason": "Vozen Quick Setup"}))
         .send().await.map_err(|_| client_error(StatusCode::BAD_GATEWAY, "discord_unreachable"))?;
@@ -6801,10 +6833,11 @@ async fn discord_find_resource(
     if state.discord_token.len() < 20 {
         return None;
     }
+    let base = discord_api_base();
     let endpoint = if resource == "role" {
-        format!("https://discord.com/api/v10/guilds/{guild_id}/roles")
+        format!("{base}/guilds/{guild_id}/roles")
     } else {
-        format!("https://discord.com/api/v10/guilds/{guild_id}/channels")
+        format!("{base}/guilds/{guild_id}/channels")
     };
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(8))
@@ -6854,7 +6887,8 @@ async fn discord_create_role(
         .timeout(std::time::Duration::from_secs(8))
         .build()
         .unwrap_or_else(|_| Client::new());
-    let response = client.post(format!("https://discord.com/api/v10/guilds/{guild_id}/roles"))
+    let base = discord_api_base();
+    let response = client.post(format!("{base}/guilds/{guild_id}/roles"))
         .header(header::AUTHORIZATION, format!("Bot {}", state.discord_token))
         .json(&serde_json::json!({"name": safe_name, "permissions": "0", "mentionable": false, "reason": "Vozen Quick Setup"}))
         .send().await.map_err(|_| client_error(StatusCode::BAD_GATEWAY, "discord_unreachable"))?;
@@ -6954,10 +6988,9 @@ async fn discord_publish_role_panel(
         .timeout(std::time::Duration::from_secs(8))
         .build()
         .unwrap_or_else(|_| Client::new());
+    let base = discord_api_base();
     let role_values = match client
-        .get(format!(
-            "https://discord.com/api/v10/guilds/{guild_id}/roles"
-        ))
+        .get(format!("{base}/guilds/{guild_id}/roles"))
         .header(
             header::AUTHORIZATION,
             format!("Bot {}", state.discord_token),
@@ -6981,9 +7014,7 @@ async fn discord_publish_role_panel(
         })).collect::<Vec<_>>()
     }]);
     let response = client
-        .post(format!(
-            "https://discord.com/api/v10/channels/{channel_id}/messages"
-        ))
+        .post(format!("{base}/channels/{channel_id}/messages"))
         .header(
             header::AUTHORIZATION,
             format!("Bot {}", state.discord_token),
@@ -7135,9 +7166,10 @@ async fn discord_delete_role_panel(
         .timeout(std::time::Duration::from_secs(8))
         .build()
         .unwrap_or_else(|_| Client::new());
+    let base = discord_api_base();
     let response = client
         .delete(format!(
-            "{DISCORD_API_BASE}/channels/{channel_id}/messages/{message_id}"
+            "{base}/channels/{channel_id}/messages/{message_id}"
         ))
         .header(
             header::AUTHORIZATION,
@@ -7482,6 +7514,7 @@ fn publish_quick_setup_feature(
     key: &str,
     enabled: bool,
     config: &serde_json::Value,
+    expected_revision: u64,
 ) -> Result<(), (StatusCode, Json<ApiError>)> {
     let enabled_value = if enabled { "true" } else { "false" };
     let mut projections = vec![
@@ -7489,19 +7522,24 @@ fn publish_quick_setup_feature(
         (feature_config_key(key), config.to_string()),
     ];
     projections.extend(runtime_projection_pairs(key, config));
-    state
-        .store
-        .publish_feature_setting(
-            guild_id,
-            key,
-            enabled,
-            &config.to_string(),
-            None,
-            user_id,
-            &projections,
-        )
-        .map_err(|_| client_error(StatusCode::INTERNAL_SERVER_ERROR, "store_error"))?;
-    Ok(())
+    match state.store.publish_feature_setting(
+        guild_id,
+        key,
+        enabled,
+        &config.to_string(),
+        Some(expected_revision),
+        user_id,
+        &projections,
+    ) {
+        Ok(_) => Ok(()),
+        Err(error) if error.to_string().starts_with("feature_revision_conflict:") => Err(
+            client_error(StatusCode::CONFLICT, "feature_revision_conflict"),
+        ),
+        Err(_) => Err(client_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "store_error",
+        )),
+    }
 }
 
 async fn quick_setup(
@@ -7548,17 +7586,79 @@ async fn quick_setup_step(
             "invalid_quick_setup_status",
         ));
     }
-    if step == "roles"
-        && update.status == "applied"
-        && update.enabled
-        && state
+    // An applied step writes a feature revision even when it is disabled, so
+    // it gets the same shape and size limits as a normal feature save.
+    if update.status == "applied"
+        && (step == "welcome" || step == "roles")
+        && (!update.config.is_object() || update.config.to_string().len() > 64 * 1024)
+    {
+        return Err(client_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_feature_config",
+        ));
+    }
+    if update.status == "applied"
+        && step == "welcome"
+        && validate_feature_config("support.welcome", &update.config)
+            .iter()
+            .any(|issue| issue.severity == "error")
+    {
+        return Err(client_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_feature_config",
+        ));
+    }
+    // One step at a time per guild, so concurrent requests cannot create
+    // duplicate channels or roles.
+    let guild_lock = QUICK_SETUP_LOCKS.for_guild(&claims.guild_id);
+    let _guard = guild_lock.lock().await;
+    // Feature revision observed before any Discord write: an edit saved while
+    // this step runs turns the publish below into a conflict.
+    let expected_revision = match step.as_str() {
+        "welcome" => Some("support.welcome"),
+        "roles" => Some("community.role_panels"),
+        _ => None,
+    }
+    .map(|key| {
+        state
+            .store
+            .get_feature_setting(&claims.guild_id, key)
+            .map(|record| record.map(|record| record.revision).unwrap_or(0))
+            .map_err(|_| client_error(StatusCode::INTERNAL_SERVER_ERROR, "store_error"))
+    })
+    .transpose()?
+    .unwrap_or(0);
+    // Skipped or disabled steps never create, reuse or publish anything in
+    // Discord.
+    let touches_discord = update.status == "applied" && update.enabled;
+    if touches_discord && step == "roles" {
+        if state
             .guild_authorization
             .permissions(&state, &claims)
             .await?
             & ((1 << 28) | 8)
             == 0
+        {
+            return Err(client_error(StatusCode::FORBIDDEN, "role_not_offerable"));
+        }
+        require_feature_premium(&state, &claims, "community.role_panels").await?;
+    }
+    if touches_discord
+        && step == "welcome"
+        && let Some(auto_role) = update
+            .config
+            .get("autoRole")
+            .and_then(serde_json::Value::as_str)
+            .filter(|role| !role.is_empty())
     {
-        return Err(client_error(StatusCode::FORBIDDEN, "role_not_offerable"));
+        // The bot gives this role to every member who joins.
+        require_role_offers(
+            &state,
+            &claims.guild_id,
+            &claims.user_id,
+            &[auto_role.to_owned()],
+        )
+        .await?;
     }
     let mut value = read_quick_setup(&state, &claims.guild_id);
     let revision = value["revision"].as_u64().unwrap_or(0);
@@ -7583,7 +7683,36 @@ async fn quick_setup_step(
     } else {
         "channel"
     };
-    if create_channel
+    let role_names = if step == "roles" && touches_discord {
+        update
+            .config
+            .get("roleNames")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .take(5)
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    // Roles, first pass: find the existing ones and check the requester may
+    // hand them out before anything (channel or role) is created.
+    let mut found_roles = Vec::with_capacity(role_names.len());
+    for role_name in &role_names {
+        found_roles.push(discord_find_resource(&state, &claims.guild_id, role_name, "role").await);
+    }
+    let existing_roles = found_roles
+        .iter()
+        .flatten()
+        .map(|(id, _)| id.clone())
+        .collect::<Vec<_>>();
+    if !existing_roles.is_empty() {
+        require_role_offers(&state, &claims.guild_id, &claims.user_id, &existing_roles).await?;
+    }
+    if touches_discord
+        && create_channel
         && update
             .config
             .get(channel_key)
@@ -7600,6 +7729,18 @@ async fn quick_setup_step(
         {
             (id, name, "reused")
         } else {
+            // Creating a channel needs the requester's own Manage Channels
+            // (or Administrator), not only the bot's.
+            let actor = state
+                .guild_authorization
+                .permissions(&state, &claims)
+                .await?;
+            if actor & (8 | 16) == 0 {
+                return Err(client_error(
+                    StatusCode::FORBIDDEN,
+                    "quick_setup_manage_channels_required",
+                ));
+            }
             let (id, name) = discord_create_channel(&state, &claims.guild_id, suggested).await?;
             (id, name, "created")
         };
@@ -7607,23 +7748,23 @@ async fn quick_setup_step(
         created_resources.push(serde_json::json!({"type": "channel", "name": format!("#{name}"), "id": id, "state": resource_state}));
     }
     if step == "roles" {
-        let role_names = update
-            .config
-            .get("roleNames")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("")
-            .split(',')
-            .map(str::trim)
-            .filter(|name| !name.is_empty())
-            .take(5);
+        // Second pass, in roleNames order: reuse or create. A name repeated in
+        // the request reuses the role created for its first occurrence. Only
+        // ids resolved here are published; a client-sent roleIds never is, and
+        // a skipped or disabled step publishes none.
         let mut role_ids = Vec::new();
-        for role_name in role_names {
-            let (id, name, resource_state) = if let Some((id, name)) =
-                discord_find_resource(&state, &claims.guild_id, role_name, "role").await
-            {
+        let mut created: Vec<(&str, String, String)> = Vec::new();
+        for (role_name, found) in role_names.iter().copied().zip(found_roles) {
+            let (id, name, resource_state) = if let Some((id, name)) = found {
                 (id, name, "reused")
+            } else if let Some((_, id, name)) = created
+                .iter()
+                .find(|(requested, _, _)| requested.eq_ignore_ascii_case(role_name))
+            {
+                (id.clone(), name.clone(), "reused")
             } else {
                 let (id, name) = discord_create_role(&state, &claims.guild_id, role_name).await?;
+                created.push((role_name, id.clone(), name.clone()));
                 (id, name, "created")
             };
             role_ids.push(serde_json::json!(id));
@@ -7660,6 +7801,7 @@ async fn quick_setup_step(
                 "support.welcome",
                 update.enabled,
                 &normalized_config,
+                expected_revision,
             )?,
             "roles" => {
                 publish_quick_setup_feature(
@@ -7669,6 +7811,7 @@ async fn quick_setup_step(
                     "community.role_panels",
                     update.enabled,
                     &normalized_config,
+                    expected_revision,
                 )?;
                 if update.enabled
                     && let Some(message_id) = discord_publish_role_panel(
@@ -12964,6 +13107,19 @@ mod tests {
         let mut entitlement = helper_contracts::EntitlementSnapshot::free(session.user_id.clone());
         entitlement.plan = Plan::Premium { guild_limit: 1 };
         store.save_entitlement(&entitlement).unwrap();
+    }
+
+    #[test]
+    fn guild_locks_isolate_guilds_and_release_entries() {
+        static LOCKS: GuildLocks = GuildLocks::new();
+        let first = LOCKS.for_guild("g1");
+        assert!(Arc::ptr_eq(&first, &LOCKS.for_guild("g1")));
+        let guard = first.try_lock().unwrap();
+        assert!(LOCKS.for_guild("g2").try_lock().is_ok());
+        drop(guard);
+        drop(first);
+        let _third = LOCKS.for_guild("g3");
+        assert_eq!(LOCKS.0.lock().unwrap().len(), 1);
     }
 
     #[test]
