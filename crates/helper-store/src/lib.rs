@@ -34,6 +34,14 @@ pub struct Store {
     database_path: Option<std::path::PathBuf>,
 }
 
+/// Version of the schema produced by `Store::migrate`, stored in `helper_meta`
+/// under `rust_schema_version`. Raise it by one whenever `migrate` changes the
+/// schema (new table, column or index). A future step that is not idempotent
+/// (for example a column rename) runs only when the stored version is lower.
+/// `PRAGMA user_version` belongs to the Node bot (src/store/db.ts) on databases
+/// converted in place, so it must not be used here.
+const RUST_SCHEMA_VERSION: i64 = 1;
+
 #[derive(Debug, Clone, Copy, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StorageMetrics {
@@ -905,7 +913,12 @@ impl Store {
         } else {
             Some(path.as_ref().to_path_buf())
         };
-        let conn = Connection::open(path).context("open helper sqlite")?;
+        let mut conn = Connection::open(path).context("open helper sqlite")?;
+        // Two Stores (API and gateway) share this file in Serve mode. Every
+        // transaction takes the write lock at BEGIN and waits for the other
+        // connection instead of failing when it upgrades from read to write.
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        conn.set_transaction_behavior(rusqlite::TransactionBehavior::Immediate);
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         let store = Self {
@@ -1018,6 +1031,13 @@ impl Store {
         // The event key is scoped to a guild because Discord identifiers from
         // different sources may legitimately overlap in fixtures/imports.
         conn.execute_batch("CREATE TABLE IF NOT EXISTS xp_events (guild_id TEXT NOT NULL, user_id TEXT NOT NULL, event_key TEXT NOT NULL, source TEXT NOT NULL, amount INTEGER NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY(guild_id,event_key)); CREATE INDEX IF NOT EXISTS idx_xp_events_user_time ON xp_events(guild_id,user_id,created_at DESC);")?;
+        // Same names as the Node schema (src/store/db.ts) so databases converted
+        // in place keep their existing indexes instead of getting duplicates.
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_cases_target ON cases(guild_id,target_id);
+             CREATE INDEX IF NOT EXISTS idx_activity_user ON activity_log(guild_id,user_id);
+             CREATE INDEX IF NOT EXISTS idx_levels_xp ON levels(guild_id,xp DESC);",
+        )?;
         conn.execute_batch("CREATE TABLE IF NOT EXISTS birthdays (guild_id TEXT NOT NULL, user_id TEXT NOT NULL, month INTEGER NOT NULL, day INTEGER NOT NULL, last_announced_year INTEGER, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY(guild_id,user_id)); CREATE INDEX IF NOT EXISTS idx_birthdays_day ON birthdays(month,day,last_announced_year); CREATE TABLE IF NOT EXISTS economy_accounts (guild_id TEXT NOT NULL, user_id TEXT NOT NULL, balance INTEGER NOT NULL DEFAULT 0, last_daily_at INTEGER, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY(guild_id,user_id)); CREATE INDEX IF NOT EXISTS idx_economy_guild_balance ON economy_accounts(guild_id,balance DESC); CREATE TABLE IF NOT EXISTS economy_ledger (id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id TEXT NOT NULL, user_id TEXT NOT NULL, amount INTEGER NOT NULL, reason TEXT NOT NULL, idempotency_key TEXT NOT NULL UNIQUE, created_at INTEGER NOT NULL); CREATE INDEX IF NOT EXISTS idx_economy_ledger_account ON economy_ledger(guild_id,user_id,created_at DESC); CREATE TABLE IF NOT EXISTS temp_channels (guild_id TEXT NOT NULL, channel_id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, created_at INTEGER NOT NULL); CREATE INDEX IF NOT EXISTS idx_temp_channels_guild ON temp_channels(guild_id); CREATE TABLE IF NOT EXISTS voice_sessions (guild_id TEXT NOT NULL, user_id TEXT NOT NULL, channel_id TEXT NOT NULL, started_at INTEGER NOT NULL, PRIMARY KEY(guild_id,user_id)); CREATE INDEX IF NOT EXISTS idx_voice_sessions_guild ON voice_sessions(guild_id,started_at);")?;
         economy_shop::migrate(&conn)?;
         conn.execute_batch("CREATE TABLE IF NOT EXISTS economy_cooldowns (guild_id TEXT NOT NULL, user_id TEXT NOT NULL, kind TEXT NOT NULL, last_claim_at INTEGER NOT NULL, PRIMARY KEY(guild_id,user_id,kind)); CREATE INDEX IF NOT EXISTS idx_economy_cooldowns_kind ON economy_cooldowns(guild_id,kind,last_claim_at);")?;
@@ -1113,6 +1133,10 @@ impl Store {
         tx.commit()?;
         drop(conn);
         self.migrate_achievement_activity()?;
+        self.conn.lock().expect("store mutex poisoned").execute(
+            "INSERT INTO helper_meta(key,value) VALUES('rust_schema_version',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value WHERE CAST(helper_meta.value AS INTEGER) < CAST(excluded.value AS INTEGER)",
+            [RUST_SCHEMA_VERSION.to_string()],
+        )?;
         Ok(())
     }
 
@@ -10084,6 +10108,111 @@ mod tests {
         assert!(store.due_birthdays(8, 3, 2026, 10).unwrap().is_empty());
         drop(store);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn sqlite_two_connections_wait_for_the_write_lock() {
+        let path = std::env::temp_dir().join(format!(
+            "vozen-helper-two-connections-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let api = Store::open(path.to_str().unwrap()).unwrap();
+        // Stands for the gateway's own Store::open on the same file (Serve mode).
+        let gateway = Connection::open(&path).unwrap();
+        gateway
+            .execute_batch("BEGIN IMMEDIATE; INSERT INTO settings(guild_id,key,value,updated_at) VALUES('other','k','v',0);")
+            .unwrap();
+        let daily = {
+            let api = api.clone();
+            std::thread::spawn(move || {
+                api.claim_daily("g", "u", 100)
+                    .map(|account| account.map(|account| account.balance))
+                    .map_err(|error| error.to_string())
+            })
+        };
+        let event = {
+            let api = api.clone();
+            std::thread::spawn(move || {
+                api.register_event_with_capacity("g", "event-1", "u", Some(10))
+                    .map_err(|error| error.to_string())
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        gateway.execute_batch("COMMIT").unwrap();
+        assert_eq!(daily.join().unwrap(), Ok(Some(100)));
+        assert_eq!(event.join().unwrap(), Ok(Some("registered".to_string())));
+        drop(api);
+        drop(gateway);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    #[test]
+    fn sqlite_busy_timeout_is_explicit() {
+        let store = Store::open(":memory:").unwrap();
+        let busy_timeout_ms = {
+            let conn = store.conn.lock().unwrap();
+            conn.query_row("PRAGMA busy_timeout", [], |row| row.get::<_, i64>(0))
+                .unwrap()
+        };
+        assert_eq!(busy_timeout_ms, 5000);
+    }
+
+    #[test]
+    fn sqlite_member_lookups_use_their_indexes() {
+        let store = Store::open(":memory:").unwrap();
+        let conn = store.conn.lock().unwrap();
+        let plan_for = |sql: &str| -> String {
+            let mut statement = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+            statement
+                .query_map([], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+                .join(" | ")
+        };
+        for (sql, index) in [
+            (
+                "SELECT id,guild_id,type,target_id,moderator_id,reason,duration_ms,created_at FROM cases WHERE guild_id='g' AND target_id='u' ORDER BY id DESC LIMIT 5",
+                "idx_cases_target",
+            ),
+            (
+                "SELECT user_tag FROM activity_log WHERE guild_id='g' AND user_id='u' AND user_tag IS NOT NULL AND user_tag<>'' ORDER BY id DESC LIMIT 1",
+                "idx_activity_user",
+            ),
+            (
+                "SELECT COUNT(*) FROM levels WHERE guild_id='g' AND xp>10",
+                "idx_levels_xp",
+            ),
+        ] {
+            let plan = plan_for(sql);
+            assert!(plan.contains(index), "{index} not used by {sql}: {plan}");
+        }
+    }
+
+    #[test]
+    fn sqlite_schema_version_is_recorded_and_never_lowered() {
+        let store = Store::open(":memory:").unwrap();
+        let meta = |key: &str| -> String {
+            let conn = store.conn.lock().unwrap();
+            conn.query_row("SELECT value FROM helper_meta WHERE key=?1", [key], |row| {
+                row.get(0)
+            })
+            .unwrap()
+        };
+        assert_eq!(meta("rust_schema_version"), RUST_SCHEMA_VERSION.to_string());
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE helper_meta SET value='99' WHERE key='rust_schema_version'",
+                [],
+            )
+            .unwrap();
+        }
+        store.migrate().unwrap();
+        assert_eq!(meta("rust_schema_version"), "99");
+        assert_eq!(meta("growth_taxonomy_v2"), "complete");
     }
 
     #[test]
