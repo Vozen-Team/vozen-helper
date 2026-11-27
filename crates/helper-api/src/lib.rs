@@ -53,9 +53,9 @@ use helper_modules::{
 use helper_store::{
     BlueskySubscriptionRecord, BlueskySubscriptionWrite, InstagramSubscriptionRecord,
     InstagramSubscriptionWrite, KickSubscriptionRecord, KickSubscriptionWrite,
-    RssSubscriptionRecord, RssSubscriptionWrite, Store, TikTokSubscriptionRecord,
-    TikTokSubscriptionWrite, TopggSyncStatus, TwitchSubscriptionRecord, TwitchSubscriptionWrite,
-    YouTubeSubscriptionRecord, YouTubeSubscriptionWrite,
+    RssSubscriptionRecord, RssSubscriptionWrite, SessionGuildRecord, Store,
+    TikTokSubscriptionRecord, TikTokSubscriptionWrite, TopggSyncStatus, TwitchSubscriptionRecord,
+    TwitchSubscriptionWrite, YouTubeSubscriptionRecord, YouTubeSubscriptionWrite,
 };
 use hmac::{Hmac, Mac};
 pub use oauth_limits::OAuthLimits;
@@ -4899,8 +4899,8 @@ async fn create_session_inner(
     let discord_user = fetch_discord_user(&client, &req.token).await?;
     // The Discord OAuth endpoint returns every guild in the account, but the
     // Helper can only ever expose servers the account can manage.  Filtering
-    // first avoids a serial bot-presence lookup for unrelated guilds, which
-    // made the first-party account handoff exceed the browser deadline.
+    // first avoids bot-presence lookups for unrelated guilds, which made the
+    // first-party account handoff exceed the browser deadline.
     let guilds = manageable_guilds(fetch_discord_guilds(&client, &req.token).await?);
     let guilds = filter_guilds_with_bot(&client, &state.discord_token, guilds).await?;
     create_session_response(state, headers, discord_user, guilds, req.guild_id)
@@ -4970,45 +4970,70 @@ fn discord_guilds_error(status: StatusCode) -> (StatusCode, &'static str) {
     }
 }
 
-async fn fetch_bot_guild_by_id(
+/// What the bot's `/guilds/{id}` lookup said about one guild. `Unknown`
+/// covers rate limits and server errors left after retries, network failures,
+/// unreadable bodies and the overall deadline.
+enum BotPresence {
+    Present(DiscordBotGuild),
+    Absent,
+    Unknown,
+}
+
+const BOT_PRESENCE_CONCURRENCY: usize = 4;
+/// Total wait for every lookup. The panel's account handoff gives up after
+/// 6 s (`SESSION_BRIDGE_TIMEOUT_MS`) and must still read the user and the
+/// guild list, so revisit this if that timeout changes.
+const BOT_PRESENCE_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
+
+async fn bot_presence_at(
     client: &Client,
+    base: &str,
     discord_token: &str,
-    guild_id: &str,
-) -> Result<Option<DiscordBotGuild>, (StatusCode, Json<ApiError>)> {
-    if discord_token.len() < 20 {
-        return Err(client_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "discord_bot_unavailable",
-        ));
+    guild_ids: &[String],
+) -> BTreeMap<String, BotPresence> {
+    let deadline = tokio::time::Instant::now() + BOT_PRESENCE_BUDGET;
+    let mut presence = BTreeMap::new();
+    let permits = Arc::new(tokio::sync::Semaphore::new(BOT_PRESENCE_CONCURRENCY));
+    let mut tasks = tokio::task::JoinSet::new();
+    for guild_id in guild_ids {
+        if !is_discord_snowflake(guild_id) {
+            presence.insert(guild_id.clone(), BotPresence::Absent);
+            continue;
+        }
+        let guild_id = guild_id.clone();
+        let url = format!("{base}/guilds/{guild_id}");
+        let auth = format!("Bot {discord_token}");
+        let client = client.clone();
+        let permits = permits.clone();
+        tasks.spawn(async move {
+            let Ok(_permit) = permits.acquire_owned().await else {
+                return (guild_id, BotPresence::Unknown);
+            };
+            let result = match discord_read::get_json(&client, &auth, &url).await {
+                Ok(value) => serde_json::from_value::<DiscordBotGuild>(value)
+                    .map_or(BotPresence::Unknown, BotPresence::Present),
+                // Same reading as `GuildAuthorization`: the bot is not there.
+                Err(error) if error == "discord_http_404" || error == "discord_http_403" => {
+                    BotPresence::Absent
+                }
+                Err(_) => BotPresence::Unknown,
+            };
+            (guild_id, result)
+        });
     }
-    let response = client
-        .get(format!("{DISCORD_API_BASE}/guilds/{guild_id}"))
-        .header(header::AUTHORIZATION, format!("Bot {discord_token}"))
-        .send()
-        .await
-        .map_err(|_| client_error(StatusCode::BAD_GATEWAY, "discord_unreachable"))?;
-    let status = response.status();
-    let body = response
-        .text()
-        .await
-        .map_err(|_| client_error(StatusCode::BAD_GATEWAY, "discord_response_unreadable"))?;
-    if status == StatusCode::NOT_FOUND {
-        return Ok(None);
+    while let Ok(Some(result)) = tokio::time::timeout_at(deadline, tasks.join_next()).await {
+        if let Ok((guild_id, result)) = result {
+            presence.insert(guild_id, result);
+        }
     }
-    if !status.is_success() {
-        tracing::warn!(%status, body_len = body.len(), "Discord bot guild request failed");
-        return Err(client_error(
-            StatusCode::BAD_GATEWAY,
-            "discord_bot_guild_unavailable",
-        ));
+    // Dropping the set cancels the lookups still waiting on Discord.
+    drop(tasks);
+    for guild_id in guild_ids {
+        presence
+            .entry(guild_id.clone())
+            .or_insert(BotPresence::Unknown);
     }
-    serde_json::from_str(&body).map(Some).map_err(|_| {
-        tracing::warn!(
-            body_len = body.len(),
-            "Discord bot guild list response was not valid JSON"
-        );
-        client_error(StatusCode::BAD_GATEWAY, "invalid_discord_response")
-    })
+    presence
 }
 
 async fn filter_guilds_with_bot(
@@ -5016,16 +5041,114 @@ async fn filter_guilds_with_bot(
     discord_token: &str,
     guilds: Vec<DiscordGuild>,
 ) -> Result<Vec<DiscordGuild>, (StatusCode, Json<ApiError>)> {
+    filter_guilds_with_bot_at(client, DISCORD_API_BASE, discord_token, guilds).await
+}
+
+/// Keeps guilds where the bot is present, then guilds whose presence could
+/// not be confirmed now. Each authenticated request re-checks the guild with
+/// Discord, so an uncertain guild grants nothing on its own. Present guilds
+/// come first because a session without an explicit guild opens the first one.
+async fn filter_guilds_with_bot_at(
+    client: &Client,
+    base: &str,
+    discord_token: &str,
+    guilds: Vec<DiscordGuild>,
+) -> Result<Vec<DiscordGuild>, (StatusCode, Json<ApiError>)> {
+    if guilds.is_empty() {
+        return Ok(Vec::new());
+    }
+    if discord_token.len() < 20 {
+        return Err(client_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "discord_bot_unavailable",
+        ));
+    }
+    let ids = guilds
+        .iter()
+        .map(|guild| guild.id.clone())
+        .collect::<Vec<_>>();
+    let presence = bot_presence_at(client, base, discord_token, &ids).await;
     let mut installed = Vec::with_capacity(guilds.len());
+    let mut unknown = Vec::new();
     for guild in guilds {
-        if fetch_bot_guild_by_id(client, discord_token, &guild.id)
-            .await?
-            .is_some()
-        {
-            installed.push(guild);
+        match presence.get(&guild.id) {
+            Some(BotPresence::Present(_)) => installed.push(guild),
+            Some(BotPresence::Absent) => {}
+            Some(BotPresence::Unknown) | None => unknown.push(guild),
         }
     }
+    if !unknown.is_empty() {
+        // Counts only: guild ids and names stay out of the logs.
+        tracing::warn!(
+            unknown = unknown.len(),
+            "Discord bot presence unknown for some guilds"
+        );
+        if installed.is_empty() {
+            return Err(client_error(
+                StatusCode::BAD_GATEWAY,
+                "discord_bot_guild_unavailable",
+            ));
+        }
+    }
+    installed.extend(unknown);
     Ok(installed)
+}
+
+/// `GET /api/guilds` rows, in the session's order. A guild whose presence is
+/// uncertain keeps the name saved at login and reports `botPresent: null`,
+/// meaning "not confirmed now", not "absent".
+async fn installed_guilds_at(
+    base: &str,
+    discord_token: &str,
+    managed: &[SessionGuildRecord],
+) -> Result<Vec<serde_json::Value>, (StatusCode, Json<ApiError>)> {
+    if managed.is_empty() {
+        return Ok(Vec::new());
+    }
+    if discord_token.len() < 20 {
+        return Err(client_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "discord_bot_unavailable",
+        ));
+    }
+    let client = Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+        .map_err(|_| client_error(StatusCode::SERVICE_UNAVAILABLE, "discord_unavailable"))?;
+    let ids = managed
+        .iter()
+        .map(|guild| guild.guild_id.clone())
+        .collect::<Vec<_>>();
+    let presence = bot_presence_at(&client, base, discord_token, &ids).await;
+    Ok(managed
+        .iter()
+        .filter_map(|guild| match presence.get(&guild.guild_id) {
+            Some(BotPresence::Present(bot_guild)) => {
+                let icon_url = bot_guild.icon.as_deref().map(|icon| {
+                    format!(
+                        "https://cdn.discordapp.com/icons/{}/{icon}.png?size=64",
+                        bot_guild.id
+                    )
+                });
+                Some(serde_json::json!({
+                    "id": bot_guild.id,
+                    "name": bot_guild.name,
+                    "iconUrl": icon_url,
+                    "canManage": true,
+                    "botPresent": true
+                }))
+            }
+            Some(BotPresence::Absent) => None,
+            Some(BotPresence::Unknown) | None => Some(serde_json::json!({
+                "id": guild.guild_id,
+                "name": guild.name,
+                "iconUrl": null,
+                "canManage": true,
+                "botPresent": null
+            })),
+        })
+        .collect())
 }
 
 fn manageable_guilds(guilds: Vec<DiscordGuild>) -> Vec<DiscordGuild> {
@@ -5173,27 +5296,8 @@ async fn guilds(
         .store
         .session_guilds(claims.session_id)
         .map_err(|_| client_error(StatusCode::INTERNAL_SERVER_ERROR, "store_error"))?;
-    let client = Client::new();
-    let mut installed = Vec::new();
-    for guild in managed_guilds {
-        if let Some(bot_guild) =
-            fetch_bot_guild_by_id(&client, &state.discord_token, &guild.guild_id).await?
-        {
-            let icon_url = bot_guild.icon.as_deref().map(|icon| {
-                format!(
-                    "https://cdn.discordapp.com/icons/{}/{icon}.png?size=64",
-                    bot_guild.id
-                )
-            });
-            installed.push(serde_json::json!({
-                "id": bot_guild.id,
-                "name": bot_guild.name,
-                "iconUrl": icon_url,
-                "canManage": true,
-                "botPresent": true
-            }));
-        }
-    }
+    let installed =
+        installed_guilds_at(DISCORD_API_BASE, &state.discord_token, &managed_guilds).await?;
     Ok(Json(serde_json::json!({
         "guilds": installed
     })))
@@ -13904,6 +14008,182 @@ mod tests {
         .await
         .unwrap();
         assert!(names.is_empty());
+        server.abort();
+    }
+
+    const G1: &str = "100000000000000001";
+    const G2: &str = "100000000000000002";
+    const G3: &str = "100000000000000003";
+    const G4: &str = "100000000000000004";
+    const G5: &str = "100000000000000005";
+    const PRESENCE_TOKEN: &str = "fixture-token-with-20-chars";
+
+    /// Discord stand-in for the bot's `/guilds/{id}` lookups: G1 present,
+    /// G2 missing, G3 forbidden, G4 always failing, G5 rate limited once.
+    async fn presence_mock() -> (String, tokio::task::JoinHandle<()>) {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let app = Router::new().route(
+            "/guilds/{guild}",
+            get(move |Path(guild): Path<String>| {
+                let calls = calls.clone();
+                async move {
+                    match guild.as_str() {
+                        G1 => (
+                            StatusCode::OK,
+                            Json(serde_json::json!({"id":G1,"name":"Um","icon":"abc"})),
+                        )
+                            .into_response(),
+                        G2 => (StatusCode::NOT_FOUND, Json(serde_json::json!({}))).into_response(),
+                        G3 => (StatusCode::FORBIDDEN, Json(serde_json::json!({}))).into_response(),
+                        G5 if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 => (
+                            StatusCode::TOO_MANY_REQUESTS,
+                            [(header::RETRY_AFTER, "0")],
+                            Json(serde_json::json!({"retry_after":0})),
+                        )
+                            .into_response(),
+                        G5 => (
+                            StatusCode::OK,
+                            Json(serde_json::json!({"id":G5,"name":"Cinco"})),
+                        )
+                            .into_response(),
+                        _ => (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({})),
+                        )
+                            .into_response(),
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (base, server)
+    }
+
+    #[tokio::test]
+    async fn bot_presence_separates_present_absent_and_unknown() {
+        let (base, server) = presence_mock().await;
+        let ids = [G1, G2, G3, G4, G5].map(String::from);
+        let presence = bot_presence_at(&Client::new(), &base, PRESENCE_TOKEN, &ids).await;
+        assert_eq!(presence.len(), 5);
+        assert!(matches!(presence[G1], BotPresence::Present(_)));
+        assert!(matches!(presence[G5], BotPresence::Present(_)));
+        assert!(matches!(presence[G2], BotPresence::Absent));
+        assert!(matches!(presence[G3], BotPresence::Absent));
+        assert!(matches!(presence[G4], BotPresence::Unknown));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn bot_presence_stops_waiting_after_the_budget() {
+        let app = Router::new().fallback(get(|| async {
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            Json(serde_json::json!({}))
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let ids = [G1, G2, G3, G4, G5].map(String::from);
+        let presence = tokio::time::timeout(
+            std::time::Duration::from_secs(6),
+            bot_presence_at(&Client::new(), &base, PRESENCE_TOKEN, &ids),
+        )
+        .await
+        .expect("presence lookups must stop at the budget");
+        assert_eq!(presence.len(), 5);
+        assert!(
+            presence
+                .values()
+                .all(|presence| matches!(presence, BotPresence::Unknown))
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn login_guild_filter_keeps_unknown_and_drops_absent() {
+        let (base, server) = presence_mock().await;
+        let g = |id: &str| DiscordGuild {
+            id: id.into(),
+            name: format!("n{id}"),
+            permissions: Some("8".into()),
+        };
+        let kept = filter_guilds_with_bot_at(
+            &Client::new(),
+            &base,
+            PRESENCE_TOKEN,
+            vec![g(G4), g(G2), g(G1)],
+        )
+        .await
+        .expect("a present guild keeps the login alive");
+        assert_eq!(
+            kept.iter()
+                .map(|guild| guild.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![G1, G4]
+        );
+        for guilds in [vec![g(G4)], vec![g(G2), g(G4)]] {
+            let Err((status, body)) =
+                filter_guilds_with_bot_at(&Client::new(), &base, PRESENCE_TOKEN, guilds).await
+            else {
+                panic!("no confirmed guild must fail the login");
+            };
+            assert_eq!(status, StatusCode::BAD_GATEWAY);
+            assert_eq!(body.0.code, "discord_bot_guild_unavailable");
+        }
+        let Ok(empty) = filter_guilds_with_bot_at(&Client::new(), &base, "short", vec![]).await
+        else {
+            panic!("an account without managed guilds needs no bot lookup");
+        };
+        assert!(empty.is_empty());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn installed_guilds_mark_unknown_and_drop_absent() {
+        let (base, server) = presence_mock().await;
+        let records = [
+            (G1, "Registo um"),
+            (G2, "Registo dois"),
+            (G4, "Registo quatro"),
+        ]
+        .map(|(guild_id, name)| SessionGuildRecord {
+            guild_id: guild_id.into(),
+            name: name.into(),
+            permissions: Some("8".into()),
+        });
+        let Ok(guilds) = installed_guilds_at(&base, PRESENCE_TOKEN, &records).await else {
+            panic!("an uncertain guild must not fail the guild list");
+        };
+        assert_eq!(guilds.len(), 2);
+        let by_id = |id: &str| {
+            guilds
+                .iter()
+                .find(|guild| guild["id"] == id)
+                .cloned()
+                .unwrap_or_else(|| panic!("{id} missing from the guild list"))
+        };
+        assert_eq!(
+            by_id(G1),
+            serde_json::json!({
+                "id": G1,
+                "name": "Um",
+                "iconUrl": "https://cdn.discordapp.com/icons/100000000000000001/abc.png?size=64",
+                "canManage": true,
+                "botPresent": true
+            })
+        );
+        assert_eq!(
+            by_id(G4),
+            serde_json::json!({
+                "id": G4,
+                "name": "Registo quatro",
+                "iconUrl": null,
+                "canManage": true,
+                "botPresent": null
+            })
+        );
+        assert!(guilds.iter().all(|guild| guild["id"] != G2));
         server.abort();
     }
 
