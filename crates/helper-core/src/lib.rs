@@ -842,6 +842,14 @@ pub fn evaluate_leaderboard(
     }
 }
 
+/// Message XP bounds used when a server has not configured them. The gateway
+/// reads the same defaults in `levels_config_for_store` (helper-discord).
+pub const LEVELS_DEFAULT_XP_MIN: i64 = 15;
+pub const LEVELS_DEFAULT_XP_MAX: i64 = 30;
+/// Largest award for one XP event. `Store::add_xp_event` clamps to the same
+/// value; evaluating with it keeps the panel preview equal to the award.
+pub const MAX_XP_PER_EVENT: i64 = 2_000;
+
 /// Bounded observation used by the XP runtime and dashboard preview.  The
 /// evaluator deliberately contains no store or Discord calls so a preview of
 /// an XP award cannot drift from what the gateway actually awards.
@@ -915,13 +923,13 @@ pub fn evaluate_levels(
             let minimum = object
                 .and_then(|values| values.get("xpMin"))
                 .and_then(serde_json::Value::as_i64)
-                .unwrap_or(15)
+                .unwrap_or(LEVELS_DEFAULT_XP_MIN)
                 .clamp(1, 1_000);
             let maximum = object
                 .and_then(|values| values.get("xpMax"))
                 .and_then(serde_json::Value::as_i64)
-                .unwrap_or(30)
-                .clamp(minimum, 2_000);
+                .unwrap_or(LEVELS_DEFAULT_XP_MAX)
+                .clamp(minimum, MAX_XP_PER_EVENT);
             let span = (maximum - minimum + 1) as u64;
             let stable = event_id.bytes().fold(0_u64, |total, byte| {
                 total.wrapping_mul(33).wrapping_add(byte as u64)
@@ -944,7 +952,7 @@ pub fn evaluate_levels(
                 .and_then(serde_json::Value::as_i64)
                 .unwrap_or(2)
                 .clamp(0, 30);
-            duration_minutes.min(24 * 60) as i64 * per_minute
+            (duration_minutes.min(24 * 60) as i64 * per_minute).min(MAX_XP_PER_EVENT)
         }
         _ => {
             return reject(
@@ -8131,29 +8139,50 @@ impl FeatureAdapter for LevelsAdapter {
             ("xpMax", 1, 2_000),
             ("cooldownSeconds", 0, 3_600),
         ] {
-            if let Some(value) = object.get(field).and_then(serde_json::Value::as_i64)
-                && !(min..=max).contains(&value)
+            let Some(value) = object.get(field) else {
+                continue;
+            };
+            match value.as_i64() {
+                None => issues.push(ValidationIssue {
+                    path: field.into(),
+                    code: "integer_required".into(),
+                    message: "The value must be a whole number.".into(),
+                    severity: "error".into(),
+                }),
+                Some(value) if !(min..=max).contains(&value) => {
+                    issues.push(ValidationIssue {
+                        path: field.into(),
+                        code: "out_of_range".into(),
+                        message: format!("The value must be between {min} and {max}."),
+                        severity: "error".into(),
+                    });
+                }
+                Some(_) => {}
+            }
+        }
+        if object.contains_key("xpMin") || object.contains_key("xpMax") {
+            // A lone bound is compared with the default the runtime would use for the other one.
+            let minimum = object
+                .get("xpMin")
+                .map_or(Some(LEVELS_DEFAULT_XP_MIN), serde_json::Value::as_i64);
+            let maximum = object
+                .get("xpMax")
+                .map_or(Some(LEVELS_DEFAULT_XP_MAX), serde_json::Value::as_i64);
+            if let (Some(minimum), Some(maximum)) = (minimum, maximum)
+                && maximum < minimum
             {
                 issues.push(ValidationIssue {
-                    path: field.into(),
-                    code: "out_of_range".into(),
-                    message: format!("The value must be between {min} and {max}."),
+                    path: if object.contains_key("xpMax") {
+                        "xpMax"
+                    } else {
+                        "xpMin"
+                    }
+                    .into(),
+                    code: "must_be_at_least_minimum".into(),
+                    message: "Maximum XP must be at least minimum XP.".into(),
                     severity: "error".into(),
                 });
             }
-        }
-        if object
-            .get("xpMin")
-            .and_then(serde_json::Value::as_i64)
-            .zip(object.get("xpMax").and_then(serde_json::Value::as_i64))
-            .is_some_and(|(min, max)| max < min)
-        {
-            issues.push(ValidationIssue {
-                path: "xpMax".into(),
-                code: "must_be_at_least_minimum".into(),
-                message: "Maximum XP must be at least minimum XP.".into(),
-                severity: "error".into(),
-            });
         }
         if let Some(value) = object.get("announceChannel")
             && !value
@@ -11957,6 +11986,45 @@ mod tests {
     }
 
     #[test]
+    fn every_catalogue_default_passes_its_own_validation() {
+        // Keys whose shipped defaults are known to fail. Recorded in the plans
+        // README; fixing them is separate work. Never add community.levels here.
+        const KNOWN_INVALID_DEFAULTS: &[&str] = &[
+            "protection.join_gate",
+            "social.twitch",
+            "social.youtube",
+            "social.rss",
+            "social.podcasts",
+            "social.bluesky",
+            "community.birthdays",
+            "growth.monetization",
+            "web3.crypto_stats",
+            "web3.gas_tracker",
+        ];
+        let mut failing = Vec::new();
+        for key in FEATURE_KEYS {
+            let adapter = feature_adapter(key).expect("catalogue key must have an adapter");
+            let issues = adapter.validate(&adapter.descriptor().defaults);
+            let fails = !issues.is_empty();
+            if KNOWN_INVALID_DEFAULTS.contains(key) {
+                assert!(
+                    fails,
+                    "{key} defaults now pass; remove it from KNOWN_INVALID_DEFAULTS"
+                );
+            } else if fails {
+                failing.push(format!(
+                    "{key}: {:?}",
+                    issues.iter().map(|i| &i.path).collect::<Vec<_>>()
+                ));
+            }
+        }
+        assert!(
+            failing.is_empty(),
+            "defaults fail their own validation: {failing:?}"
+        );
+    }
+
+    #[test]
     fn every_catalogue_preview_describes_an_actionable_runtime_decision() {
         let fixture = serde_json::json!({
             "content": "preview message",
@@ -13455,6 +13523,106 @@ mod tests {
                 }),
             );
         assert!(preview[0].contains("Award 60 XP"));
+    }
+
+    #[test]
+    fn levels_validation_rejects_non_integer_xp_fields() {
+        let levels = feature_adapter("community.levels").expect("levels adapter");
+        for field in ["xpMin", "xpMax", "cooldownSeconds"] {
+            for value in [
+                serde_json::json!("20"),
+                serde_json::json!(20.5),
+                serde_json::json!(null),
+                serde_json::json!(true),
+            ] {
+                let config = serde_json::Value::Object(serde_json::Map::from_iter([(
+                    field.to_string(),
+                    value.clone(),
+                )]));
+                let issues = levels.validate(&config);
+                assert!(
+                    issues
+                        .iter()
+                        .any(|issue| issue.path == field && issue.code == "integer_required"),
+                    "{field} = {value} must be rejected as a non-integer, got {issues:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn levels_validation_compares_a_lone_bound_with_the_default() {
+        let levels = feature_adapter("community.levels").expect("levels adapter");
+        for config in [
+            serde_json::json!({"xpMax": 10}),
+            serde_json::json!({"xpMin": 40}),
+        ] {
+            let issues = levels.validate(&config);
+            assert!(
+                issues
+                    .iter()
+                    .any(|issue| issue.code == "must_be_at_least_minimum"),
+                "{config} must be rejected against the default bound, got {issues:?}"
+            );
+        }
+        for config in [
+            serde_json::json!({"xpMax": 15}),
+            serde_json::json!({"xpMin": 30}),
+            serde_json::json!({"xpMin": 40, "xpMax": 40}),
+        ] {
+            let issues = levels.validate(&config);
+            assert!(issues.is_empty(), "{config} must validate, got {issues:?}");
+        }
+    }
+
+    #[test]
+    fn levels_voice_preview_matches_the_awarded_cap() {
+        let config = serde_json::json!({"voiceXpEnabled": true, "voiceXpPerMinute": 30});
+        let voice = evaluate_levels(&config, "voice", "123", "voice-1", true, 1_440, 0);
+        assert_eq!(voice.amount, 2_000);
+        let preview = feature_adapter("community.levels")
+            .expect("levels adapter")
+            .simulate(
+                &config,
+                &serde_json::json!({
+                    "source": "voice",
+                    "channelId": "123",
+                    "durationMinutes": 1440,
+                    "currentXp": 0
+                }),
+            );
+        assert!(
+            preview
+                .iter()
+                .any(|effect| effect.contains("Award 2000 XP")),
+            "preview must show the awarded cap, got {preview:?}"
+        );
+    }
+
+    #[test]
+    fn levels_valid_integer_config_still_validates_and_awards_the_same_xp() {
+        let levels = feature_adapter("community.levels").expect("levels adapter");
+        let config = serde_json::json!({
+            "xpMin": 10,
+            "xpMax": 10,
+            "cooldownSeconds": 60,
+            "voiceXpEnabled": true,
+            "voiceXpPerMinute": 3
+        });
+        assert!(levels.validate(&config).is_empty());
+        let message = evaluate_levels(&config, "message", "123", "message-1", true, 0, 0);
+        assert_eq!(message.amount, 10);
+        let voice = evaluate_levels(&config, "voice", "123", "voice-1", true, 20, 0);
+        assert_eq!(voice.amount, 60);
+
+        let defaults = levels.descriptor().defaults;
+        assert!(levels.validate(&defaults).is_empty());
+        let default_message = evaluate_levels(&defaults, "message", "123", "message-1", true, 0, 0);
+        assert!(
+            (15..=30).contains(&default_message.amount),
+            "default message XP must stay within 15-30, got {}",
+            default_message.amount
+        );
     }
 
     #[test]
