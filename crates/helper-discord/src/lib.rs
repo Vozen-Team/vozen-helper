@@ -31,7 +31,6 @@ use helper_store::{
     KickSubscriptionRecord, RssSubscriptionRecord, Store, TikTokSubscriptionRecord,
     TopggSyncDetail, TwitchSubscriptionRecord, YouTubeSubscriptionRecord,
 };
-use rand::seq::SliceRandom;
 use reqwest::Client as HttpClient;
 use serenity::{
     all::{
@@ -3233,6 +3232,11 @@ impl EventHandler for Handler {
         if board_id == reaction.channel_id.get() {
             return;
         }
+        // Count and publish under one lock so a near-simultaneous second
+        // reaction edits the first board post instead of creating another.
+        let starboard_lock =
+            starboard_display::update_lock(guild_id.get(), reaction.message_id.get());
+        let _starboard_guard = starboard_lock.lock().await;
         let Ok(users) = reaction
             .channel_id
             .reaction_users(
@@ -6034,6 +6038,8 @@ impl Handler {
         ) {
             return;
         }
+        let starboard_lock = starboard_display::update_lock(guild_id.get(), message_id.get());
+        let _starboard_guard = starboard_lock.lock().await;
         let Ok(Some(entry)) = self.store.star_entry(&guild_text, &message_id.to_string()) else {
             return;
         };
@@ -8120,7 +8126,7 @@ impl Handler {
                 let id = option_i64(command, "id").unwrap_or(0);
                 match reroll_giveaway(&ctx.http, &self.store, &guild_id.to_string(), id).await? {
                     Some(winner) => format!("Giveaway #{id} rerolled: <@{winner}>."),
-                    None => "Giveaway not found, still active or without participants.".to_string(),
+                    None => "Giveaway not found, still active, still being announced, or no other participants to pick.".to_string(),
                 }
             }
             "poll" => {
@@ -8237,17 +8243,26 @@ impl Handler {
                 if !manual_moderation::allowed(&ctx.http, guild_id.get(), command.user.id.get(), target.get(), "unquarantine", &record.role_ids).await {
                     return respond(ctx, command, "Unable to perform the action; check permissions and role hierarchy.").await;
                 }
+                // Roles deleted from the server since the quarantine are dropped
+                // instead of blocking the restore forever.
+                let guild_roles: HashSet<u64> = guild_id.roles(&ctx.http).await?.keys().map(|id| id.get()).collect();
+                let (to_restore, missing) = split_missing_quarantine_roles(&record.role_ids, &guild_roles);
                 let member = guild_id.member(&ctx.http, target).await?;
                 let role_member = &member;
                 let role_http = &ctx.http;
                 let (restored, pending) = restore_quarantine_roles(
-                    &self.store, &guild_id.to_string(), &target.to_string(), &record.role_ids, &record.reason,
+                    &self.store, &guild_id.to_string(), &target.to_string(), &to_restore, &record.reason,
                     |role| async move { role_member.add_role(role_http, role).await.is_ok() },
                 ).await?;
-                if pending == 0 {
-                    format!("Quarantine removed from <@{}>; {} role(s) restored.", target, restored)
+                let dropped = if missing.is_empty() {
+                    String::new()
                 } else {
-                    format!("Quarantine partially restored for <@{target}>: {restored} role(s) restored, {pending} still pending. Pending roles are saved; check permissions and retry /unquarantine.")
+                    format!(" {} saved role(s) no longer exist and were dropped.", missing.len())
+                };
+                if pending == 0 {
+                    format!("Quarantine removed from <@{}>; {} role(s) restored.{dropped}", target, restored)
+                } else {
+                    format!("Quarantine partially restored for <@{target}>: {restored} role(s) restored, {pending} still pending. Pending roles are saved; check permissions and retry /unquarantine.{dropped}")
                 }
             }
             "join-gate" => {
@@ -11813,18 +11828,18 @@ async fn reroll_giveaway(
     guild_id: &str,
     id: i64,
 ) -> Result<Option<String>> {
+    let update_lock = giveaway_display::update_lock(id);
+    let _update = update_lock.lock().await;
     let Some(giveaway) = store.giveaway(id)? else {
         return Ok(None);
     };
     if giveaway.guild_id != guild_id || !giveaway.ended {
         return Ok(None);
     }
-    let mut entries = store.giveaway_entries(id)?;
-    if entries.is_empty() {
+    // Previous winners, including earlier rerolls, are never drawn again.
+    let Some(winner) = store.giveaway_reroll_candidate(guild_id, id)? else {
         return Ok(None);
-    }
-    entries.shuffle(&mut rand::rng());
-    let winner = entries[0].clone();
+    };
     let channel = giveaway.channel_id.parse::<u64>().map(ChannelId::new)?;
     giveaway_display::publish(
         http,
@@ -11834,12 +11849,30 @@ async fn reroll_giveaway(
             giveaway: &giveaway,
             winners: Some(std::slice::from_ref(&winner)),
             rerolled: true,
-            participants: entries.len() as u64,
+            participants: store.giveaway_participant_count(id)?,
         },
         true,
     )
     .await?;
+    store.record_giveaway_reroll(id, &winner)?;
     Ok(Some(winner))
+}
+
+/// Split saved quarantine roles into those to restore and those deleted from
+/// the server. Ids that are not real role ids stay on the restore side, where
+/// they remain pending as before.
+fn split_missing_quarantine_roles(
+    saved: &[String],
+    guild_roles: &HashSet<u64>,
+) -> (Vec<String>, Vec<String>) {
+    let (missing, to_restore): (Vec<String>, Vec<String>) =
+        saved.iter().cloned().partition(|raw| {
+            raw.parse::<u64>()
+                .ok()
+                .filter(|id| *id != 0)
+                .is_some_and(|id| !guild_roles.contains(&id))
+        });
+    (to_restore, missing)
 }
 
 async fn restore_quarantine_roles<F, Fut>(
@@ -13521,6 +13554,39 @@ async fn deliver_birthday_announcements(
     Ok(())
 }
 
+/// What a due event reminder does once the live Discord event is known.
+#[derive(Debug, PartialEq, Eq)]
+enum EventReminderCheck {
+    Send,
+    /// The event was cancelled, has ended or is already running.
+    Drop,
+    /// The event's start or name changed outside the bot, so the reminder
+    /// text is stale and the reminder is queued again from the live event.
+    Reschedule,
+}
+
+/// `saved_start` and `saved_name` are absent in reminders queued before they
+/// were recorded; those are sent unless the event is over.
+fn event_reminder_check(
+    status: serenity::all::ScheduledEventStatus,
+    start_unix: i64,
+    name: &str,
+    saved_start: Option<i64>,
+    saved_name: Option<&str>,
+) -> EventReminderCheck {
+    use serenity::all::ScheduledEventStatus as Status;
+    match status {
+        Status::Completed | Status::Canceled | Status::Active => EventReminderCheck::Drop,
+        Status::Scheduled
+            if saved_start.is_some_and(|saved| saved != start_unix)
+                || saved_name.is_some_and(|saved| saved != name) =>
+        {
+            EventReminderCheck::Reschedule
+        }
+        _ => EventReminderCheck::Send,
+    }
+}
+
 fn schedule_event_reminder(
     store: &Store,
     guild_id: &str,
@@ -13551,6 +13617,9 @@ fn schedule_event_reminder(
         "channel_id": channel_id.to_string(),
         "event_id": event_id,
         "text": format!("Reminder: **{}** starts <t:{}:R>.", event_name, start.unix_timestamp()),
+        // The reminder text quotes these; delivery compares them with the live event.
+        "start": start.unix_timestamp(),
+        "name": event_name,
     });
     store.schedule_typed(
         guild_id,
@@ -13914,6 +13983,48 @@ async fn deliver_scheduled_action(
         );
         store.delete_scheduled_action(id)?;
         return Ok(());
+    }
+    if action_type == "event_reminder" {
+        // The bot does not receive event updates from the gateway, so confirm
+        // the event is still upcoming and unchanged before reminding anyone.
+        let guild = guild_id
+            .parse::<u64>()
+            .map(serenity::all::GuildId::new)
+            .map_err(|_| anyhow::anyhow!("invalid event reminder guild"))?;
+        let Some(event_id) = target_id.parse::<u64>().ok().filter(|id| *id > 0) else {
+            store.delete_scheduled_action(id)?;
+            return Ok(());
+        };
+        let event = match guild
+            .scheduled_event(http, serenity::all::ScheduledEventId::new(event_id), false)
+            .await
+        {
+            Ok(event) => event,
+            // Unknown Guild Scheduled Event: deleted in Discord.
+            Err(error) if discord_error_code(&error, 10070) => {
+                store.delete_scheduled_action(id)?;
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        };
+        match event_reminder_check(
+            event.status,
+            event.start_time.unix_timestamp(),
+            &event.name,
+            value.get("start").and_then(serde_json::Value::as_i64),
+            value.get("name").and_then(serde_json::Value::as_str),
+        ) {
+            EventReminderCheck::Drop => {
+                store.delete_scheduled_action(id)?;
+                return Ok(());
+            }
+            EventReminderCheck::Reschedule => {
+                // Replaces this job with one built from the live event.
+                schedule_event_reminder(store, guild_id, target_id, &event.name, event.start_time)?;
+                return Ok(());
+            }
+            EventReminderCheck::Send => {}
+        }
     }
     let channel_id = value
         .get("channel_id")
@@ -14491,6 +14602,50 @@ mod tests {
         );
     }
 
+    #[test]
+    fn quarantine_roles_split_missing_from_restorable() {
+        let guild_roles: std::collections::HashSet<u64> = [10u64].into_iter().collect();
+        let saved: Vec<String> = vec!["10".into(), "20".into(), "invalid".into(), "0".into()];
+        let (to_restore, missing) = super::split_missing_quarantine_roles(&saved, &guild_roles);
+        assert_eq!(
+            to_restore,
+            vec!["10".to_string(), "invalid".to_string(), "0".to_string()]
+        );
+        assert_eq!(missing, vec!["20".to_string()]);
+    }
+
+    #[test]
+    fn event_reminders_follow_the_live_event() {
+        use super::{EventReminderCheck as R, event_reminder_check as check};
+        use serenity::all::ScheduledEventStatus as S;
+        assert_eq!(
+            check(S::Scheduled, 1000, "Raid", Some(1000), Some("Raid")),
+            R::Send
+        );
+        // Jobs queued before this change carry no start or name.
+        assert_eq!(check(S::Scheduled, 1000, "Raid", None, None), R::Send);
+        assert_eq!(
+            check(S::Canceled, 1000, "Raid", Some(1000), Some("Raid")),
+            R::Drop
+        );
+        assert_eq!(
+            check(S::Completed, 1000, "Raid", Some(1000), Some("Raid")),
+            R::Drop
+        );
+        assert_eq!(
+            check(S::Active, 1000, "Raid", Some(1000), Some("Raid")),
+            R::Drop
+        );
+        assert_eq!(
+            check(S::Scheduled, 2000, "Raid", Some(1000), Some("Raid")),
+            R::Reschedule
+        );
+        assert_eq!(
+            check(S::Scheduled, 1000, "Raid night", Some(1000), Some("Raid")),
+            R::Reschedule
+        );
+    }
+
     #[tokio::test]
     async fn unpublished_poll_results_keep_the_job_even_after_votes_close() {
         let store = helper_store::Store::open(":memory:").unwrap();
@@ -14760,6 +14915,72 @@ mod tests {
         let reqs = server.await.unwrap();
         assert_eq!(reqs.len(), 1);
         assert!(reqs[0].starts_with("DELETE /api/v10/guilds/1/bans/2 "));
+    }
+
+    /// A due reminder for Discord event 7 in guild 1, posting to channel 5.
+    fn due_event_reminder_store() -> (helper_store::Store, helper_store::ScheduledAction) {
+        let store = helper_store::Store::open(":memory:").unwrap();
+        store
+            .set_setting("1", "feature.community.events", "true")
+            .unwrap();
+        store
+            .schedule_typed(
+                "1",
+                "event_reminder",
+                "7",
+                0,
+                r#"{"channel_id":"5","event_id":"7","text":"x","start":1893456000,"name":"Raid"}"#,
+            )
+            .unwrap();
+        let job = store.due_scheduled_actions(0, 1).unwrap().pop().unwrap();
+        (store, job)
+    }
+
+    #[tokio::test]
+    async fn event_reminder_for_a_deleted_event_is_dropped_without_posting() {
+        let (store, job) = due_event_reminder_store();
+        let (http, server) = mock_discord_http(vec![(
+            404,
+            serde_json::json!({"code": 10070, "message": "Unknown Guild Scheduled Event"}),
+        )])
+        .await;
+        super::run_due_scheduled_action(&http, &store, job, 0).await;
+        assert!(
+            store
+                .due_scheduled_actions(i64::MAX, 10)
+                .unwrap()
+                .is_empty()
+        );
+        let reqs = server.await.unwrap();
+        assert_eq!(reqs.len(), 1);
+        assert!(reqs[0].starts_with("GET /api/v10/guilds/1/scheduled-events/7"));
+    }
+
+    #[tokio::test]
+    async fn event_reminder_for_an_unchanged_event_is_posted() {
+        let (store, job) = due_event_reminder_store();
+        let (http, server) = mock_discord_http(vec![
+            (
+                200,
+                serde_json::json!({"id":"7","guild_id":"1","channel_id":null,"name":"Raid","scheduled_start_time":"2030-01-01T00:00:00+00:00","privacy_level":2,"status":1,"entity_type":3}),
+            ),
+            (
+                200,
+                serde_json::to_value(serenity::all::Message::default()).unwrap(),
+            ),
+        ])
+        .await;
+        super::run_due_scheduled_action(&http, &store, job, 0).await;
+        assert!(
+            store
+                .due_scheduled_actions(i64::MAX, 10)
+                .unwrap()
+                .is_empty()
+        );
+        let reqs = server.await.unwrap();
+        assert_eq!(reqs.len(), 2);
+        assert!(reqs[0].starts_with("GET /api/v10/guilds/1/scheduled-events/7"));
+        assert!(reqs[1].starts_with("POST /api/v10/channels/5/messages "));
     }
 
     #[test]

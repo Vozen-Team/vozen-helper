@@ -2354,12 +2354,7 @@ pub fn evaluate_birthday(
     day: u32,
 ) -> BirthdayDecision {
     let object = config.as_object();
-    let valid_day = match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => (1..=31).contains(&day),
-        4 | 6 | 9 | 11 => (1..=30).contains(&day),
-        2 => (1..=29).contains(&day),
-        _ => false,
-    };
+    let valid_day = helper_contracts::is_valid_birthday(month, day);
     if !valid_day {
         return BirthdayDecision {
             allowed: false,

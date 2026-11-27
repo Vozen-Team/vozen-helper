@@ -1,6 +1,29 @@
 //! Native Discord attachment delivery. No messages are sent by renderer tests.
 use serenity::all::{ChannelId, Context, CreateAttachment, Message, MessageId, User};
-use std::{sync::OnceLock, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex, OnceLock, Weak},
+    time::Duration,
+};
+
+/// One lock per original message, so two reactions at once cannot both
+/// create a board post.
+pub(super) fn update_lock(guild_id: u64, message_id: u64) -> Arc<tokio::sync::Mutex<()>> {
+    type Locks = Mutex<HashMap<(u64, u64), Weak<tokio::sync::Mutex<()>>>>;
+    static LOCKS: OnceLock<Locks> = OnceLock::new();
+    let mut locks = LOCKS
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    let key = (guild_id, message_id);
+    if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(tokio::sync::Mutex::new(()));
+    locks.insert(key, Arc::downgrade(&lock));
+    lock
+}
 
 struct Visual {
     png: Vec<u8>,
@@ -200,6 +223,19 @@ mod tests {
     use super::*;
     use serenity::all::UserId;
     const LINK: &str = "https://discord.com/channels/1/2/3";
+
+    #[test]
+    fn starboard_updates_share_only_their_message_lock() {
+        let first = update_lock(1, 100);
+        let same = update_lock(1, 100);
+        assert!(std::sync::Arc::ptr_eq(&first, &same));
+        let held = first.try_lock().unwrap();
+        assert!(same.try_lock().is_err());
+        assert!(update_lock(1, 101).try_lock().is_ok());
+        assert!(update_lock(2, 100).try_lock().is_ok());
+        drop(held);
+        assert!(same.try_lock().is_ok());
+    }
 
     #[test]
     fn unicode_alt_text_fits_discord_limit() {

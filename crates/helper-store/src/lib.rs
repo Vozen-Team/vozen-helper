@@ -18,7 +18,9 @@ pub use achievement_activity::AchievementProgress;
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Duration, Utc};
-use helper_contracts::{EntitlementSnapshot, SessionClaims, is_valid_workflow_reaction};
+use helper_contracts::{
+    EntitlementSnapshot, SessionClaims, is_valid_birthday, is_valid_workflow_reaction,
+};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::{
     path::{Path, PathBuf},
@@ -1631,6 +1633,7 @@ impl Store {
     ) -> Result<serde_json::Value> {
         let mut conn = self.conn.lock().expect("store mutex poisoned");
         let tx = conn.transaction()?;
+        let freed_events = seated_event_ids(&tx, guild_id, user_id)?;
         let mut deleted = serde_json::Map::new();
         for (name, statement) in [
             (
@@ -1703,6 +1706,9 @@ impl Store {
             if count > 0 {
                 deleted.insert(name.to_string(), serde_json::json!(count));
             }
+        }
+        for event_id in &freed_events {
+            promote_next_waitlisted(&tx, guild_id, event_id)?;
         }
         tx.commit()?;
         Ok(serde_json::Value::Object(deleted))
@@ -1778,13 +1784,14 @@ impl Store {
     }
 
     pub fn set_birthday(&self, guild_id: &str, user_id: &str, month: u32, day: u32) -> Result<()> {
-        if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        if !is_valid_birthday(month, day) {
             bail!("invalid_birthday");
         }
         let now = Utc::now().timestamp_millis();
         let conn = self.conn.lock().expect("store mutex poisoned");
+        // Saving the same date again keeps this year's announcement mark.
         conn.execute(
-            "INSERT INTO birthdays(guild_id,user_id,month,day,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?5) ON CONFLICT(guild_id,user_id) DO UPDATE SET month=excluded.month,day=excluded.day,last_announced_year=NULL,updated_at=excluded.updated_at",
+            "INSERT INTO birthdays(guild_id,user_id,month,day,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?5) ON CONFLICT(guild_id,user_id) DO UPDATE SET month=excluded.month,day=excluded.day,last_announced_year=CASE WHEN birthdays.month=excluded.month AND birthdays.day=excluded.day THEN birthdays.last_announced_year ELSE NULL END,updated_at=excluded.updated_at",
             params![guild_id, user_id, month, day, now],
         )?;
         Ok(())
@@ -1806,9 +1813,15 @@ impl Store {
         limit: u32,
     ) -> Result<Vec<BirthdayRecord>> {
         let conn = self.conn.lock().expect("store mutex poisoned");
-        let mut stmt = conn.prepare("SELECT guild_id,user_id,month,day,last_announced_year FROM birthdays WHERE month=?1 AND day=?2 AND (last_announced_year IS NULL OR last_announced_year<>?3) LIMIT ?4")?;
+        let mut stmt = conn.prepare("SELECT guild_id,user_id,month,day,last_announced_year FROM birthdays WHERE ((month=?1 AND day=?2) OR (?5=1 AND month=2 AND day=29)) AND (last_announced_year IS NULL OR last_announced_year<>?3) LIMIT ?4")?;
         let rows = stmt.query_map(
-            params![month, day, year, i64::from(limit.min(500))],
+            params![
+                month,
+                day,
+                year,
+                i64::from(limit.min(500)),
+                leap_day_falls_back_today(month, day, year)
+            ],
             |row| {
                 Ok(BirthdayRecord {
                     guild_id: row.get(0)?,
@@ -1834,10 +1847,17 @@ impl Store {
     ) -> Result<Vec<BirthdayRecord>> {
         let conn = self.conn.lock().expect("store mutex poisoned");
         let mut stmt = conn.prepare(
-            "SELECT guild_id,user_id,month,day,last_announced_year FROM birthdays WHERE guild_id=?1 AND month=?2 AND day=?3 AND (last_announced_year IS NULL OR last_announced_year<>?4) LIMIT ?5",
+            "SELECT guild_id,user_id,month,day,last_announced_year FROM birthdays WHERE guild_id=?1 AND ((month=?2 AND day=?3) OR (?6=1 AND month=2 AND day=29)) AND (last_announced_year IS NULL OR last_announced_year<>?4) LIMIT ?5",
         )?;
         let rows = stmt.query_map(
-            params![guild_id, month, day, year, i64::from(limit.min(500))],
+            params![
+                guild_id,
+                month,
+                day,
+                year,
+                i64::from(limit.min(500)),
+                leap_day_falls_back_today(month, day, year)
+            ],
             |row| {
                 Ok(BirthdayRecord {
                     guild_id: row.get(0)?,
@@ -4675,6 +4695,7 @@ impl Store {
     pub fn purge_user(&self, guild_id: &str, user_id: &str) -> Result<serde_json::Value> {
         let mut conn = self.conn.lock().expect("store mutex poisoned");
         let tx = conn.transaction()?;
+        let freed_events = seated_event_ids(&tx, guild_id, user_id)?;
         let mut deleted = serde_json::Map::new();
         for (name, statement) in [
             (
@@ -4767,6 +4788,9 @@ impl Store {
             if count > 0 {
                 deleted.insert(name.to_string(), serde_json::json!(count));
             }
+        }
+        for event_id in &freed_events {
+            promote_next_waitlisted(&tx, guild_id, event_id)?;
         }
         tx.commit()?;
         Ok(serde_json::json!({
@@ -4962,13 +4986,13 @@ impl Store {
                 .get("day")
                 .and_then(serde_json::Value::as_u64)
                 .ok_or_else(|| anyhow!("invalid_birthday_day"))?;
-            if !(1..=64).contains(&user_id.len())
-                || !(1..=12).contains(&month)
-                || !(1..=31).contains(&day)
-            {
+            let (Ok(month), Ok(day)) = (u32::try_from(month), u32::try_from(day)) else {
+                bail!("invalid_birthday");
+            };
+            if !(1..=64).contains(&user_id.len()) || !is_valid_birthday(month, day) {
                 bail!("invalid_birthday");
             }
-            parsed_birthdays.push((user_id, month as u32, day as u32));
+            parsed_birthdays.push((user_id, month, day));
         }
 
         Ok(PreparedConfigImport {
@@ -5189,8 +5213,9 @@ impl Store {
             )?;
         }
         for (user_id, month, day) in parsed_birthdays {
+            // An unchanged date keeps this year's announcement mark.
             tx.execute(
-                "INSERT INTO birthdays(guild_id,user_id,month,day,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?5) ON CONFLICT(guild_id,user_id) DO UPDATE SET month=excluded.month,day=excluded.day,last_announced_year=NULL,updated_at=excluded.updated_at",
+                "INSERT INTO birthdays(guild_id,user_id,month,day,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?5) ON CONFLICT(guild_id,user_id) DO UPDATE SET month=excluded.month,day=excluded.day,last_announced_year=CASE WHEN birthdays.month=excluded.month AND birthdays.day=excluded.day THEN birthdays.last_announced_year ELSE NULL END,updated_at=excluded.updated_at",
                 params![guild_id, user_id, month, day, Utc::now().timestamp_millis()],
             )?;
         }
@@ -6125,22 +6150,7 @@ impl Store {
             params![guild_id, event_id, user_id],
         )?;
         let promoted = if status == "registered" || status == "checked_in" {
-            let next: Option<(i64, String)> = tx
-                .query_row(
-                    "SELECT rowid,user_id FROM event_registrations WHERE guild_id=?1 AND event_id=?2 AND status='waitlisted' ORDER BY created_at ASC,rowid ASC LIMIT 1",
-                    params![guild_id, event_id],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .optional()?;
-            if let Some((rowid, user_id)) = next {
-                tx.execute(
-                    "UPDATE event_registrations SET status='registered' WHERE rowid=?1",
-                    [rowid],
-                )?;
-                Some(user_id)
-            } else {
-                None
-            }
+            promote_next_waitlisted(&tx, guild_id, event_id)?
         } else {
             None
         };
@@ -6508,6 +6518,74 @@ impl Store {
             "UPDATE giveaway_results SET claimed_at=NULL WHERE giveaway_id=?1 AND claimed_at=?2 AND announced=0",
             params![id, claim_at],
         )?;
+        Ok(())
+    }
+
+    /// Pick a reroll winner among entrants who have not won this giveaway yet.
+    /// None while the original announcement is still running.
+    pub fn giveaway_reroll_candidate(&self, guild_id: &str, id: i64) -> Result<Option<String>> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let ended: Option<bool> = conn
+            .query_row(
+                "SELECT ended FROM giveaways WHERE id=?1 AND guild_id=?2",
+                params![id, guild_id],
+                |row| row.get::<_, i64>(0).map(|ended| ended != 0),
+            )
+            .optional()?;
+        if ended != Some(true) {
+            return Ok(None);
+        }
+        let result: Option<(String, bool)> = conn
+            .query_row(
+                "SELECT winners_json,announced FROM giveaway_results WHERE giveaway_id=?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get::<_, i64>(1)? != 0)),
+            )
+            .optional()?;
+        let winners_json = match result {
+            Some((_, false)) => return Ok(None),
+            Some((raw, true)) => raw,
+            None => "[]".to_string(),
+        };
+        Ok(conn
+            .query_row(
+                "SELECT user_id FROM giveaway_entries WHERE giveaway_id=?1 AND user_id NOT IN (SELECT value FROM json_each(?2)) ORDER BY RANDOM() LIMIT 1",
+                params![id, winners_json],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Add a reroll winner to the giveaway's recorded winners.
+    pub fn record_giveaway_reroll(&self, id: i64, winner: &str) -> Result<()> {
+        let mut conn = self.conn.lock().expect("store mutex poisoned");
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let existing: Option<String> = tx
+            .query_row(
+                "SELECT winners_json FROM giveaway_results WHERE giveaway_id=?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match existing {
+            Some(raw) => {
+                let mut winners: Vec<String> = serde_json::from_str(&raw)?;
+                if !winners.iter().any(|known| known == winner) {
+                    winners.push(winner.to_string());
+                    tx.execute(
+                        "UPDATE giveaway_results SET winners_json=?2 WHERE giveaway_id=?1",
+                        params![id, serde_json::to_string(&winners)?],
+                    )?;
+                }
+            }
+            None => {
+                tx.execute(
+                    "INSERT INTO giveaway_results(giveaway_id,winners_json,announced) VALUES(?1,?2,1)",
+                    params![id, serde_json::to_string(&[winner])?],
+                )?;
+            }
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -6895,6 +6973,45 @@ fn parse_dt(value: &str) -> Result<DateTime<Utc>> {
     Ok(DateTime::parse_from_rfc3339(value)?.with_timezone(&Utc))
 }
 
+/// 1 when 29 February birthdays are celebrated on this date: 28 February of a
+/// year without a 29th. The date is the guild's local date.
+fn leap_day_falls_back_today(month: u32, day: u32, year: i32) -> i64 {
+    i64::from(month == 2 && day == 28 && chrono::NaiveDate::from_ymd_opt(year, 2, 29).is_none())
+}
+
+/// Give a freed event seat to the oldest waitlisted member. Takes the caller's
+/// open connection or transaction; the store mutex is not reentrant.
+fn promote_next_waitlisted(
+    conn: &Connection,
+    guild_id: &str,
+    event_id: &str,
+) -> Result<Option<String>> {
+    let next: Option<(i64, String)> = conn
+        .query_row(
+            "SELECT rowid,user_id FROM event_registrations WHERE guild_id=?1 AND event_id=?2 AND status='waitlisted' ORDER BY created_at ASC,rowid ASC LIMIT 1",
+            params![guild_id, event_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((rowid, user_id)) = next else {
+        return Ok(None);
+    };
+    conn.execute(
+        "UPDATE event_registrations SET status='registered' WHERE rowid=?1",
+        [rowid],
+    )?;
+    Ok(Some(user_id))
+}
+
+/// Events where this member holds a seat that leaving would free.
+fn seated_event_ids(conn: &Connection, guild_id: &str, user_id: &str) -> Result<Vec<String>> {
+    let mut statement = conn.prepare(
+        "SELECT event_id FROM event_registrations WHERE guild_id=?1 AND user_id=?2 AND status IN ('registered','checked_in')",
+    )?;
+    let rows = statement.query_map(params![guild_id, user_id], |row| row.get(0))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<String>>>()?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7153,6 +7270,29 @@ mod tests {
         assert_eq!(retry, selected);
         store.mark_giveaway_announced(id, retry_claim).unwrap();
         assert_eq!(store.prepare_giveaway_result("g", id).unwrap(), None);
+    }
+
+    #[test]
+    fn giveaway_rerolls_skip_previous_winners_and_are_recorded() {
+        let store = Store::open(":memory:").unwrap();
+        let id = store
+            .create_giveaway("g", "c", "Prize", 1, i64::MAX, None, "host")
+            .unwrap();
+        store.add_giveaway_entry(id, "a").unwrap();
+        store.add_giveaway_entry(id, "b").unwrap();
+        let (winners, claim) = store.prepare_giveaway_result("g", id).unwrap().unwrap();
+        // The original announcement is still running.
+        assert_eq!(store.giveaway_reroll_candidate("g", id).unwrap(), None);
+        store.mark_giveaway_announced(id, claim).unwrap();
+        let other = store.giveaway_reroll_candidate("g", id).unwrap().unwrap();
+        assert!(!winners.contains(&other));
+        assert_eq!(
+            store.giveaway_reroll_candidate("other-guild", id).unwrap(),
+            None
+        );
+        store.record_giveaway_reroll(id, &other).unwrap();
+        // Everyone has won once now.
+        assert_eq!(store.giveaway_reroll_candidate("g", id).unwrap(), None);
     }
 
     #[test]
@@ -9687,6 +9827,101 @@ mod tests {
         assert_eq!(store.due_birthdays(8, 3, 2027, 10).unwrap().len(), 1);
         assert!(store.remove_birthday("g", "u").unwrap());
         assert!(store.due_birthdays(8, 3, 2027, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn store_birthdays_reject_impossible_dates() {
+        let store = Store::open(":memory:").unwrap();
+        assert!(store.set_birthday("g", "u", 2, 30).is_err());
+        assert!(store.set_birthday("g", "u", 4, 31).is_err());
+        assert!(store.set_birthday("g", "u", 2, 29).is_ok());
+    }
+
+    #[test]
+    fn birthday_import_keeps_this_years_announcement_when_the_date_is_unchanged() {
+        let store = Store::open(":memory:").unwrap();
+        store.set_birthday("target", "u1", 8, 3).unwrap();
+        assert!(store.mark_birthday_announced("target", "u1", 2026).unwrap());
+        store.set_birthday("source", "u1", 8, 3).unwrap();
+        store
+            .import_guild_config("target", &store.export_guild("source").unwrap())
+            .unwrap();
+        assert!(
+            store
+                .due_birthdays_for_guild("target", 8, 3, 2026, 10)
+                .unwrap()
+                .is_empty()
+        );
+        store.set_birthday("source", "u1", 8, 4).unwrap();
+        store
+            .import_guild_config("target", &store.export_guild("source").unwrap())
+            .unwrap();
+        assert_eq!(
+            store
+                .due_birthdays_for_guild("target", 8, 4, 2026, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn leap_day_birthdays_are_announced_on_february_28_in_common_years() {
+        let store = Store::open(":memory:").unwrap();
+        store.set_birthday("g", "leap", 2, 29).unwrap();
+        let due = |month, day, year| {
+            store
+                .due_birthdays_for_guild("g", month, day, year, 10)
+                .unwrap()
+                .into_iter()
+                .map(|record| record.user_id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(due(2, 28, 2027), vec!["leap".to_string()]);
+        assert!(due(2, 28, 2028).is_empty());
+        assert_eq!(due(2, 29, 2028), vec!["leap".to_string()]);
+        assert!(due(3, 1, 2027).is_empty());
+        assert!(store.mark_birthday_announced("g", "leap", 2027).unwrap());
+        assert!(due(2, 28, 2027).is_empty());
+    }
+
+    #[test]
+    fn leaving_members_promote_the_event_waitlist() {
+        let store = Store::open(":memory:").unwrap();
+        for (event, user, status) in [
+            ("e", "a", "registered"),
+            ("e", "b", "waitlisted"),
+            ("e2", "c", "registered"),
+            ("e2", "d", "waitlisted"),
+            ("e3", "x", "registered"),
+            ("e3", "w", "waitlisted"),
+        ] {
+            assert_eq!(
+                store
+                    .register_event_with_capacity("g", event, user, Some(1))
+                    .unwrap()
+                    .as_deref(),
+                Some(status)
+            );
+        }
+        let status = |event: &str, user: &str| {
+            store
+                .event_registration("g", event, user)
+                .unwrap()
+                .map(|record| record.status)
+        };
+        store.delete_member_voluntary_data("g", "a").unwrap();
+        assert_eq!(status("e", "a"), None);
+        assert_eq!(status("e", "b").as_deref(), Some("registered"));
+        store.purge_user("g", "c").unwrap();
+        assert_eq!(status("e2", "c"), None);
+        assert_eq!(status("e2", "d").as_deref(), Some("registered"));
+        // A member who was only waiting frees no seat.
+        store.delete_member_voluntary_data("g", "w").unwrap();
+        assert_eq!(status("e3", "w"), None);
+        assert_eq!(status("e3", "x").as_deref(), Some("registered"));
+        assert_eq!(status("e", "b").as_deref(), Some("registered"));
+        assert_eq!(status("e2", "d").as_deref(), Some("registered"));
     }
 
     #[test]
