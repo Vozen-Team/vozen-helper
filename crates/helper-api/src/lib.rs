@@ -78,6 +78,7 @@ const INSTALL_FLOW_MARKER: &str = "install";
 // Module preflights and role/channel restrictions still apply after installation.
 const HELPER_INSTALL_PERMISSIONS: &str = "19099133930742";
 const SESSION_RESPONSE_HEADER: &str = "x-vozen-session";
+const EXPECTED_GUILD_HEADER: &str = "x-vozen-guild";
 const SESSION_MAX_HOURS: i64 = 8;
 const IDLE_MINUTES: i64 = 30;
 
@@ -425,7 +426,12 @@ pub fn router(state: ApiState) -> Router {
                         http::Method::DELETE,
                         http::Method::OPTIONS,
                     ])
-                    .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE, header::ACCEPT]),
+                    .allow_headers([
+                        header::AUTHORIZATION,
+                        header::CONTENT_TYPE,
+                        header::ACCEPT,
+                        header::HeaderName::from_static(EXPECTED_GUILD_HEADER),
+                    ]),
             )
         } else {
             tracing::warn!("HELPER_ALLOWED_ORIGIN is invalid; CORS disabled");
@@ -8008,7 +8014,8 @@ async fn switch_session_guild(
     headers: HeaderMap,
     Json(request): Json<SwitchGuildRequest>,
 ) -> Result<Response, (StatusCode, Json<ApiError>)> {
-    let current = require_mutation_auth(&state, &headers).await?;
+    // Switching must work from any tab, even one still showing an older guild.
+    let current = require_mutation_auth_any_guild(&state, &headers).await?;
     let managed = state
         .store
         .session_guilds(current.session_id)
@@ -12170,11 +12177,20 @@ async fn require_auth(
     Ok(claims)
 }
 
+async fn require_mutation_auth(
+    state: &ApiState,
+    headers: &HeaderMap,
+) -> Result<SessionClaims, (StatusCode, Json<ApiError>)> {
+    let claims = require_mutation_auth_any_guild(state, headers).await?;
+    require_expected_guild(headers, &claims)?;
+    Ok(claims)
+}
+
 /// State-changing browser requests must prove they came from the configured
 /// panel origin when authentication is carried by the ambient session cookie.
 /// API clients using an explicit Bearer token remain usable without an Origin
 /// header because browsers do not attach that credential automatically.
-async fn require_mutation_auth(
+async fn require_mutation_auth_any_guild(
     state: &ApiState,
     headers: &HeaderMap,
 ) -> Result<SessionClaims, (StatusCode, Json<ApiError>)> {
@@ -12185,6 +12201,23 @@ async fn require_mutation_auth(
     let claims = require_auth(state, headers).await?;
     require_cookie_origin(state, headers)?;
     Ok(claims)
+}
+
+/// Panel tabs send the guild they display. The session cookie is shared by
+/// every tab, so a tab left on another server must not write here.
+/// Optional for older clients and API callers.
+fn require_expected_guild(
+    headers: &HeaderMap,
+    claims: &SessionClaims,
+) -> Result<(), (StatusCode, Json<ApiError>)> {
+    let mut values = headers.get_all(EXPECTED_GUILD_HEADER).iter();
+    let Some(value) = values.next() else {
+        return Ok(());
+    };
+    if values.next().is_some() || value.to_str().ok() != Some(claims.guild_id.as_str()) {
+        return Err(client_error(StatusCode::CONFLICT, "guild_changed"));
+    }
+    Ok(())
 }
 
 fn require_cookie_origin(
@@ -15222,6 +15255,143 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["guildId"], "guild-b");
         assert!(store.load_session(session.session_id).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn mutation_rejects_a_different_expected_guild() {
+        let store = Store::open(":memory:").unwrap();
+        let session = claims("guild-a");
+        let token = sign_session(&session, "test-session-secret-with-at-least-32-bytes");
+        store.save_session(&session).unwrap();
+        store
+            .replace_session_guilds(
+                session.session_id,
+                &[("guild-a".into(), "Alpha".into(), Some("32".into()))],
+            )
+            .unwrap();
+        let save = |expected_guild: Option<&str>| {
+            let mut request = Request::builder()
+                .method("PUT")
+                .uri("/api/config/features/utility.help")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .header(header::CONTENT_TYPE, "application/json");
+            if let Some(guild) = expected_guild {
+                request = request.header("x-vozen-guild", guild);
+            }
+            request
+                .body(Body::from(r#"{"enabled":false,"config":{}}"#))
+                .unwrap()
+        };
+
+        let response = router(state(store.clone()))
+            .oneshot(save(Some("guild-b")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 1_000_000).await.unwrap())
+                .unwrap();
+        assert_eq!(body["code"], "guild_changed");
+        assert!(
+            store
+                .get_feature_setting("guild-a", "utility.help")
+                .unwrap()
+                .is_none()
+        );
+
+        let response = router(state(store.clone()))
+            .oneshot(save(Some("guild-a")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            store
+                .get_feature_setting("guild-a", "utility.help")
+                .unwrap()
+                .unwrap()
+                .revision,
+            1
+        );
+
+        // Older clients and API callers send no expected guild.
+        let response = router(state(store.clone()))
+            .oneshot(save(None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            store
+                .get_feature_setting("guild-a", "utility.help")
+                .unwrap()
+                .unwrap()
+                .revision,
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn session_switch_ignores_the_expected_guild_header() {
+        let store = Store::open(":memory:").unwrap();
+        let session = claims("guild-a");
+        let token = sign_session(&session, "test-session-secret-with-at-least-32-bytes");
+        store.save_session(&session).unwrap();
+        store
+            .replace_session_guilds(
+                session.session_id,
+                &[
+                    ("guild-a".into(), "Alpha".into(), Some("32".into())),
+                    ("guild-b".into(), "Beta".into(), Some("32".into())),
+                ],
+            )
+            .unwrap();
+        let response = router(state(store.clone()))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/session/switch")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("x-vozen-guild", "guild-z")
+                    .body(Body::from(r#"{"guild_id":"guild-b"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1_000_000).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["guildId"], "guild-b");
+        assert!(store.load_session(session.session_id).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn cors_allows_the_expected_guild_header() {
+        let store = Store::open(":memory:").unwrap();
+        let mut api_state = state(store);
+        api_state.allowed_origin = Some("http://127.0.0.1:4173".into());
+        let response = router(api_state)
+            .oneshot(
+                Request::builder()
+                    .method("OPTIONS")
+                    .uri("/api/config/features/utility.help")
+                    .header(header::ORIGIN, "http://127.0.0.1:4173")
+                    .header(header::ACCESS_CONTROL_REQUEST_METHOD, "PUT")
+                    .header(
+                        header::ACCESS_CONTROL_REQUEST_HEADERS,
+                        "content-type,x-vozen-guild",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let allowed = response
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_HEADERS)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        assert!(allowed.contains("x-vozen-guild"), "{allowed}");
     }
 
     #[test]
