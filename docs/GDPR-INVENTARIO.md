@@ -63,6 +63,30 @@ entrada registada depois da saída, ou XP, comando, `/daily` ou recompensa mais 
 está fora, o membro não aparece no ranking de saldo. `/privacidade apagar` e apagar o servidor apagam logo a economia e
 a marca.
 
+### Saída de um membro e apagamento a pedido
+
+**Quando um membro sai, é expulso ou banido**, apagam-se logo:
+- votos em sugestões;
+- participações em sorteios;
+- votos em sondagens;
+- lembretes;
+- inscrições em eventos;
+- estado AFK;
+- níveis e eventos de XP;
+- sessão de voz aberta;
+- aniversário;
+- tags e sugestões que criou.
+
+As conquistas ficam (decisão do dono a 26/11). A economia tem regra própria (ver "Economia de quem sai").
+
+**`/privacidade apagar`** apaga, além disso, as conquistas, a economia, a marca de saída e a atribuição de convite do
+membro. Também retira o seu identificador das atribuições de quem ele convidou. A exportação inclui a atribuição de
+convite (código e data), mas não quem convidou. Os registos de moderação ficam (art. 17.º/3-e).
+
+**Apagar o servidor** apaga todos os dados desse servidor, incluindo as tabelas antigas do bot em Node (`notes`,
+`sticky_roles`) quando existem. `invite_snapshots` guarda o criador de cada convite tal como o Discord o mostra; volta a
+ser lido do Discord enquanto o convite existir e apaga-se com o servidor.
+
 ## Conclusões que alimentam as fases seguintes
 
 - **Sem cookies não-essenciais → sem banner de consentimento.** O cookie e o localStorage

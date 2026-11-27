@@ -4679,6 +4679,7 @@ impl Store {
              UNION ALL SELECT 'xp_event' AS kind, printf('%+d %s', amount, source), created_at FROM xp_events WHERE guild_id=?1 AND user_id=?2
              UNION ALL SELECT 'achievement_activity' AS kind, printf('%s: %d', kind, value), 0 FROM achievement_activity WHERE guild_id=?1 AND user_id=?2
              UNION ALL SELECT 'achievement' AS kind, achievement_key, unlocked_at FROM achievements WHERE guild_id=?1 AND user_id=?2
+             UNION ALL SELECT 'invite_attribution' AS kind, code, joined_at FROM invite_attributions WHERE guild_id=?1 AND user_id=?2
              ORDER BY kind",
         )?;
         for row in stmt.query_map(params![guild_id, user_id], |row| {
@@ -4832,6 +4833,14 @@ impl Store {
             (
                 "member_departures",
                 "DELETE FROM member_departures WHERE guild_id=?2 AND user_id=?1",
+            ),
+            (
+                "invite_attributions",
+                "DELETE FROM invite_attributions WHERE guild_id=?2 AND user_id=?1",
+            ),
+            (
+                "invite_attributions_inviter_cleared",
+                "UPDATE invite_attributions SET inviter_id=NULL WHERE guild_id=?2 AND inviter_id=?1",
             ),
             (
                 "tags",
@@ -5356,6 +5365,15 @@ impl Store {
             "DELETE FROM settings WHERE guild_id=?1",
         ] {
             tx.execute(statement, [guild_id])?;
+        }
+        // Node-era tables (src/store/db.ts) that the Rust runtime never reads.
+        for (table, statement) in [
+            ("notes", "DELETE FROM notes WHERE guild_id=?1"),
+            ("sticky_roles", "DELETE FROM sticky_roles WHERE guild_id=?1"),
+        ] {
+            if legacy_table_exists(&tx, table)? {
+                tx.execute(statement, [guild_id])?;
+            }
         }
         tx.commit()?;
         Ok(())
@@ -7125,6 +7143,16 @@ fn seated_event_ids(conn: &Connection, guild_id: &str, user_id: &str) -> Result<
     )?;
     let rows = statement.query_map(params![guild_id, user_id], |row| row.get(0))?;
     Ok(rows.collect::<rusqlite::Result<Vec<String>>>()?)
+}
+
+/// Tables created by the Node bot exist only on databases converted in place.
+/// The name is a bound parameter; callers pass fixed literals.
+fn legacy_table_exists(tx: &rusqlite::Transaction<'_>, table: &str) -> Result<bool> {
+    Ok(tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+        [table],
+        |row| row.get(0),
+    )?)
 }
 
 #[cfg(test)]
@@ -9659,6 +9687,85 @@ mod tests {
                 .all(|entry| entry["kind"] != "economy_transaction")
         );
         assert_eq!(store.suggestion_votes(suggestion).unwrap(), (0, 0));
+    }
+
+    #[test]
+    fn privacy_gap_invites_are_exported_and_erased() {
+        let store = Store::open(":memory:").unwrap();
+        store
+            .record_invite_attribution("g", "u", "abc", Some("inviter"))
+            .unwrap();
+        store
+            .record_invite_attribution("g", "friend", "abc", Some("u"))
+            .unwrap();
+
+        let export = store.export_user("g", "u").unwrap();
+        assert!(
+            export["voluntary"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["kind"] == "invite_attribution" && entry["value"] == "abc")
+        );
+
+        store.purge_user("g", "u").unwrap();
+        assert!(store.invite_attribution("g", "u").unwrap().is_none());
+        assert_eq!(
+            store.invite_attribution("g", "friend").unwrap(),
+            Some(("abc".to_string(), None))
+        );
+    }
+
+    #[test]
+    fn privacy_gap_guild_purge_covers_legacy_node_tables() {
+        let store = Store::open(":memory:").unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute_batch(
+                "CREATE TABLE notes (id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id TEXT NOT NULL, target_id TEXT NOT NULL, author_id TEXT NOT NULL, content TEXT NOT NULL, created_at INTEGER NOT NULL);
+                 CREATE TABLE sticky_roles (guild_id TEXT NOT NULL, user_id TEXT NOT NULL, role_ids TEXT NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY (guild_id, user_id));
+                 INSERT INTO notes(guild_id,target_id,author_id,content,created_at) VALUES('g','u','mod','note',1),('other','u','mod','note',1);
+                 INSERT INTO sticky_roles(guild_id,user_id,role_ids,updated_at) VALUES('g','u','[\"r\"]',1),('other','u','[\"r\"]',1);",
+            )
+            .unwrap();
+        }
+
+        store.purge_guild("g").unwrap();
+
+        {
+            let conn = store.conn.lock().unwrap();
+            for (table, statement) in [
+                ("notes", "SELECT COUNT(*) FROM notes WHERE guild_id=?1"),
+                (
+                    "sticky_roles",
+                    "SELECT COUNT(*) FROM sticky_roles WHERE guild_id=?1",
+                ),
+            ] {
+                let count = |guild: &str| -> i64 {
+                    conn.query_row(statement, [guild], |row| row.get(0))
+                        .unwrap()
+                };
+                assert_eq!(count("g"), 0, "{table} kept rows of the purged guild");
+                assert_eq!(count("other"), 1, "{table} lost rows of another guild");
+            }
+        }
+    }
+
+    #[test]
+    fn privacy_gap_guild_purge_without_legacy_tables_still_works() {
+        let store = Store::open(":memory:").unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            let legacy: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('notes','sticky_roles')",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(legacy, 0);
+        }
+        assert!(store.purge_guild("g").is_ok());
     }
 
     #[test]
