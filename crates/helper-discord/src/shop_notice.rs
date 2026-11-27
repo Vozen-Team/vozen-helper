@@ -15,9 +15,31 @@ fn body(order: &ShopOrder, currency: &str, locale: &str) -> Value {
         "ko" => ("새 주문 · 운영진 지급", "상점 보기"),
         _ => ("New order · staff delivery", "Open shop"),
     };
+    // A role order only reaches staff when Discord refused the role.
+    let title = if order.delivery == "role" {
+        match locale {
+            "pt" => "Cargo não entregue · revisão da equipa",
+            "fr" => "Rôle non attribué · vérification par l'équipe",
+            "es" => "Rol no entregado · revisión del equipo",
+            "de" => "Rolle nicht vergeben · Prüfung durch das Team",
+            "tr" => "Rol verilemedi · ekip kontrolü",
+            "ar" => "لم يُمنح الدور · مراجعة الفريق",
+            "zh" => "身分組未發放 · 人工檢查",
+            "ru" => "Роль не выдана · проверка персоналом",
+            "ko" => "역할 미지급 · 운영진 확인",
+            _ => "Role not delivered · staff review",
+        }
+    } else {
+        title
+    };
     json!({"embeds":[{"title":title,"description":format!("**{}** · {} {}\n<@{}> · {}\n**#{}**",super::economy_shop::safe(&order.product_name),order.price,super::economy_shop::safe(currency),order.user_id,super::economy_shop::safe(&order.display_name),order.id),"color":0x8ee5d2}],
         "allowed_mentions":{"parse":[]},"nonce":format!("shop-{}",order.id),"enforce_nonce":true,
         "components":[{"type":1,"components":[{"type":2,"style":5,"label":button,"url":"https://vozen.org/panel/helper-tracker/#/config/community.economy"}]}]})
+}
+
+/// Pending orders that wait on staff: manual delivery, or a role the Helper could not give.
+fn notice_needs_staff(order: &ShopOrder) -> bool {
+    order.status == "pending" && matches!(order.delivery.as_str(), "manual" | "role")
 }
 
 pub(super) async fn deliver(
@@ -36,7 +58,7 @@ pub(super) async fn deliver(
     else {
         return store.delete_scheduled_action(*id);
     };
-    if order.delivery != "manual" || order.status != "pending" {
+    if !notice_needs_staff(&order) {
         return store.delete_scheduled_action(*id);
     }
     let channel = store
@@ -157,6 +179,61 @@ mod tests {
             body(&order, "credits", "ko")["embeds"][0]["title"],
             body(&order, "credits", "en")["embeds"][0]["title"]
         );
+    }
+    #[test]
+    fn role_review_notice_has_its_own_title() {
+        let role_order = ShopOrder {
+            id: 9,
+            user_id: "123".into(),
+            display_name: "Buyer".into(),
+            product_name: "VIP".into(),
+            price: 10,
+            delivery: "role".into(),
+            role_id: Some("123456789012345678".into()),
+            status: "pending".into(),
+            created_at: 0,
+        };
+        let title = |value: Value| value["embeds"][0]["title"].as_str().unwrap().to_owned();
+        assert!(title(body(&role_order, "credits", "pt")).starts_with("Cargo não entregue"));
+        assert!(title(body(&role_order, "credits", "en")).starts_with("Role not delivered"));
+        let manual_order = ShopOrder {
+            id: 9,
+            user_id: "123".into(),
+            display_name: "Buyer".into(),
+            product_name: "VIP".into(),
+            price: 10,
+            delivery: "manual".into(),
+            role_id: None,
+            status: "pending".into(),
+            created_at: 0,
+        };
+        assert!(title(body(&manual_order, "credits", "pt")).starts_with("Novo pedido"));
+        assert!(notice_needs_staff(&role_order));
+        assert!(notice_needs_staff(&manual_order));
+        let delivered = ShopOrder {
+            id: 9,
+            user_id: "123".into(),
+            display_name: "Buyer".into(),
+            product_name: "VIP".into(),
+            price: 10,
+            delivery: "role".into(),
+            role_id: Some("123456789012345678".into()),
+            status: "delivered".into(),
+            created_at: 0,
+        };
+        assert!(!notice_needs_staff(&delivered));
+        let other = ShopOrder {
+            id: 9,
+            user_id: "123".into(),
+            display_name: "Buyer".into(),
+            product_name: "VIP".into(),
+            price: 10,
+            delivery: "other".into(),
+            role_id: None,
+            status: "pending".into(),
+            created_at: 0,
+        };
+        assert!(!notice_needs_staff(&other));
     }
     fn fixture() -> (Store, ScheduledAction) {
         let store = Store::open(":memory:").unwrap();
