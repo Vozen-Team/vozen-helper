@@ -1,5 +1,5 @@
 use super::{
-    ApiError, ApiState, Client, DISCORD_API_BASE, NICKNAME_SAVE_LOCK, SessionClaims, client_error,
+    ApiError, ApiState, Client, DISCORD_API_BASE, NICKNAME_SAVE_LOCKS, SessionClaims, client_error,
     discord_json, feature_config_key, feature_key, guild_has_premium, require_auth,
     require_mutation_auth, runtime_projection_pairs,
 };
@@ -231,8 +231,9 @@ pub(super) async fn update(
     {
         return Err(client_error(StatusCode::FORBIDDEN, "premium_required"));
     }
+    let nickname_lock = NICKNAME_SAVE_LOCKS.for_guild(&guild);
     let _nickname_guard = if fields.contains_key("nick") {
-        Some(NICKNAME_SAVE_LOCK.lock().await)
+        Some(nickname_lock.lock().await)
     } else {
         None
     };

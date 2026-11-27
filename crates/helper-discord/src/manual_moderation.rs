@@ -170,14 +170,15 @@ async fn allowed_at(
         .filter(|id| !target_roles.contains(id))
     {
         let id = role.parse::<u64>().map_err(|_| ())?;
-        let value = roles.get(&id);
-        if !helper_core::role_offer_allowed(
-            guild,
-            id,
-            value.map(|value| value.0),
-            value.is_none_or(|value| value.2),
-            &role_authority,
-        ) {
+        // A saved id of 0 was never a role; it keeps blocking, as before.
+        if id == 0 {
+            return Ok(false);
+        }
+        // A role deleted from the server cannot be granted; /unquarantine drops it.
+        let Some(value) = roles.get(&id) else {
+            continue;
+        };
+        if !helper_core::role_offer_allowed(guild, id, Some(value.0), value.2, &role_authority) {
             return Ok(false);
         }
     }
@@ -275,6 +276,34 @@ mod tests {
                 )
                 .await,
                 Ok(true)
+            );
+            assert_eq!(
+                allowed_at(
+                    &client,
+                    &base,
+                    "Bot synthetic",
+                    1,
+                    2,
+                    3,
+                    "unquarantine",
+                    &["40".into(), "99".into()]
+                )
+                .await,
+                Ok(true)
+            );
+            assert_eq!(
+                allowed_at(
+                    &client,
+                    &base,
+                    "Bot synthetic",
+                    1,
+                    2,
+                    3,
+                    "unquarantine",
+                    &["0".into()]
+                )
+                .await,
+                Ok(false)
             );
             assert_eq!(
                 allowed_at(

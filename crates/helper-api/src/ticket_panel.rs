@@ -22,6 +22,7 @@ pub(super) async fn publish(
     config: &Value,
     quota: u64,
     base: &str,
+    recover_stale: bool,
 ) -> anyhow::Result<Value> {
     let Some(channel) = config["panelChannel"].as_str().filter(|id| !id.is_empty()) else {
         return Ok(Value::Null);
@@ -64,6 +65,28 @@ pub(super) async fn publish(
         record = json!({"message_id": id});
         store.set_setting(guild, &key, &record.to_string())?;
     }
+    let now = chrono::Utc::now().timestamp_millis();
+    // Only an explicit repair may resolve an expired unknown delivery, and
+    // only after the channel history was read: adopt the bot's own panel, or
+    // post once when it is confirmed absent. A failed read changes nothing.
+    if recover_stale
+        && record["message_id"].is_null()
+        && !record["nonce"].is_null()
+        && now - record["started_at"].as_i64().unwrap_or(0) >= 120_000
+    {
+        if let Some(id) = find_bot_panel(&client, base, &authorization, channel).await? {
+            record = json!({"message_id": id});
+            store.set_setting(guild, &key, &record.to_string())?;
+            store.set_setting(
+                guild,
+                &format!("support.panel.{id}"),
+                &json!({"channel_id": channel, "message_id": id}).to_string(),
+            )?;
+        } else {
+            store.delete_setting(guild, &key)?;
+            record = json!({});
+        }
+    }
     let mut body = panel_body(config);
     if let Some(message) = record["message_id"].as_str() {
         anyhow::ensure!(message.parse::<u64>().is_ok(), "invalid_panel_reference");
@@ -88,7 +111,6 @@ pub(super) async fn publish(
         store.count_settings_prefix(guild, "support.panel.")? < quota,
         "ticket_panel_quota_reached"
     );
-    let now = chrono::Utc::now().timestamp_millis();
     if record["nonce"].is_null() {
         record = json!({"nonce": uuid::Uuid::new_v4().simple().to_string()[..25].to_owned(), "started_at": now});
         store.set_setting(guild, &key, &record.to_string())?;
@@ -125,6 +147,76 @@ pub(super) async fn publish(
         &json!({"channel_id": channel, "message_id": id}).to_string(),
     )?;
     Ok(json!({"applied": true, "channelId": channel, "messageId": id}))
+}
+
+// Looks for the bot's own ticket panel in the latest channel messages. The
+// nonce is not trusted here: only the author and the open button identify it.
+// Anything short of a clean read is an error, because `None` permits a post.
+async fn find_bot_panel(
+    client: &reqwest::Client,
+    base: &str,
+    authorization: &str,
+    channel: &str,
+) -> anyhow::Result<Option<String>> {
+    let bot: Value = client
+        .get(format!("{base}/users/@me"))
+        .header("Authorization", authorization)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let bot_id = bot["id"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("invalid_panel_response"))?;
+    let history: Value = client
+        .get(format!("{base}/channels/{channel}/messages?limit=50"))
+        .header("Authorization", authorization)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let messages = history
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("invalid_panel_response"))?;
+    let has_open_button = |message: &Value| {
+        message["components"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|row| row["components"].as_array())
+            .flatten()
+            .any(|component| component["custom_id"].as_str() == Some("ticket:open"))
+    };
+    let Some(panel) = messages.iter().find(|message| {
+        message["author"]["id"].as_str() == Some(bot_id) && has_open_button(message)
+    }) else {
+        return Ok(None);
+    };
+    let id = panel["id"]
+        .as_str()
+        .filter(|id| id.parse::<u64>().is_ok())
+        .ok_or_else(|| anyhow::anyhow!("invalid_panel_response"))?;
+    Ok(Some(id.to_owned()))
+}
+
+/// The stable codes `publish` reports; anything else is a generic failure.
+pub(super) fn error_code(error: &anyhow::Error) -> &'static str {
+    const CODES: [&str; 7] = [
+        "invalid_panel_channel",
+        "panel_channel_wrong_guild",
+        "panel_channel_must_be_text",
+        "invalid_panel_reference",
+        "ticket_panel_quota_reached",
+        "ticket_panel_delivery_unknown_check_discord",
+        "invalid_panel_response",
+    ];
+    let message = error.to_string();
+    CODES
+        .into_iter()
+        .find(|code| *code == message)
+        .unwrap_or("ticket_panel_publish_failed")
 }
 
 #[cfg(test)]
@@ -173,7 +265,8 @@ mod tests {
                 "10",
                 &json!({"panelChannel":"20"}),
                 1,
-                &base
+                &base,
+                false
             )
             .await
             .unwrap()["messageId"],
@@ -222,14 +315,14 @@ mod tests {
         let config = json!({"panelChannel":"20"});
         for _ in 0..2 {
             assert_eq!(
-                publish(&store, "token", "10", &config, 1, &base)
+                publish(&store, "token", "10", &config, 1, &base, false)
                     .await
                     .unwrap()["messageId"],
                 "30"
             );
         }
         assert!(
-            publish(&store, "token", "99", &config, 1, &base)
+            publish(&store, "token", "99", &config, 1, &base, false)
                 .await
                 .is_err()
         );
@@ -267,12 +360,12 @@ mod tests {
         .await;
         let config = json!({"panelChannel":"20"});
         assert!(
-            publish(&store, "token", "10", &config, 1, &base)
+            publish(&store, "token", "10", &config, 1, &base, false)
                 .await
                 .is_err()
         );
         assert_eq!(
-            publish(&store, "token", "10", &config, 1, &base)
+            publish(&store, "token", "10", &config, 1, &base, false)
                 .await
                 .unwrap()["messageId"],
             "31"
@@ -298,7 +391,7 @@ mod tests {
         .await;
         let config = json!({"panelChannel":"20"});
         assert!(
-            publish(&store, "token", "10", &config, 0, &base)
+            publish(&store, "token", "10", &config, 0, &base, false)
                 .await
                 .is_err()
         );
@@ -310,7 +403,7 @@ mod tests {
             )
             .unwrap();
         assert!(
-            publish(&store, "token", "10", &config, 1, &base)
+            publish(&store, "token", "10", &config, 1, &base, false)
                 .await
                 .is_err()
         );
@@ -318,13 +411,146 @@ mod tests {
         task.abort();
     }
 
+    fn store_with_stale_delivery() -> Store {
+        let store = Store::open(":memory:").unwrap();
+        store
+            .set_setting(
+                "10",
+                "support.ticket.dashboard_panel.20",
+                r#"{"nonce":"old","started_at":1}"#,
+            )
+            .unwrap();
+        store
+    }
+
+    fn stale_recovery_reads(history_status: u16, history: Value) -> Vec<Reply> {
+        vec![
+            (
+                "GET",
+                "/channels/20",
+                200,
+                json!({"guild_id":"10", "type":0}),
+            ),
+            ("GET", "/users/@me", 200, json!({"id":"99"})),
+            ("GET", "/channels/20/messages", history_status, history),
+        ]
+    }
+
+    #[tokio::test]
+    async fn stale_delivery_adopts_the_bot_panel_on_recovery() {
+        let store = store_with_stale_delivery();
+        let open_button = json!([{"type":1,"components":[{"type":2,"custom_id":"ticket:open"}]}]);
+        let history = json!([
+            {"id":"33","author":{"id":"99"},"components":[]},
+            {"id":"32","author":{"id":"77"},"components":open_button.clone()},
+            {"id":"31","author":{"id":"99"},"components":open_button},
+        ]);
+        let mut replies = stale_recovery_reads(200, history);
+        replies.push(("PATCH", "/channels/20/messages/31", 200, json!({"id":"31"})));
+        let (base, task, queue) = mock(replies).await;
+        let result = publish(
+            &store,
+            "token",
+            "10",
+            &json!({"panelChannel":"20"}),
+            1,
+            &base,
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["messageId"], "31");
+        assert!(
+            store
+                .get_setting("10", "support.panel.31")
+                .unwrap()
+                .is_some()
+        );
+        assert!(queue.lock().unwrap().is_empty());
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn stale_delivery_without_a_panel_posts_once_on_recovery() {
+        let store = store_with_stale_delivery();
+        let mut replies = stale_recovery_reads(200, json!([]));
+        replies.push(("POST", "/channels/20/messages", 200, json!({"id":"32"})));
+        let (base, task, queue) = mock(replies).await;
+        let result = publish(
+            &store,
+            "token",
+            "10",
+            &json!({"panelChannel":"20"}),
+            1,
+            &base,
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["messageId"], "32");
+        assert!(queue.lock().unwrap().is_empty());
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn stale_delivery_stays_blocked_when_history_is_unreadable() {
+        let store = store_with_stale_delivery();
+        let (base, task, queue) = mock(stale_recovery_reads(403, json!({}))).await;
+        assert!(
+            publish(
+                &store,
+                "token",
+                "10",
+                &json!({"panelChannel":"20"}),
+                1,
+                &base,
+                true,
+            )
+            .await
+            .is_err()
+        );
+        let record: Value = serde_json::from_str(
+            &store
+                .get_setting("10", "support.ticket.dashboard_panel.20")
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(record["nonce"], "old");
+        assert!(queue.lock().unwrap().is_empty());
+        task.abort();
+    }
+
+    #[test]
+    fn publish_errors_keep_their_specific_code() {
+        for code in [
+            "ticket_panel_delivery_unknown_check_discord",
+            "ticket_panel_quota_reached",
+            "panel_channel_wrong_guild",
+        ] {
+            assert_eq!(error_code(&anyhow::anyhow!(code)), code);
+        }
+        assert_eq!(
+            error_code(&anyhow::anyhow!("x")),
+            "ticket_panel_publish_failed"
+        );
+    }
+
     #[tokio::test]
     async fn unconfigured_panel_never_contacts_discord() {
         let store = Store::open(":memory:").unwrap();
         assert_eq!(
-            publish(&store, "token", "1", &json!({}), 1, "http://127.0.0.1:1")
-                .await
-                .unwrap(),
+            publish(
+                &store,
+                "token",
+                "1",
+                &json!({}),
+                1,
+                "http://127.0.0.1:1",
+                false
+            )
+            .await
+            .unwrap(),
             Value::Null
         );
     }

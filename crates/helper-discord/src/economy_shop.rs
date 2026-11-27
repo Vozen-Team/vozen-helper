@@ -237,6 +237,9 @@ pub(super) async fn handle(store: &Store, ctx: &Context, c: &ComponentInteractio
             Err(error) => {
                 // A timeout can mean Discord applied the role. Keep the debit and order for staff review.
                 warn!(%error,order_id=order.id,"shop role delivery requires review");
+                if let Err(error) = store.queue_shop_review_notice(&g, order.id) {
+                    warn!(%error, order_id = order.id, "could not queue shop review notice");
+                }
                 c.edit_response(
                     ctx,
                     raw_feedback(&format!(

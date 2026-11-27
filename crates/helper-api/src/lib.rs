@@ -53,9 +53,9 @@ use helper_modules::{
 use helper_store::{
     BlueskySubscriptionRecord, BlueskySubscriptionWrite, InstagramSubscriptionRecord,
     InstagramSubscriptionWrite, KickSubscriptionRecord, KickSubscriptionWrite,
-    RssSubscriptionRecord, RssSubscriptionWrite, Store, TikTokSubscriptionRecord,
-    TikTokSubscriptionWrite, TopggSyncStatus, TwitchSubscriptionRecord, TwitchSubscriptionWrite,
-    YouTubeSubscriptionRecord, YouTubeSubscriptionWrite,
+    RssSubscriptionRecord, RssSubscriptionWrite, SessionGuildRecord, Store,
+    TikTokSubscriptionRecord, TikTokSubscriptionWrite, TopggSyncStatus, TwitchSubscriptionRecord,
+    TwitchSubscriptionWrite, YouTubeSubscriptionRecord, YouTubeSubscriptionWrite,
 };
 use hmac::{Hmac, Mac};
 pub use oauth_limits::OAuthLimits;
@@ -78,10 +78,32 @@ const INSTALL_FLOW_MARKER: &str = "install";
 // Module preflights and role/channel restrictions still apply after installation.
 const HELPER_INSTALL_PERMISSIONS: &str = "19099133930742";
 const SESSION_RESPONSE_HEADER: &str = "x-vozen-session";
+const EXPECTED_GUILD_HEADER: &str = "x-vozen-guild";
 const SESSION_MAX_HOURS: i64 = 8;
 const IDLE_MINUTES: i64 = 30;
-static TICKET_PANEL_SAVE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-static NICKNAME_SAVE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Async locks keyed by guild id: work in one server never waits for another.
+/// An entry nobody holds is dropped on the next lookup, so the map stays small.
+struct GuildLocks(std::sync::Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>);
+
+impl GuildLocks {
+    const fn new() -> Self {
+        Self(std::sync::Mutex::new(BTreeMap::new()))
+    }
+
+    fn for_guild(&self, guild_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+        locks.entry(guild_id.to_owned()).or_default().clone()
+    }
+}
+
+static QUICK_SETUP_LOCKS: GuildLocks = GuildLocks::new();
+static TICKET_PANEL_SAVE_LOCKS: GuildLocks = GuildLocks::new();
+static NICKNAME_SAVE_LOCKS: GuildLocks = GuildLocks::new();
 
 #[derive(Clone)]
 pub struct ApiState {
@@ -404,7 +426,12 @@ pub fn router(state: ApiState) -> Router {
                         http::Method::DELETE,
                         http::Method::OPTIONS,
                     ])
-                    .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE, header::ACCEPT]),
+                    .allow_headers([
+                        header::AUTHORIZATION,
+                        header::CONTENT_TYPE,
+                        header::ACCEPT,
+                        header::HeaderName::from_static(EXPECTED_GUILD_HEADER),
+                    ]),
             )
         } else {
             tracing::warn!("HELPER_ALLOWED_ORIGIN is invalid; CORS disabled");
@@ -4878,8 +4905,8 @@ async fn create_session_inner(
     let discord_user = fetch_discord_user(&client, &req.token).await?;
     // The Discord OAuth endpoint returns every guild in the account, but the
     // Helper can only ever expose servers the account can manage.  Filtering
-    // first avoids a serial bot-presence lookup for unrelated guilds, which
-    // made the first-party account handoff exceed the browser deadline.
+    // first avoids bot-presence lookups for unrelated guilds, which made the
+    // first-party account handoff exceed the browser deadline.
     let guilds = manageable_guilds(fetch_discord_guilds(&client, &req.token).await?);
     let guilds = filter_guilds_with_bot(&client, &state.discord_token, guilds).await?;
     create_session_response(state, headers, discord_user, guilds, req.guild_id)
@@ -4949,45 +4976,70 @@ fn discord_guilds_error(status: StatusCode) -> (StatusCode, &'static str) {
     }
 }
 
-async fn fetch_bot_guild_by_id(
+/// What the bot's `/guilds/{id}` lookup said about one guild. `Unknown`
+/// covers rate limits and server errors left after retries, network failures,
+/// unreadable bodies and the overall deadline.
+enum BotPresence {
+    Present(DiscordBotGuild),
+    Absent,
+    Unknown,
+}
+
+const BOT_PRESENCE_CONCURRENCY: usize = 4;
+/// Total wait for every lookup. The panel's account handoff gives up after
+/// 6 s (`SESSION_BRIDGE_TIMEOUT_MS`) and must still read the user and the
+/// guild list, so revisit this if that timeout changes.
+const BOT_PRESENCE_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
+
+async fn bot_presence_at(
     client: &Client,
+    base: &str,
     discord_token: &str,
-    guild_id: &str,
-) -> Result<Option<DiscordBotGuild>, (StatusCode, Json<ApiError>)> {
-    if discord_token.len() < 20 {
-        return Err(client_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "discord_bot_unavailable",
-        ));
+    guild_ids: &[String],
+) -> BTreeMap<String, BotPresence> {
+    let deadline = tokio::time::Instant::now() + BOT_PRESENCE_BUDGET;
+    let mut presence = BTreeMap::new();
+    let permits = Arc::new(tokio::sync::Semaphore::new(BOT_PRESENCE_CONCURRENCY));
+    let mut tasks = tokio::task::JoinSet::new();
+    for guild_id in guild_ids {
+        if !is_discord_snowflake(guild_id) {
+            presence.insert(guild_id.clone(), BotPresence::Absent);
+            continue;
+        }
+        let guild_id = guild_id.clone();
+        let url = format!("{base}/guilds/{guild_id}");
+        let auth = format!("Bot {discord_token}");
+        let client = client.clone();
+        let permits = permits.clone();
+        tasks.spawn(async move {
+            let Ok(_permit) = permits.acquire_owned().await else {
+                return (guild_id, BotPresence::Unknown);
+            };
+            let result = match discord_read::get_json(&client, &auth, &url).await {
+                Ok(value) => serde_json::from_value::<DiscordBotGuild>(value)
+                    .map_or(BotPresence::Unknown, BotPresence::Present),
+                // Same reading as `GuildAuthorization`: the bot is not there.
+                Err(error) if error == "discord_http_404" || error == "discord_http_403" => {
+                    BotPresence::Absent
+                }
+                Err(_) => BotPresence::Unknown,
+            };
+            (guild_id, result)
+        });
     }
-    let response = client
-        .get(format!("{DISCORD_API_BASE}/guilds/{guild_id}"))
-        .header(header::AUTHORIZATION, format!("Bot {discord_token}"))
-        .send()
-        .await
-        .map_err(|_| client_error(StatusCode::BAD_GATEWAY, "discord_unreachable"))?;
-    let status = response.status();
-    let body = response
-        .text()
-        .await
-        .map_err(|_| client_error(StatusCode::BAD_GATEWAY, "discord_response_unreadable"))?;
-    if status == StatusCode::NOT_FOUND {
-        return Ok(None);
+    while let Ok(Some(result)) = tokio::time::timeout_at(deadline, tasks.join_next()).await {
+        if let Ok((guild_id, result)) = result {
+            presence.insert(guild_id, result);
+        }
     }
-    if !status.is_success() {
-        tracing::warn!(%status, body_len = body.len(), "Discord bot guild request failed");
-        return Err(client_error(
-            StatusCode::BAD_GATEWAY,
-            "discord_bot_guild_unavailable",
-        ));
+    // Dropping the set cancels the lookups still waiting on Discord.
+    drop(tasks);
+    for guild_id in guild_ids {
+        presence
+            .entry(guild_id.clone())
+            .or_insert(BotPresence::Unknown);
     }
-    serde_json::from_str(&body).map(Some).map_err(|_| {
-        tracing::warn!(
-            body_len = body.len(),
-            "Discord bot guild list response was not valid JSON"
-        );
-        client_error(StatusCode::BAD_GATEWAY, "invalid_discord_response")
-    })
+    presence
 }
 
 async fn filter_guilds_with_bot(
@@ -4995,16 +5047,114 @@ async fn filter_guilds_with_bot(
     discord_token: &str,
     guilds: Vec<DiscordGuild>,
 ) -> Result<Vec<DiscordGuild>, (StatusCode, Json<ApiError>)> {
+    filter_guilds_with_bot_at(client, DISCORD_API_BASE, discord_token, guilds).await
+}
+
+/// Keeps guilds where the bot is present, then guilds whose presence could
+/// not be confirmed now. Each authenticated request re-checks the guild with
+/// Discord, so an uncertain guild grants nothing on its own. Present guilds
+/// come first because a session without an explicit guild opens the first one.
+async fn filter_guilds_with_bot_at(
+    client: &Client,
+    base: &str,
+    discord_token: &str,
+    guilds: Vec<DiscordGuild>,
+) -> Result<Vec<DiscordGuild>, (StatusCode, Json<ApiError>)> {
+    if guilds.is_empty() {
+        return Ok(Vec::new());
+    }
+    if discord_token.len() < 20 {
+        return Err(client_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "discord_bot_unavailable",
+        ));
+    }
+    let ids = guilds
+        .iter()
+        .map(|guild| guild.id.clone())
+        .collect::<Vec<_>>();
+    let presence = bot_presence_at(client, base, discord_token, &ids).await;
     let mut installed = Vec::with_capacity(guilds.len());
+    let mut unknown = Vec::new();
     for guild in guilds {
-        if fetch_bot_guild_by_id(client, discord_token, &guild.id)
-            .await?
-            .is_some()
-        {
-            installed.push(guild);
+        match presence.get(&guild.id) {
+            Some(BotPresence::Present(_)) => installed.push(guild),
+            Some(BotPresence::Absent) => {}
+            Some(BotPresence::Unknown) | None => unknown.push(guild),
         }
     }
+    if !unknown.is_empty() {
+        // Counts only: guild ids and names stay out of the logs.
+        tracing::warn!(
+            unknown = unknown.len(),
+            "Discord bot presence unknown for some guilds"
+        );
+        if installed.is_empty() {
+            return Err(client_error(
+                StatusCode::BAD_GATEWAY,
+                "discord_bot_guild_unavailable",
+            ));
+        }
+    }
+    installed.extend(unknown);
     Ok(installed)
+}
+
+/// `GET /api/guilds` rows, in the session's order. A guild whose presence is
+/// uncertain keeps the name saved at login and reports `botPresent: null`,
+/// meaning "not confirmed now", not "absent".
+async fn installed_guilds_at(
+    base: &str,
+    discord_token: &str,
+    managed: &[SessionGuildRecord],
+) -> Result<Vec<serde_json::Value>, (StatusCode, Json<ApiError>)> {
+    if managed.is_empty() {
+        return Ok(Vec::new());
+    }
+    if discord_token.len() < 20 {
+        return Err(client_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "discord_bot_unavailable",
+        ));
+    }
+    let client = Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+        .map_err(|_| client_error(StatusCode::SERVICE_UNAVAILABLE, "discord_unavailable"))?;
+    let ids = managed
+        .iter()
+        .map(|guild| guild.guild_id.clone())
+        .collect::<Vec<_>>();
+    let presence = bot_presence_at(&client, base, discord_token, &ids).await;
+    Ok(managed
+        .iter()
+        .filter_map(|guild| match presence.get(&guild.guild_id) {
+            Some(BotPresence::Present(bot_guild)) => {
+                let icon_url = bot_guild.icon.as_deref().map(|icon| {
+                    format!(
+                        "https://cdn.discordapp.com/icons/{}/{icon}.png?size=64",
+                        bot_guild.id
+                    )
+                });
+                Some(serde_json::json!({
+                    "id": bot_guild.id,
+                    "name": bot_guild.name,
+                    "iconUrl": icon_url,
+                    "canManage": true,
+                    "botPresent": true
+                }))
+            }
+            Some(BotPresence::Absent) => None,
+            Some(BotPresence::Unknown) | None => Some(serde_json::json!({
+                "id": guild.guild_id,
+                "name": guild.name,
+                "iconUrl": null,
+                "canManage": true,
+                "botPresent": null
+            })),
+        })
+        .collect())
 }
 
 fn manageable_guilds(guilds: Vec<DiscordGuild>) -> Vec<DiscordGuild> {
@@ -5152,33 +5302,24 @@ async fn guilds(
         .store
         .session_guilds(claims.session_id)
         .map_err(|_| client_error(StatusCode::INTERNAL_SERVER_ERROR, "store_error"))?;
-    let client = Client::new();
-    let mut installed = Vec::new();
-    for guild in managed_guilds {
-        if let Some(bot_guild) =
-            fetch_bot_guild_by_id(&client, &state.discord_token, &guild.guild_id).await?
-        {
-            let icon_url = bot_guild.icon.as_deref().map(|icon| {
-                format!(
-                    "https://cdn.discordapp.com/icons/{}/{icon}.png?size=64",
-                    bot_guild.id
-                )
-            });
-            installed.push(serde_json::json!({
-                "id": bot_guild.id,
-                "name": bot_guild.name,
-                "iconUrl": icon_url,
-                "canManage": true,
-                "botPresent": true
-            }));
-        }
-    }
+    let installed =
+        installed_guilds_at(DISCORD_API_BASE, &state.discord_token, &managed_guilds).await?;
     Ok(Json(serde_json::json!({
         "guilds": installed
     })))
 }
 
 const DISCORD_API_BASE: &str = "https://discord.com/api/v10";
+
+/// Discord REST base for the Quick Setup/role panel helpers. Tests point it
+/// at a local mock through `discord_channel_tests::TEST_BASE`.
+fn discord_api_base() -> String {
+    #[cfg(test)]
+    if let Ok(base) = discord_channel_tests::TEST_BASE.try_with(Clone::clone) {
+        return base;
+    }
+    DISCORD_API_BASE.to_owned()
+}
 
 #[derive(Debug, Default, Clone)]
 struct DiscordGuildSnapshot {
@@ -6370,6 +6511,19 @@ async fn generic_feature_preflight_with_import(
             "warning",
         );
     }
+    if request.enabled
+        && key == "community.role_panels"
+        && !snapshot.channels_ready
+        && !configured_channels.is_empty()
+    {
+        add_dependency_issue(
+            &mut issues,
+            "discord_context".into(),
+            "discord_channels_unavailable",
+            "Refresh the Discord context: the role panel channel could not be checked.".into(),
+            "error",
+        );
+    }
 
     let error_count = issues
         .iter()
@@ -6771,7 +6925,8 @@ async fn discord_create_channel(
         .timeout(std::time::Duration::from_secs(8))
         .build()
         .unwrap_or_else(|_| Client::new());
-    let response = client.post(format!("https://discord.com/api/v10/guilds/{guild_id}/channels"))
+    let base = discord_api_base();
+    let response = client.post(format!("{base}/guilds/{guild_id}/channels"))
         .header(header::AUTHORIZATION, format!("Bot {}", state.discord_token))
         .json(&serde_json::json!({"name": if safe_name.is_empty() { "vozen-setup" } else { &safe_name }, "type": 0, "reason": "Vozen Quick Setup"}))
         .send().await.map_err(|_| client_error(StatusCode::BAD_GATEWAY, "discord_unreachable"))?;
@@ -6801,10 +6956,11 @@ async fn discord_find_resource(
     if state.discord_token.len() < 20 {
         return None;
     }
+    let base = discord_api_base();
     let endpoint = if resource == "role" {
-        format!("https://discord.com/api/v10/guilds/{guild_id}/roles")
+        format!("{base}/guilds/{guild_id}/roles")
     } else {
-        format!("https://discord.com/api/v10/guilds/{guild_id}/channels")
+        format!("{base}/guilds/{guild_id}/channels")
     };
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(8))
@@ -6854,7 +7010,8 @@ async fn discord_create_role(
         .timeout(std::time::Duration::from_secs(8))
         .build()
         .unwrap_or_else(|_| Client::new());
-    let response = client.post(format!("https://discord.com/api/v10/guilds/{guild_id}/roles"))
+    let base = discord_api_base();
+    let response = client.post(format!("{base}/guilds/{guild_id}/roles"))
         .header(header::AUTHORIZATION, format!("Bot {}", state.discord_token))
         .json(&serde_json::json!({"name": safe_name, "permissions": "0", "mentionable": false, "reason": "Vozen Quick Setup"}))
         .send().await.map_err(|_| client_error(StatusCode::BAD_GATEWAY, "discord_unreachable"))?;
@@ -6910,6 +7067,10 @@ async fn discord_publish_role_panel(
         return Ok(None);
     }
     require_role_offers(state, guild_id, publisher_id, &role_ids).await?;
+    // Every caller (create, update, repair, Quick Setup) posts here: bind the
+    // destination to the session guild with a fresh Discord read, even when the
+    // preflight snapshot was unavailable or skipped.
+    require_subscription_channel(state, guild_id, channel_id).await?;
     if reuse_existing
         && state
             .store
@@ -6954,10 +7115,9 @@ async fn discord_publish_role_panel(
         .timeout(std::time::Duration::from_secs(8))
         .build()
         .unwrap_or_else(|_| Client::new());
+    let base = discord_api_base();
     let role_values = match client
-        .get(format!(
-            "https://discord.com/api/v10/guilds/{guild_id}/roles"
-        ))
+        .get(format!("{base}/guilds/{guild_id}/roles"))
         .header(
             header::AUTHORIZATION,
             format!("Bot {}", state.discord_token),
@@ -6981,9 +7141,7 @@ async fn discord_publish_role_panel(
         })).collect::<Vec<_>>()
     }]);
     let response = client
-        .post(format!(
-            "https://discord.com/api/v10/channels/{channel_id}/messages"
-        ))
+        .post(format!("{base}/channels/{channel_id}/messages"))
         .header(
             header::AUTHORIZATION,
             format!("Bot {}", state.discord_token),
@@ -7135,9 +7293,10 @@ async fn discord_delete_role_panel(
         .timeout(std::time::Duration::from_secs(8))
         .build()
         .unwrap_or_else(|_| Client::new());
+    let base = discord_api_base();
     let response = client
         .delete(format!(
-            "{DISCORD_API_BASE}/channels/{channel_id}/messages/{message_id}"
+            "{base}/channels/{channel_id}/messages/{message_id}"
         ))
         .header(
             header::AUTHORIZATION,
@@ -7482,6 +7641,7 @@ fn publish_quick_setup_feature(
     key: &str,
     enabled: bool,
     config: &serde_json::Value,
+    expected_revision: u64,
 ) -> Result<(), (StatusCode, Json<ApiError>)> {
     let enabled_value = if enabled { "true" } else { "false" };
     let mut projections = vec![
@@ -7489,19 +7649,24 @@ fn publish_quick_setup_feature(
         (feature_config_key(key), config.to_string()),
     ];
     projections.extend(runtime_projection_pairs(key, config));
-    state
-        .store
-        .publish_feature_setting(
-            guild_id,
-            key,
-            enabled,
-            &config.to_string(),
-            None,
-            user_id,
-            &projections,
-        )
-        .map_err(|_| client_error(StatusCode::INTERNAL_SERVER_ERROR, "store_error"))?;
-    Ok(())
+    match state.store.publish_feature_setting(
+        guild_id,
+        key,
+        enabled,
+        &config.to_string(),
+        Some(expected_revision),
+        user_id,
+        &projections,
+    ) {
+        Ok(_) => Ok(()),
+        Err(error) if error.to_string().starts_with("feature_revision_conflict:") => Err(
+            client_error(StatusCode::CONFLICT, "feature_revision_conflict"),
+        ),
+        Err(_) => Err(client_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "store_error",
+        )),
+    }
 }
 
 async fn quick_setup(
@@ -7548,17 +7713,79 @@ async fn quick_setup_step(
             "invalid_quick_setup_status",
         ));
     }
-    if step == "roles"
-        && update.status == "applied"
-        && update.enabled
-        && state
+    // An applied step writes a feature revision even when it is disabled, so
+    // it gets the same shape and size limits as a normal feature save.
+    if update.status == "applied"
+        && (step == "welcome" || step == "roles")
+        && (!update.config.is_object() || update.config.to_string().len() > 64 * 1024)
+    {
+        return Err(client_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_feature_config",
+        ));
+    }
+    if update.status == "applied"
+        && step == "welcome"
+        && validate_feature_config("support.welcome", &update.config)
+            .iter()
+            .any(|issue| issue.severity == "error")
+    {
+        return Err(client_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_feature_config",
+        ));
+    }
+    // One step at a time per guild, so concurrent requests cannot create
+    // duplicate channels or roles.
+    let guild_lock = QUICK_SETUP_LOCKS.for_guild(&claims.guild_id);
+    let _guard = guild_lock.lock().await;
+    // Feature revision observed before any Discord write: an edit saved while
+    // this step runs turns the publish below into a conflict.
+    let expected_revision = match step.as_str() {
+        "welcome" => Some("support.welcome"),
+        "roles" => Some("community.role_panels"),
+        _ => None,
+    }
+    .map(|key| {
+        state
+            .store
+            .get_feature_setting(&claims.guild_id, key)
+            .map(|record| record.map(|record| record.revision).unwrap_or(0))
+            .map_err(|_| client_error(StatusCode::INTERNAL_SERVER_ERROR, "store_error"))
+    })
+    .transpose()?
+    .unwrap_or(0);
+    // Skipped or disabled steps never create, reuse or publish anything in
+    // Discord.
+    let touches_discord = update.status == "applied" && update.enabled;
+    if touches_discord && step == "roles" {
+        if state
             .guild_authorization
             .permissions(&state, &claims)
             .await?
             & ((1 << 28) | 8)
             == 0
+        {
+            return Err(client_error(StatusCode::FORBIDDEN, "role_not_offerable"));
+        }
+        require_feature_premium(&state, &claims, "community.role_panels").await?;
+    }
+    if touches_discord
+        && step == "welcome"
+        && let Some(auto_role) = update
+            .config
+            .get("autoRole")
+            .and_then(serde_json::Value::as_str)
+            .filter(|role| !role.is_empty())
     {
-        return Err(client_error(StatusCode::FORBIDDEN, "role_not_offerable"));
+        // The bot gives this role to every member who joins.
+        require_role_offers(
+            &state,
+            &claims.guild_id,
+            &claims.user_id,
+            &[auto_role.to_owned()],
+        )
+        .await?;
     }
     let mut value = read_quick_setup(&state, &claims.guild_id);
     let revision = value["revision"].as_u64().unwrap_or(0);
@@ -7583,7 +7810,36 @@ async fn quick_setup_step(
     } else {
         "channel"
     };
-    if create_channel
+    let role_names = if step == "roles" && touches_discord {
+        update
+            .config
+            .get("roleNames")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .take(5)
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    // Roles, first pass: find the existing ones and check the requester may
+    // hand them out before anything (channel or role) is created.
+    let mut found_roles = Vec::with_capacity(role_names.len());
+    for role_name in &role_names {
+        found_roles.push(discord_find_resource(&state, &claims.guild_id, role_name, "role").await);
+    }
+    let existing_roles = found_roles
+        .iter()
+        .flatten()
+        .map(|(id, _)| id.clone())
+        .collect::<Vec<_>>();
+    if !existing_roles.is_empty() {
+        require_role_offers(&state, &claims.guild_id, &claims.user_id, &existing_roles).await?;
+    }
+    if touches_discord
+        && create_channel
         && update
             .config
             .get(channel_key)
@@ -7600,6 +7856,18 @@ async fn quick_setup_step(
         {
             (id, name, "reused")
         } else {
+            // Creating a channel needs the requester's own Manage Channels
+            // (or Administrator), not only the bot's.
+            let actor = state
+                .guild_authorization
+                .permissions(&state, &claims)
+                .await?;
+            if actor & (8 | 16) == 0 {
+                return Err(client_error(
+                    StatusCode::FORBIDDEN,
+                    "quick_setup_manage_channels_required",
+                ));
+            }
             let (id, name) = discord_create_channel(&state, &claims.guild_id, suggested).await?;
             (id, name, "created")
         };
@@ -7607,23 +7875,23 @@ async fn quick_setup_step(
         created_resources.push(serde_json::json!({"type": "channel", "name": format!("#{name}"), "id": id, "state": resource_state}));
     }
     if step == "roles" {
-        let role_names = update
-            .config
-            .get("roleNames")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("")
-            .split(',')
-            .map(str::trim)
-            .filter(|name| !name.is_empty())
-            .take(5);
+        // Second pass, in roleNames order: reuse or create. A name repeated in
+        // the request reuses the role created for its first occurrence. Only
+        // ids resolved here are published; a client-sent roleIds never is, and
+        // a skipped or disabled step publishes none.
         let mut role_ids = Vec::new();
-        for role_name in role_names {
-            let (id, name, resource_state) = if let Some((id, name)) =
-                discord_find_resource(&state, &claims.guild_id, role_name, "role").await
-            {
+        let mut created: Vec<(&str, String, String)> = Vec::new();
+        for (role_name, found) in role_names.iter().copied().zip(found_roles) {
+            let (id, name, resource_state) = if let Some((id, name)) = found {
                 (id, name, "reused")
+            } else if let Some((_, id, name)) = created
+                .iter()
+                .find(|(requested, _, _)| requested.eq_ignore_ascii_case(role_name))
+            {
+                (id.clone(), name.clone(), "reused")
             } else {
                 let (id, name) = discord_create_role(&state, &claims.guild_id, role_name).await?;
+                created.push((role_name, id.clone(), name.clone()));
                 (id, name, "created")
             };
             role_ids.push(serde_json::json!(id));
@@ -7660,6 +7928,7 @@ async fn quick_setup_step(
                 "support.welcome",
                 update.enabled,
                 &normalized_config,
+                expected_revision,
             )?,
             "roles" => {
                 publish_quick_setup_feature(
@@ -7669,6 +7938,7 @@ async fn quick_setup_step(
                     "community.role_panels",
                     update.enabled,
                     &normalized_config,
+                    expected_revision,
                 )?;
                 if update.enabled
                     && let Some(message_id) = discord_publish_role_panel(
@@ -7744,7 +8014,8 @@ async fn switch_session_guild(
     headers: HeaderMap,
     Json(request): Json<SwitchGuildRequest>,
 ) -> Result<Response, (StatusCode, Json<ApiError>)> {
-    let current = require_mutation_auth(&state, &headers).await?;
+    // Switching must work from any tab, even one still showing an older guild.
+    let current = require_mutation_auth_any_guild(&state, &headers).await?;
     let managed = state
         .store
         .session_guilds(current.session_id)
@@ -9421,7 +9692,19 @@ async fn update_feature_detail(
     State(state): State<Arc<ApiState>>,
     headers: HeaderMap,
     Path(key): Path<String>,
-    Json(mut update): Json<FeatureDetailUpdate>,
+    Json(update): Json<FeatureDetailUpdate>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
+    update_feature_detail_inner(state, headers, key, update, false).await
+}
+
+/// The one publish path shared by save, toggle, repair and rollback. It takes
+/// the per-guild save locks itself, so callers must not hold them.
+async fn update_feature_detail_inner(
+    state: Arc<ApiState>,
+    headers: HeaderMap,
+    key: String,
+    mut update: FeatureDetailUpdate,
+    recover_ticket_panel: bool,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
     let claims = require_mutation_auth(&state, &headers).await?;
     if key == "community.levels"
@@ -9429,13 +9712,15 @@ async fn update_feature_detail(
     {
         config.insert("bannerEnabled".into(), serde_json::Value::Bool(true));
     }
+    let ticket_lock = TICKET_PANEL_SAVE_LOCKS.for_guild(&claims.guild_id);
     let _ticket_save_guard = if key == "support.tickets" {
-        Some(TICKET_PANEL_SAVE_LOCK.lock().await)
+        Some(ticket_lock.lock().await)
     } else {
         None
     };
+    let nickname_lock = NICKNAME_SAVE_LOCKS.for_guild(&claims.guild_id);
     let _nickname_save_guard = if key == "management.nickname" {
-        Some(NICKNAME_SAVE_LOCK.lock().await)
+        Some(nickname_lock.lock().await)
     } else {
         None
     };
@@ -9716,12 +10001,15 @@ async fn update_feature_detail(
             &claims.guild_id,
             &update.config,
             quota_limit(&plan, "panels"),
-            DISCORD_API_BASE,
+            &discord_api_base(),
+            recover_ticket_panel,
         )
         .await
         {
             Ok(result) => result,
-            Err(_) => serde_json::json!({"applied": false, "code": "ticket_panel_publish_failed"}),
+            Err(error) => {
+                serde_json::json!({"applied": false, "code": ticket_panel::error_code(&error)})
+            }
         }
     } else {
         serde_json::json!(null)
@@ -10184,218 +10472,29 @@ async fn feature_rollback(
     }
     let config: serde_json::Value = serde_json::from_str(&previous.config_json)
         .map_err(|_| client_error(StatusCode::INTERNAL_SERVER_ERROR, "invalid_stored_config"))?;
-    // Rollback is a mutation just like a fresh publish: re-run the same
-    // guild-scoped preflight before touching either the feature setting or a
-    // provider subscription. This prevents a historical revision from
-    // bypassing current permissions/hierarchy checks.
-    let preflight = if key == "management.nickname" {
-        nickname_preflight_for_claims(
-            &state,
-            &claims,
-            FeaturePreflightRequest {
-                config: config.clone(),
-                enabled: previous.enabled,
-            },
-        )
-        .await?
-    } else if matches!(key.as_str(), "protection.antispam" | "protection.antiscam") {
-        preflight(
-            State(state.clone()),
-            headers.clone(),
-            Json(PreflightRequest {
-                operation: format!("{key}.rollback"),
-                config: config.clone(),
-                enabled: previous.enabled,
-            }),
-        )
-        .await?
-    } else {
-        generic_feature_preflight(
-            State(state.clone()),
-            headers.clone(),
-            key.clone(),
-            FeaturePreflightRequest {
-                config: config.clone(),
-                enabled: previous.enabled,
-            },
-        )
-        .await?
-    };
-    if !preflight
-        .0
-        .get("ok")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
-    {
-        return Err(client_error(
-            StatusCode::PRECONDITION_FAILED,
-            "feature_preflight_failed",
-        ));
+    // Rollback is a publish of an older revision: it goes through the same
+    // path as a save, with its locks, preflight, validation, provider
+    // subscriptions, nickname and ticket panel delivery.
+    let response = update_feature_detail_inner(
+        state,
+        headers,
+        key,
+        FeatureDetailUpdate {
+            enabled: previous.enabled,
+            config,
+            expected_revision: request.expected_revision,
+        },
+        false,
+    )
+    .await?;
+    let mut body = response.0;
+    if let Some(object) = body.as_object_mut() {
+        object.insert(
+            "rolledBackFrom".to_string(),
+            serde_json::Value::from(request.revision),
+        );
     }
-    let issues = validate_feature_config(&key, &config);
-    if previous.enabled && issues.iter().any(|issue| issue.severity == "error") {
-        return Err(client_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_stored_config",
-        ));
-    }
-    // Provider revisions need their subscription projection restored in the
-    // same transaction as feature_settings/feature_revisions. Reusing the
-    // normal preparation path also validates the historical source and
-    // ensures the provider is still reachable before the transaction starts.
-    let youtube_subscription = if key == "social.youtube" {
-        prepare_youtube_feature(&state, &claims, &config, previous.enabled).await?
-    } else {
-        None
-    };
-    let rss_subscription = if matches!(key.as_str(), "social.rss" | "social.podcasts") {
-        prepare_rss_feature(&state, &claims, &config, previous.enabled).await?
-    } else {
-        None
-    };
-    let twitch_subscription = if key == "social.twitch" {
-        prepare_twitch_feature(&state, &claims, &config, previous.enabled).await?
-    } else {
-        None
-    };
-    let bluesky_subscription = if key == "social.bluesky" {
-        prepare_bluesky_feature(&state, &claims, &config, previous.enabled).await?
-    } else {
-        None
-    };
-    let tiktok_subscription = if key == "social.tiktok" {
-        prepare_tiktok_feature(&state, &claims, &config, previous.enabled).await?
-    } else {
-        None
-    };
-    let instagram_subscription = if key == "social.instagram" {
-        prepare_instagram_feature(&state, &claims, &config, previous.enabled).await?
-    } else {
-        None
-    };
-    let kick_subscription = if key == "social.kick" {
-        prepare_kick_feature(&state, &claims, &config, previous.enabled).await?
-    } else {
-        None
-    };
-    let mut projections = vec![
-        (
-            feature_key(&key),
-            if previous.enabled { "true" } else { "false" }.into(),
-        ),
-        (feature_config_key(&key), previous.config_json.clone()),
-    ];
-    projections.extend(runtime_projection_pairs(&key, &config));
-    if let Some(runtime_key) = runtime_feature_key(&key) {
-        projections.push((
-            runtime_key.to_string(),
-            if previous.enabled { "true" } else { "false" }.into(),
-        ));
-    }
-    let publish_result = if key == "social.youtube" {
-        state.store.publish_youtube_feature_setting(
-            &claims.guild_id,
-            &key,
-            previous.enabled,
-            &previous.config_json,
-            request.expected_revision,
-            &claims.user_id,
-            &projections,
-            youtube_subscription.as_ref(),
-        )
-    } else if matches!(key.as_str(), "social.rss" | "social.podcasts") {
-        state.store.publish_rss_feature_setting(
-            &claims.guild_id,
-            &key,
-            previous.enabled,
-            &previous.config_json,
-            request.expected_revision,
-            &claims.user_id,
-            &projections,
-            rss_subscription.as_ref(),
-        )
-    } else if key == "social.twitch" {
-        state.store.publish_twitch_feature_setting(
-            &claims.guild_id,
-            &key,
-            previous.enabled,
-            &previous.config_json,
-            request.expected_revision,
-            &claims.user_id,
-            &projections,
-            twitch_subscription.as_ref(),
-        )
-    } else if key == "social.bluesky" {
-        state.store.publish_bluesky_feature_setting(
-            &claims.guild_id,
-            &key,
-            previous.enabled,
-            &previous.config_json,
-            request.expected_revision,
-            &claims.user_id,
-            &projections,
-            bluesky_subscription.as_ref(),
-        )
-    } else if key == "social.tiktok" {
-        state.store.publish_tiktok_feature_setting(
-            &claims.guild_id,
-            &key,
-            previous.enabled,
-            &previous.config_json,
-            request.expected_revision,
-            &claims.user_id,
-            &projections,
-            tiktok_subscription.as_ref(),
-        )
-    } else if key == "social.instagram" {
-        state.store.publish_instagram_feature_setting(
-            &claims.guild_id,
-            &key,
-            previous.enabled,
-            &previous.config_json,
-            request.expected_revision,
-            &claims.user_id,
-            &projections,
-            instagram_subscription.as_ref(),
-        )
-    } else if key == "social.kick" {
-        state.store.publish_kick_feature_setting(
-            &claims.guild_id,
-            &key,
-            previous.enabled,
-            &previous.config_json,
-            request.expected_revision,
-            &claims.user_id,
-            &projections,
-            kick_subscription.as_ref(),
-        )
-    } else {
-        state.store.publish_feature_setting(
-            &claims.guild_id,
-            &key,
-            previous.enabled,
-            &previous.config_json,
-            request.expected_revision,
-            &claims.user_id,
-            &projections,
-        )
-    };
-    let record = publish_result.map_err(|error| {
-        if error.to_string().starts_with("feature_revision_conflict:") {
-            client_error(StatusCode::CONFLICT, "feature_revision_conflict")
-        } else {
-            client_error(StatusCode::INTERNAL_SERVER_ERROR, "store_error")
-        }
-    })?;
-    Ok(Json(serde_json::json!({
-        "guildId": claims.guild_id,
-        "key": key,
-        "enabled": record.enabled,
-        "config": config,
-        "revision": record.revision,
-        "rolledBackFrom": request.revision,
-        "issues": issues,
-    })))
+    Ok(Json(body))
 }
 
 /// Rebuild the runtime projection (and any provider subscription) from the
@@ -10403,7 +10502,8 @@ async fn feature_rollback(
 /// through the normal update path so it gets the same authentication,
 /// validation, preflight, revision checks and atomic provider handling as a
 /// regular publish.  A successful repair therefore creates a new revision
-/// instead of mutating history in place.
+/// instead of mutating history in place.  It is also the only path allowed to
+/// resolve an expired unknown ticket panel delivery by reading the channel.
 async fn feature_repair(
     State(state): State<Arc<ApiState>>,
     headers: HeaderMap,
@@ -10422,15 +10522,16 @@ async fn feature_repair(
     };
     let config = serde_json::from_str(&current.config_json)
         .map_err(|_| client_error(StatusCode::INTERNAL_SERVER_ERROR, "invalid_stored_config"))?;
-    let response = update_feature_detail(
-        State(state),
+    let response = update_feature_detail_inner(
+        state,
         headers,
-        Path(key),
-        Json(FeatureDetailUpdate {
+        key,
+        FeatureDetailUpdate {
             enabled: current.enabled,
             config,
             expected_revision: Some(current.revision),
-        }),
+        },
+        true,
     )
     .await?;
     let mut body = response.0;
@@ -12076,11 +12177,20 @@ async fn require_auth(
     Ok(claims)
 }
 
+async fn require_mutation_auth(
+    state: &ApiState,
+    headers: &HeaderMap,
+) -> Result<SessionClaims, (StatusCode, Json<ApiError>)> {
+    let claims = require_mutation_auth_any_guild(state, headers).await?;
+    require_expected_guild(headers, &claims)?;
+    Ok(claims)
+}
+
 /// State-changing browser requests must prove they came from the configured
 /// panel origin when authentication is carried by the ambient session cookie.
 /// API clients using an explicit Bearer token remain usable without an Origin
 /// header because browsers do not attach that credential automatically.
-async fn require_mutation_auth(
+async fn require_mutation_auth_any_guild(
     state: &ApiState,
     headers: &HeaderMap,
 ) -> Result<SessionClaims, (StatusCode, Json<ApiError>)> {
@@ -12091,6 +12201,23 @@ async fn require_mutation_auth(
     let claims = require_auth(state, headers).await?;
     require_cookie_origin(state, headers)?;
     Ok(claims)
+}
+
+/// Panel tabs send the guild they display. The session cookie is shared by
+/// every tab, so a tab left on another server must not write here.
+/// Optional for older clients and API callers.
+fn require_expected_guild(
+    headers: &HeaderMap,
+    claims: &SessionClaims,
+) -> Result<(), (StatusCode, Json<ApiError>)> {
+    let mut values = headers.get_all(EXPECTED_GUILD_HEADER).iter();
+    let Some(value) = values.next() else {
+        return Ok(());
+    };
+    if values.next().is_some() || value.to_str().ok() != Some(claims.guild_id.as_str()) {
+        return Err(client_error(StatusCode::CONFLICT, "guild_changed"));
+    }
+    Ok(())
 }
 
 fn require_cookie_origin(
@@ -12964,6 +13091,19 @@ mod tests {
         let mut entitlement = helper_contracts::EntitlementSnapshot::free(session.user_id.clone());
         entitlement.plan = Plan::Premium { guild_limit: 1 };
         store.save_entitlement(&entitlement).unwrap();
+    }
+
+    #[test]
+    fn guild_locks_isolate_guilds_and_release_entries() {
+        static LOCKS: GuildLocks = GuildLocks::new();
+        let first = LOCKS.for_guild("g1");
+        assert!(Arc::ptr_eq(&first, &LOCKS.for_guild("g1")));
+        let guard = first.try_lock().unwrap();
+        assert!(LOCKS.for_guild("g2").try_lock().is_ok());
+        drop(guard);
+        drop(first);
+        let _third = LOCKS.for_guild("g3");
+        assert_eq!(LOCKS.0.lock().unwrap().len(), 1);
     }
 
     #[test]
@@ -13904,6 +14044,182 @@ mod tests {
         server.abort();
     }
 
+    const G1: &str = "100000000000000001";
+    const G2: &str = "100000000000000002";
+    const G3: &str = "100000000000000003";
+    const G4: &str = "100000000000000004";
+    const G5: &str = "100000000000000005";
+    const PRESENCE_TOKEN: &str = "fixture-token-with-20-chars";
+
+    /// Discord stand-in for the bot's `/guilds/{id}` lookups: G1 present,
+    /// G2 missing, G3 forbidden, G4 always failing, G5 rate limited once.
+    async fn presence_mock() -> (String, tokio::task::JoinHandle<()>) {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let app = Router::new().route(
+            "/guilds/{guild}",
+            get(move |Path(guild): Path<String>| {
+                let calls = calls.clone();
+                async move {
+                    match guild.as_str() {
+                        G1 => (
+                            StatusCode::OK,
+                            Json(serde_json::json!({"id":G1,"name":"Um","icon":"abc"})),
+                        )
+                            .into_response(),
+                        G2 => (StatusCode::NOT_FOUND, Json(serde_json::json!({}))).into_response(),
+                        G3 => (StatusCode::FORBIDDEN, Json(serde_json::json!({}))).into_response(),
+                        G5 if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 => (
+                            StatusCode::TOO_MANY_REQUESTS,
+                            [(header::RETRY_AFTER, "0")],
+                            Json(serde_json::json!({"retry_after":0})),
+                        )
+                            .into_response(),
+                        G5 => (
+                            StatusCode::OK,
+                            Json(serde_json::json!({"id":G5,"name":"Cinco"})),
+                        )
+                            .into_response(),
+                        _ => (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({})),
+                        )
+                            .into_response(),
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (base, server)
+    }
+
+    #[tokio::test]
+    async fn bot_presence_separates_present_absent_and_unknown() {
+        let (base, server) = presence_mock().await;
+        let ids = [G1, G2, G3, G4, G5].map(String::from);
+        let presence = bot_presence_at(&Client::new(), &base, PRESENCE_TOKEN, &ids).await;
+        assert_eq!(presence.len(), 5);
+        assert!(matches!(presence[G1], BotPresence::Present(_)));
+        assert!(matches!(presence[G5], BotPresence::Present(_)));
+        assert!(matches!(presence[G2], BotPresence::Absent));
+        assert!(matches!(presence[G3], BotPresence::Absent));
+        assert!(matches!(presence[G4], BotPresence::Unknown));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn bot_presence_stops_waiting_after_the_budget() {
+        let app = Router::new().fallback(get(|| async {
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            Json(serde_json::json!({}))
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let ids = [G1, G2, G3, G4, G5].map(String::from);
+        let presence = tokio::time::timeout(
+            std::time::Duration::from_secs(6),
+            bot_presence_at(&Client::new(), &base, PRESENCE_TOKEN, &ids),
+        )
+        .await
+        .expect("presence lookups must stop at the budget");
+        assert_eq!(presence.len(), 5);
+        assert!(
+            presence
+                .values()
+                .all(|presence| matches!(presence, BotPresence::Unknown))
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn login_guild_filter_keeps_unknown_and_drops_absent() {
+        let (base, server) = presence_mock().await;
+        let g = |id: &str| DiscordGuild {
+            id: id.into(),
+            name: format!("n{id}"),
+            permissions: Some("8".into()),
+        };
+        let kept = filter_guilds_with_bot_at(
+            &Client::new(),
+            &base,
+            PRESENCE_TOKEN,
+            vec![g(G4), g(G2), g(G1)],
+        )
+        .await
+        .expect("a present guild keeps the login alive");
+        assert_eq!(
+            kept.iter()
+                .map(|guild| guild.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![G1, G4]
+        );
+        for guilds in [vec![g(G4)], vec![g(G2), g(G4)]] {
+            let Err((status, body)) =
+                filter_guilds_with_bot_at(&Client::new(), &base, PRESENCE_TOKEN, guilds).await
+            else {
+                panic!("no confirmed guild must fail the login");
+            };
+            assert_eq!(status, StatusCode::BAD_GATEWAY);
+            assert_eq!(body.0.code, "discord_bot_guild_unavailable");
+        }
+        let Ok(empty) = filter_guilds_with_bot_at(&Client::new(), &base, "short", vec![]).await
+        else {
+            panic!("an account without managed guilds needs no bot lookup");
+        };
+        assert!(empty.is_empty());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn installed_guilds_mark_unknown_and_drop_absent() {
+        let (base, server) = presence_mock().await;
+        let records = [
+            (G1, "Registo um"),
+            (G2, "Registo dois"),
+            (G4, "Registo quatro"),
+        ]
+        .map(|(guild_id, name)| SessionGuildRecord {
+            guild_id: guild_id.into(),
+            name: name.into(),
+            permissions: Some("8".into()),
+        });
+        let Ok(guilds) = installed_guilds_at(&base, PRESENCE_TOKEN, &records).await else {
+            panic!("an uncertain guild must not fail the guild list");
+        };
+        assert_eq!(guilds.len(), 2);
+        let by_id = |id: &str| {
+            guilds
+                .iter()
+                .find(|guild| guild["id"] == id)
+                .cloned()
+                .unwrap_or_else(|| panic!("{id} missing from the guild list"))
+        };
+        assert_eq!(
+            by_id(G1),
+            serde_json::json!({
+                "id": G1,
+                "name": "Um",
+                "iconUrl": "https://cdn.discordapp.com/icons/100000000000000001/abc.png?size=64",
+                "canManage": true,
+                "botPresent": true
+            })
+        );
+        assert_eq!(
+            by_id(G4),
+            serde_json::json!({
+                "id": G4,
+                "name": "Registo quatro",
+                "iconUrl": null,
+                "canManage": true,
+                "botPresent": null
+            })
+        );
+        assert!(guilds.iter().all(|guild| guild["id"] != G2));
+        server.abort();
+    }
+
     #[tokio::test]
     async fn leaderboard_preview_requires_a_valid_session() {
         for credential in [None, Some("Bearer invalid")] {
@@ -14170,6 +14486,65 @@ mod tests {
                 .revision,
             2
         );
+    }
+
+    #[tokio::test]
+    async fn feature_rollback_goes_through_the_publish_path() {
+        let store = Store::open(":memory:").unwrap();
+        let session = claims("guild-a");
+        let token = sign_session(&session, "test-session-secret-with-at-least-32-bytes");
+        store.save_session(&session).unwrap();
+        store
+            .replace_session_guilds(
+                session.session_id,
+                &[("guild-a".into(), "Alpha".into(), Some("32".into()))],
+            )
+            .unwrap();
+
+        for expected_revision in [1, 2] {
+            let response = router(state(store.clone()))
+                .oneshot(
+                    Request::builder()
+                        .method("PUT")
+                        .uri("/api/config/features/utility.help")
+                        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(r#"{"enabled":false,"config":{}}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                store
+                    .get_feature_setting("guild-a", "utility.help")
+                    .unwrap()
+                    .unwrap()
+                    .revision,
+                expected_revision
+            );
+        }
+
+        let response = router(state(store.clone()))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/config/features/utility.help/rollback")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"revision":1}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 1_000_000).await.unwrap())
+                .unwrap();
+        assert_eq!(body["rolledBackFrom"], 1);
+        assert_eq!(body["revision"], 3);
+        // Only the shared publish path reports what it applied in Discord.
+        assert!(body.get("discordApply").is_some());
     }
 
     #[tokio::test]
@@ -14707,6 +15082,98 @@ mod tests {
         assert_eq!(body["guildId"], "guild-a");
     }
 
+    /// Role panel preflight against a fixed Discord snapshot (no network):
+    /// Premium session with every permission in guild `100000000000000001`.
+    async fn role_panel_preflight(channels_ready: bool) -> (StatusCode, serde_json::Value) {
+        const GUILD: &str = "100000000000000001";
+        const CHANNEL: &str = "100000000000000060";
+        let state = state(Store::open(":memory:").unwrap());
+        let now = Utc::now();
+        let session = SessionClaims {
+            session_id: Uuid::new_v4(),
+            user_id: "100000000000000002".into(),
+            guild_id: GUILD.into(),
+            issued_at: now,
+            expires_at: now + Duration::hours(1),
+            last_seen_at: now,
+        };
+        state.store.save_session(&session).unwrap();
+        state
+            .store
+            .replace_session_guilds(
+                session.session_id,
+                &[(GUILD.into(), "Test".into(), Some(u64::MAX.to_string()))],
+            )
+            .unwrap();
+        grant_premium(&state.store, &session);
+        let snapshot = DiscordGuildSnapshot {
+            channels: vec![
+                serde_json::json!({"id":CHANNEL,"guild_id":GUILD,"type":0,"permission_overwrites":[]}),
+            ],
+            roles: vec![
+                serde_json::json!({"id":GUILD,"position":0,"permissions":"0"}),
+                serde_json::json!({"id":"bot-role","position":10,"permissions":"8"}),
+            ],
+            bot_role_ids: vec!["bot-role".into()],
+            bot_user_id: Some("bot-user".into()),
+            channels_ready,
+            roles_ready: true,
+            bot_ready: true,
+            ..Default::default()
+        };
+        let token = sign_session(&session, &state.session_secret);
+        let request = serde_json::json!({"enabled":true,"config":{"channel":CHANNEL,"roleIds":[]}});
+        config_import::TEST_SNAPSHOT
+            .scope(snapshot, async move {
+                let response = router(state)
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/api/config/features/community.role_panels/preflight")
+                            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .body(Body::from(request.to_string()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let body = serde_json::from_slice(
+                    &to_bytes(response.into_body(), 1_000_000).await.unwrap(),
+                )
+                .unwrap();
+                (status, body)
+            })
+            .await
+    }
+
+    fn channel_list_issues(body: &serde_json::Value) -> Vec<serde_json::Value> {
+        body["issues"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|issue| issue["code"] == "discord_channels_unavailable")
+            .cloned()
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn role_panel_preflight_fails_when_channel_list_is_unavailable() {
+        let (status, body) = role_panel_preflight(false).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["ok"], false, "{body}");
+        let issues = channel_list_issues(&body);
+        assert_eq!(issues.len(), 1, "{body}");
+        assert_eq!(issues[0]["severity"], "error", "{body}");
+    }
+
+    #[tokio::test]
+    async fn role_panel_preflight_with_channel_list_has_no_channel_list_error() {
+        let (status, body) = role_panel_preflight(true).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(channel_list_issues(&body).is_empty(), "{body}");
+    }
+
     #[tokio::test]
     async fn enabled_feature_health_includes_live_discord_preflight() {
         let store = Store::open(":memory:").unwrap();
@@ -14788,6 +15255,143 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["guildId"], "guild-b");
         assert!(store.load_session(session.session_id).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn mutation_rejects_a_different_expected_guild() {
+        let store = Store::open(":memory:").unwrap();
+        let session = claims("guild-a");
+        let token = sign_session(&session, "test-session-secret-with-at-least-32-bytes");
+        store.save_session(&session).unwrap();
+        store
+            .replace_session_guilds(
+                session.session_id,
+                &[("guild-a".into(), "Alpha".into(), Some("32".into()))],
+            )
+            .unwrap();
+        let save = |expected_guild: Option<&str>| {
+            let mut request = Request::builder()
+                .method("PUT")
+                .uri("/api/config/features/utility.help")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .header(header::CONTENT_TYPE, "application/json");
+            if let Some(guild) = expected_guild {
+                request = request.header("x-vozen-guild", guild);
+            }
+            request
+                .body(Body::from(r#"{"enabled":false,"config":{}}"#))
+                .unwrap()
+        };
+
+        let response = router(state(store.clone()))
+            .oneshot(save(Some("guild-b")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 1_000_000).await.unwrap())
+                .unwrap();
+        assert_eq!(body["code"], "guild_changed");
+        assert!(
+            store
+                .get_feature_setting("guild-a", "utility.help")
+                .unwrap()
+                .is_none()
+        );
+
+        let response = router(state(store.clone()))
+            .oneshot(save(Some("guild-a")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            store
+                .get_feature_setting("guild-a", "utility.help")
+                .unwrap()
+                .unwrap()
+                .revision,
+            1
+        );
+
+        // Older clients and API callers send no expected guild.
+        let response = router(state(store.clone()))
+            .oneshot(save(None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            store
+                .get_feature_setting("guild-a", "utility.help")
+                .unwrap()
+                .unwrap()
+                .revision,
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn session_switch_ignores_the_expected_guild_header() {
+        let store = Store::open(":memory:").unwrap();
+        let session = claims("guild-a");
+        let token = sign_session(&session, "test-session-secret-with-at-least-32-bytes");
+        store.save_session(&session).unwrap();
+        store
+            .replace_session_guilds(
+                session.session_id,
+                &[
+                    ("guild-a".into(), "Alpha".into(), Some("32".into())),
+                    ("guild-b".into(), "Beta".into(), Some("32".into())),
+                ],
+            )
+            .unwrap();
+        let response = router(state(store.clone()))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/session/switch")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("x-vozen-guild", "guild-z")
+                    .body(Body::from(r#"{"guild_id":"guild-b"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1_000_000).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["guildId"], "guild-b");
+        assert!(store.load_session(session.session_id).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn cors_allows_the_expected_guild_header() {
+        let store = Store::open(":memory:").unwrap();
+        let mut api_state = state(store);
+        api_state.allowed_origin = Some("http://127.0.0.1:4173".into());
+        let response = router(api_state)
+            .oneshot(
+                Request::builder()
+                    .method("OPTIONS")
+                    .uri("/api/config/features/utility.help")
+                    .header(header::ORIGIN, "http://127.0.0.1:4173")
+                    .header(header::ACCESS_CONTROL_REQUEST_METHOD, "PUT")
+                    .header(
+                        header::ACCESS_CONTROL_REQUEST_HEADERS,
+                        "content-type,x-vozen-guild",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let allowed = response
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_HEADERS)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        assert!(allowed.contains("x-vozen-guild"), "{allowed}");
     }
 
     #[test]

@@ -14,5 +14,10 @@
   "r_eb4a6ce8e56d": " a meghívók nevével",
   "r_f22ae96535a7": " (csak animált)",
   "r_fe6ebea0bf5e": " · belső megjegyzés mentve",
-  "r_4aeacdd823e2": "Creator Channel: <#{0}>. Csatlakozz a saját szobád létrehozásához."
+  "r_4aeacdd823e2": "Creator Channel: <#{0}>. Csatlakozz a saját szobád létrehozásához.",
+  "r_5b2765ff3bd5": "Már 25 függő emlékeztetőd van ezen a szerveren. Várd meg, amíg az egyiket elküldjük, mielőtt újat adsz hozzá.",
+  "r_76dcd789bfcb": "A nyereményjáték nem található, még aktív, kihirdetése még folyamatban van, vagy nincs más választható résztvevő.",
+  "r_03bbc7b8b6ed": " {0} mentett szerepkör már nem létezik, ezért elvetettük.",
+  "r_db9acf706d49": "<@{0}> karanténja feloldva; {1} szerepkör visszaállítva.{2}",
+  "r_1b29f6412df3": "A karantén szerepkörei részben visszaállítva <@{0}> számára: {1} visszaállítva, {2} még függőben. A függő szerepkörök mentve vannak; ellenőrizd a jogosultságokat, és próbáld újra a /unquarantine parancsot.{3}"
 }

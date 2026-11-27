@@ -14,5 +14,10 @@
   "r_eb4a6ce8e56d": " dengan nama pengundang",
   "r_f22ae96535a7": " (hanya animasi)",
   "r_fe6ebea0bf5e": " · catatan internal disimpan",
-  "r_4aeacdd823e2": "Creator Channel: <#{0}>. Masuk untuk membuat ruangmu."
+  "r_4aeacdd823e2": "Creator Channel: <#{0}>. Masuk untuk membuat ruangmu.",
+  "r_5b2765ff3bd5": "Anda sudah memiliki 25 pengingat yang tertunda di server ini. Tunggu salah satunya terkirim sebelum menambahkan yang lain.",
+  "r_76dcd789bfcb": "Undian tidak ditemukan, masih aktif, masih diumumkan, atau tidak ada peserta lain yang bisa dipilih.",
+  "r_03bbc7b8b6ed": " {0} peran tersimpan tidak lagi ada dan telah dibuang.",
+  "r_db9acf706d49": "Karantina dicabut dari <@{0}>; {1} peran dipulihkan.{2}",
+  "r_1b29f6412df3": "Peran sebelum karantina dipulihkan sebagian untuk <@{0}>: {1} peran dipulihkan, {2} masih tertunda. Peran tertunda disimpan; periksa izin dan coba lagi /unquarantine.{3}"
 }

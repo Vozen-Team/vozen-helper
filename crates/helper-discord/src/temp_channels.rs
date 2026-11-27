@@ -95,36 +95,38 @@ impl TempChannels {
         })
     }
 
+    /// Returns the channel this member was last seen in (`Some(None)` when not
+    /// connected). `None` means this guild has not been seeded yet, so the
+    /// previous channel is unknown.
     pub(super) async fn update(
         &self,
         http: &serenity::http::Http,
         store: &Store,
         guild: GuildId,
         new: &VoiceState,
-    ) {
+    ) -> Option<Option<ChannelId>> {
         // Update before awaiting network work so other occupants remain visible during creation/deletion.
-        let Some(previous) = self.observe(guild, new.user_id, new.channel_id) else {
-            return;
-        };
+        let previous = self.observe(guild, new.user_id, new.channel_id)?;
         if previous == new.channel_id {
-            return;
+            return Some(previous);
         }
         let _guard = self.operations.lock().await;
         if let Some(channel) = previous {
             self.cleanup(http, store, guild, channel).await;
         }
         let Some(source) = new.channel_id else {
-            return;
+            return Some(previous);
         };
         if creator(store, guild) != Some(source)
             || self.channel(guild, new.user_id) != Some(source)
             || !feature_enabled(store, &guild.to_string(), "utility.temp_channels", None)
         {
-            return;
+            return Some(previous);
         }
         if let Err(error) = self.create_room(http, store, guild, source, new).await {
             warn!(%guild, user = %new.user_id, %error, "temporary room creation or move failed");
         }
+        Some(previous)
     }
 
     async fn create_room(
@@ -449,6 +451,35 @@ mod tests {
             1,
             "no POST or duplicate event request"
         );
+    }
+
+    #[tokio::test]
+    async fn update_reports_the_previously_observed_channel() {
+        let (state, store, mut voice) = fixture();
+        let (http, task) = mock_http(vec![]).await;
+        voice.channel_id = Some(ChannelId::new(8));
+        assert_eq!(
+            state.update(&http, &store, GuildId::new(1), &voice).await,
+            Some(None)
+        );
+        // A mute or deafen repeats the same channel.
+        assert_eq!(
+            state.update(&http, &store, GuildId::new(1), &voice).await,
+            Some(Some(ChannelId::new(8)))
+        );
+        voice.channel_id = None;
+        assert_eq!(
+            state.update(&http, &store, GuildId::new(1), &voice).await,
+            Some(Some(ChannelId::new(8)))
+        );
+        voice.guild_id = Some(GuildId::new(2));
+        voice.channel_id = Some(ChannelId::new(8));
+        assert_eq!(
+            state.update(&http, &store, GuildId::new(2), &voice).await,
+            None,
+            "an unseeded guild has no known previous channel"
+        );
+        assert!(task.await.unwrap().is_empty());
     }
 
     #[test]

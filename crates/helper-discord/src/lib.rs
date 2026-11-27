@@ -31,7 +31,6 @@ use helper_store::{
     KickSubscriptionRecord, RssSubscriptionRecord, Store, TikTokSubscriptionRecord,
     TopggSyncDetail, TwitchSubscriptionRecord, YouTubeSubscriptionRecord,
 };
-use rand::seq::SliceRandom;
 use reqwest::Client as HttpClient;
 use serenity::{
     all::{
@@ -421,6 +420,37 @@ impl EventHandler for Handler {
         self.temp_channels
             .seed(&ctx.http, &self.store, &guild)
             .await;
+        // READY carries no voice states; GUILD_CREATE does. Sessions left open by
+        // leaves missed while disconnected must not be credited later.
+        let in_voice: Vec<(String, String)> = guild
+            .voice_states
+            .iter()
+            .filter_map(|(user, state)| {
+                state
+                    .channel_id
+                    .map(|channel| (user.to_string(), channel.to_string()))
+            })
+            .collect();
+        if let Err(error) = self
+            .store
+            .reconcile_voice_presence(&guild.id.to_string(), &in_voice)
+        {
+            warn!(guild_id = %guild.id, %error, "could not reconcile voice sessions");
+        }
+        // Channels deleted while the bot was offline never produce ChannelDelete.
+        let present: Vec<String> = guild.channels.keys().map(|id| id.to_string()).collect();
+        match self
+            .store
+            .close_tickets_without_channel(&guild.id.to_string(), &present)
+        {
+            Ok(0) => {}
+            Ok(closed) => {
+                info!(guild_id = %guild.id, closed, "closed tickets whose channel no longer exists")
+            }
+            Err(error) => {
+                warn!(guild_id = %guild.id, %error, "could not reconcile ticket channels")
+            }
+        }
         // The store makes this idempotent, so startup GuildCreate replays do
         // not inflate acquisition. A first observation is intentionally a
         // join: it gives a newly enabled lifecycle table a valid baseline.
@@ -496,19 +526,17 @@ impl EventHandler for Handler {
                 // per minute instead of once per UTC day so a guild at UTC-14
                 // or UTC+14 is still announced on its own local day.
                 let mut last_birthday_minute: Option<i64> = None;
+                let mut last_retention: Option<Instant> = None;
                 loop {
                     if let Ok(actions) =
                         store.due_scheduled_actions(chrono::Utc::now().timestamp_millis(), 100)
                     {
-                        for (id, guild_id, action_type, target_id, payload) in actions {
-                            let _ = deliver_scheduled_action(
+                        for job in actions {
+                            run_due_scheduled_action(
                                 &http,
                                 &store,
-                                id,
-                                &guild_id,
-                                &action_type,
-                                &target_id,
-                                &payload,
+                                job,
+                                chrono::Utc::now().timestamp_millis(),
                             )
                             .await;
                         }
@@ -518,6 +546,11 @@ impl EventHandler for Handler {
                     if last_birthday_minute != Some(birthday_minute) {
                         let _ = deliver_birthday_announcements(&http, &store, birthday_now).await;
                         last_birthday_minute = Some(birthday_minute);
+                    }
+                    if last_retention.is_none_or(|at| at.elapsed() >= Duration::from_secs(60 * 60))
+                    {
+                        run_retention_sweep(&store);
+                        last_retention = Some(Instant::now());
                     }
                     tokio::time::sleep(Duration::from_secs(1)).await;
                 }
@@ -1871,10 +1904,12 @@ impl EventHandler for Handler {
         else {
             return;
         };
-        self.temp_channels
+        // Serenity is built without `cache`, so `old` is always `None`; the
+        // previous channel comes from the occupant map instead.
+        let observed_previous = self
+            .temp_channels
             .update(&ctx.http, &self.store, guild_id, &new)
             .await;
-        let old_channel_id = old.as_ref().and_then(|state| state.channel_id);
         let new_channel_id = new.channel_id;
         let guild_text = guild_id.to_string();
         let user_text = new.user_id.to_string();
@@ -1906,9 +1941,12 @@ impl EventHandler for Handler {
             }
         }
 
-        if feature_enabled(&self.store, &guild_text, "management.audit", None) {
+        // Mute, deafen and stream changes keep the channel and are not audited.
+        if let Some((from, to)) = voice_audit_change(observed_previous, new_channel_id)
+            && feature_enabled(&self.store, &guild_text, "management.audit", None)
+        {
             let detail = serde_json::json!({
-                "oldChannelId": old_channel_id.map(|channel| channel.to_string()),
+                "oldChannelId": observed_previous.flatten().map(|channel| channel.to_string()),
                 "newChannelId": new_channel_id.map(|channel| channel.to_string()),
                 "contentAvailable": false,
             })
@@ -1926,12 +1964,6 @@ impl EventHandler for Handler {
                     .filter(|value| !value.trim().is_empty())
                 && let Ok(log_channel) = raw_channel.parse::<u64>()
             {
-                let from = old_channel_id
-                    .map(|channel| format!("<#{}>", channel))
-                    .unwrap_or_else(|| "not connected".into());
-                let to = new_channel_id
-                    .map(|channel| format!("<#{}>", channel))
-                    .unwrap_or_else(|| "not connected".into());
                 let _ = ChannelId::new(log_channel)
                     .say(
                         &ctx.http,
@@ -1946,10 +1978,11 @@ impl EventHandler for Handler {
 
         // Voice XP is session based: joins start a durable snapshot, moves
         // close the old snapshot before starting the new one, and leaves close
-        // it without relying on a background timer. The store operation is
-        // idempotent so duplicate gateway deliveries cannot double-award XP.
-        if old_channel_id != new_channel_id
-            && feature_enabled(&self.store, &guild_text, "community.levels", None)
+        // it without relying on a background timer. The stored session decides
+        // what changed, so a mute in the same channel never restarts it. The
+        // store operation is idempotent so duplicate gateway deliveries cannot
+        // double-award XP.
+        if feature_enabled(&self.store, &guild_text, "community.levels", None)
             && setting_bool(
                 &self.store,
                 &guild_text,
@@ -1977,10 +2010,19 @@ impl EventHandler for Handler {
                 .active_voice_session(&guild_text, &user_text)
                 .ok()
                 .flatten();
-            if old_channel_id.is_some()
-                && let Ok(Some(minutes)) =
-                    self.store
-                        .finish_voice_session(&guild_text, &user_text, now)
+            let change = voice_session_change(
+                previous_session
+                    .as_ref()
+                    .map(|session| session.channel_id.as_str()),
+                new_channel_id.map(|channel| channel.to_string()).as_deref(),
+                is_ignored(new_channel_id),
+            );
+            if matches!(
+                change,
+                VoiceSessionChange::Finish | VoiceSessionChange::FinishAndStart(_)
+            ) && let Ok(Some(minutes)) =
+                self.store
+                    .finish_voice_session(&guild_text, &user_text, now)
             {
                 let before = self.store.level_for(&guild_text, &user_text).unwrap_or(0);
                 let event_key = previous_session
@@ -2039,14 +2081,11 @@ impl EventHandler for Handler {
                     }
                 }
             }
-            if let Some(channel_id) = new_channel_id
-                && !is_ignored(Some(channel_id))
-                && let Err(error) = self.store.start_voice_session(
-                    &guild_text,
-                    &user_text,
-                    &channel_id.to_string(),
-                    now,
-                )
+            if let VoiceSessionChange::Start(channel) | VoiceSessionChange::FinishAndStart(channel) =
+                &change
+                && let Err(error) =
+                    self.store
+                        .start_voice_session(&guild_text, &user_text, channel, now)
             {
                 warn!(%guild_id, user = %new.user_id, %error, "failed to start voice XP session");
             }
@@ -2067,6 +2106,20 @@ impl EventHandler for Handler {
             .is_some_and(|record| record.guild_id == channel.guild_id.to_string())
         {
             let _ = self.store.remove_temp_channel(&channel.id.to_string());
+        }
+        // Staff often delete ticket channels by hand. Without this the opener stays
+        // counted as having an open ticket and can never open another one.
+        match self.store.close_ticket_for_deleted_channel(
+            &channel.guild_id.to_string(),
+            &channel.id.to_string(),
+        ) {
+            Ok(true) => {
+                info!(guild_id = %channel.guild_id, channel_id = %channel.id, "closed ticket whose channel was deleted")
+            }
+            Ok(false) => {}
+            Err(error) => {
+                warn!(guild_id = %channel.guild_id, channel_id = %channel.id, %error, "could not close ticket for deleted channel")
+            }
         }
     }
 
@@ -2276,6 +2329,13 @@ impl EventHandler for Handler {
         let day = chrono::Utc::now().format("%Y-%m-%d").to_string();
         let _ = self.store.record_join(&guild_id.to_string(), &day);
         let guild_text = guild_id.to_string();
+        // A member who returns within 30 days gets their kept economy back.
+        if let Err(error) = self
+            .store
+            .clear_member_departure(&guild_text, &new_member.user.id.to_string())
+        {
+            warn!(%guild_text, %error, "could not clear member departure marker");
+        }
         let detail = serde_json::json!({
             "event": "member_join",
             "contentAvailable": false,
@@ -2525,6 +2585,7 @@ impl EventHandler for Handler {
                 "protection.join_gate",
                 Some("security.join_gate.enabled"),
             );
+        let mut gate_blocked = false;
         if gate_enabled {
             let minimum_age = self
                 .store
@@ -2595,6 +2656,7 @@ impl EventHandler for Handler {
                     display_name,
                 },
             );
+            gate_blocked = gate_decision.blocked;
             if gate_decision.blocked {
                 let action = gate_decision.action;
                 let gate_reasons = gate_decision.reasons;
@@ -2647,7 +2709,10 @@ impl EventHandler for Handler {
             .store
             .welcome_configuration(&guild_text)
             .unwrap_or((false, serde_json::json!({})));
-        let welcome_claimed = welcome_enabled
+        if welcome_enabled && gate_blocked {
+            info!(guild_id = %guild_text, user = %new_member.user.id, "welcome skipped for a member held by the join gate");
+        }
+        let welcome_claimed = welcome_applies_to_join(welcome_enabled, gate_blocked)
             && self
                 .store
                 .claim_welcome_delivery(
@@ -2664,11 +2729,7 @@ impl EventHandler for Handler {
             if delay > 0 {
                 tokio::time::sleep(Duration::from_secs(delay)).await;
             }
-            if let Some(role) = welcome["autoRole"]
-                .as_str()
-                .and_then(|id| id.parse::<u64>().ok())
-                .filter(|id| *id > 0)
-            {
+            if let Some(role) = welcome_auto_role(&welcome, gate_blocked) {
                 let _ = new_member.add_role(&ctx.http, RoleId::new(role)).await;
             }
             let guild = guild_id.to_partial_guild(&ctx.http).await.ok();
@@ -2790,6 +2851,7 @@ impl EventHandler for Handler {
         user: serenity::all::User,
         _member_data_if_available: Option<serenity::all::Member>,
     ) {
+        let left_at = Utc::now().timestamp_millis();
         let day = chrono::Utc::now().format("%Y-%m-%d").to_string();
         let guild_text = guild_id.to_string();
         let _ = self.store.record_leave(&guild_text, &day);
@@ -2855,9 +2917,9 @@ impl EventHandler for Handler {
                     .await;
             }
         }
-        if let Ok(deleted) = self
-            .store
-            .delete_member_voluntary_data(&guild_text, &user.id.to_string())
+        if let Ok(deleted) =
+            self.store
+                .delete_member_voluntary_data_at(&guild_text, &user.id.to_string(), left_at)
         {
             tracing::debug!(
                 guild_id = %guild_id,
@@ -2922,6 +2984,14 @@ impl EventHandler for Handler {
             None,
             "{}",
         );
+        // Once unbanned, any pending release is moot.
+        if let Err(error) = self.store.delete_scheduled_actions_for(
+            &guild_id.to_string(),
+            "unban",
+            &user.id.to_string(),
+        ) {
+            warn!(%error, %guild_id, "pending unban cleanup failed");
+        }
     }
 
     async fn guild_audit_log_entry_create(
@@ -2947,6 +3017,9 @@ impl EventHandler for Handler {
             .flatten()
             .is_some_and(|value| value == "true");
         if !enabled || !is_destructive_audit_action(entry.action) {
+            return;
+        }
+        if audit_action_is_by_helper(entry.user_id.get(), self.bot_id.load(Ordering::Relaxed)) {
             return;
         }
         let threshold = self
@@ -3173,6 +3246,11 @@ impl EventHandler for Handler {
         if board_id == reaction.channel_id.get() {
             return;
         }
+        // Count and publish under one lock so a near-simultaneous second
+        // reaction edits the first board post instead of creating another.
+        let starboard_lock =
+            starboard_display::update_lock(guild_id.get(), reaction.message_id.get());
+        let _starboard_guard = starboard_lock.lock().await;
         let Ok(users) = reaction
             .channel_id
             .reaction_users(
@@ -5009,6 +5087,18 @@ async fn run_growth_lifecycle_purge_worker(store: Store) {
     }
 }
 
+/// Hourly retention with the periods listed in docs/GDPR-INVENTARIO.md.
+/// Runs on the gateway only; `helper_modules::start_scheduler` stays unused.
+fn run_retention_sweep(store: &Store) {
+    let started = Instant::now();
+    let result = store.prune_retention(Utc::now().timestamp_millis());
+    let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    match result {
+        Ok(summary) => info!(deleted = %summary.deleted, elapsed_ms, "retention sweep completed"),
+        Err(error) => warn!(%error, elapsed_ms, "retention sweep failed"),
+    }
+}
+
 /// Keep the configured Helper nickname synchronized with the live Discord
 /// member state, including removal after a feature is disabled.
 async fn run_nickname_worker(http: Arc<serenity::http::Http>, store: Store) {
@@ -5974,6 +6064,8 @@ impl Handler {
         ) {
             return;
         }
+        let starboard_lock = starboard_display::update_lock(guild_id.get(), message_id.get());
+        let _starboard_guard = starboard_lock.lock().await;
         let Ok(Some(entry)) = self.store.star_entry(&guild_text, &message_id.to_string()) else {
             return;
         };
@@ -6875,7 +6967,13 @@ impl Handler {
                     return respond(ctx, command, "ID de utilizador inválido.").await;
                 };
                 match guild_id.unban(&ctx.http, serenity::all::UserId::new(user_id)).await {
-                    Ok(()) => "User unbanned.".to_string(),
+                    Ok(()) => {
+                        // The member is free now; a pending tempban release has nothing left to do.
+                        if let Err(error) = self.store.delete_scheduled_actions_for(&guild_id.to_string(), "unban", &user_id.to_string()) {
+                            tracing::warn!(%error, "pending unban cleanup failed");
+                        }
+                        "User unbanned.".to_string()
+                    }
                     Err(error) => {
                         tracing::warn!(%error, "unban failed");
                         "Unable to remove the ban.".to_string()
@@ -6931,24 +7029,29 @@ impl Handler {
                 if !decision.allowed {
                     return respond(ctx, command, &decision.explanation).await;
                 }
+                // Refuse a bad duration before the member is touched; only tempban carries one.
+                let tempban_delay = if command.data.name == "tempban" {
+                    let Some(delay) = parse_duration(option_string(command, "duration").unwrap_or_default()) else {
+                        return respond(ctx, command, "Duração inválida. Usa 10m, 2h ou 1d.").await;
+                    };
+                    Some(delay)
+                } else {
+                    None
+                };
                 let reason = if reason.trim().is_empty() { "No reason provided" } else { reason };
                 let action = guild_id.ban_with_reason(&ctx.http, target, 0, reason).await;
                 if let Err(error) = action {
                     tracing::warn!(%error, action = %command.data.name, "ban action failed");
                     return respond(ctx, command, "Nao foi possivel executar o ban; confirma as permissoes e a hierarquia.").await;
                 }
-                if command.data.name == "softban" {
+                if let Some(delay) = tempban_delay {
+                    let case_id = self.store.record_case(&guild_id.to_string(), "tempban", &target.to_string(), &command.user.id.to_string(), reason, Some(delay))?;
+                    self.store.replace_scheduled_unban(&guild_id.to_string(), &target.to_string(), chrono::Utc::now().timestamp_millis() + delay, case_id)?;
+                    format!("Tempban completed as case #{case_id} for <@{}>; expires in {}.", target, format_duration(delay))
+                } else {
                     let _ = guild_id.unban(&ctx.http, target).await;
                     let case_id = self.store.record_case(&guild_id.to_string(), "softban", &target.to_string(), &command.user.id.to_string(), reason, None)?;
                     format!("Softban completed as case #{case_id} for <@{}>.", target)
-                } else {
-                    let Some(delay) = parse_duration(option_string(command, "duration").unwrap_or_default()) else {
-                        let _ = guild_id.unban(&ctx.http, target).await;
-                        return respond(ctx, command, "Duração inválida. Usa 10m, 2h ou 1d.").await;
-                    };
-                    let case_id = self.store.record_case(&guild_id.to_string(), "tempban", &target.to_string(), &command.user.id.to_string(), reason, Some(delay))?;
-                    self.store.schedule_typed(&guild_id.to_string(), "unban", &target.to_string(), chrono::Utc::now().timestamp_millis() + delay, "")?;
-                    format!("Tempban completed as case #{case_id} for <@{}>; expires in {}.", target, format_duration(delay))
                 }
             }
             "kick" | "ban" | "timeout" => {
@@ -6991,6 +7094,10 @@ impl Handler {
                 match action {
                     Ok(()) => {
                         let case_id = self.store.record_case(&guild_id.to_string(), &command.data.name, &target.to_string(), &command.user.id.to_string(), reason, None)?;
+                        if command.data.name == "ban" {
+                            // A permanent ban outlives any pending tempban release.
+                            self.store.delete_scheduled_actions_for(&guild_id.to_string(), "unban", &target.to_string())?;
+                        }
                         format!("Action {} completed as case #{case_id} for <@{}>.", command.data.name, target)
                     }
                     Err(error) => {
@@ -7062,6 +7169,13 @@ impl Handler {
                         _ => "That reminder cannot be scheduled with the current server policy.",
                     };
                     return respond(ctx, command, message).await;
+                }
+                if self
+                    .store
+                    .pending_reminder_count(&guild_text, &command.user.id.to_string())?
+                    >= MAX_PENDING_REMINDERS_PER_MEMBER
+                {
+                    return respond(ctx, command, "You already have 25 pending reminders in this server. Wait for one to fire before adding another.").await;
                 }
                 let payload = serde_json::json!({
                     "channel_id": command.channel_id.to_string(),
@@ -8038,7 +8152,7 @@ impl Handler {
                 let id = option_i64(command, "id").unwrap_or(0);
                 match reroll_giveaway(&ctx.http, &self.store, &guild_id.to_string(), id).await? {
                     Some(winner) => format!("Giveaway #{id} rerolled: <@{winner}>."),
-                    None => "Giveaway not found, still active or without participants.".to_string(),
+                    None => "Giveaway not found, still active, still being announced, or no other participants to pick.".to_string(),
                 }
             }
             "poll" => {
@@ -8155,17 +8269,26 @@ impl Handler {
                 if !manual_moderation::allowed(&ctx.http, guild_id.get(), command.user.id.get(), target.get(), "unquarantine", &record.role_ids).await {
                     return respond(ctx, command, "Unable to perform the action; check permissions and role hierarchy.").await;
                 }
+                // Roles deleted from the server since the quarantine are dropped
+                // instead of blocking the restore forever.
+                let guild_roles: HashSet<u64> = guild_id.roles(&ctx.http).await?.keys().map(|id| id.get()).collect();
+                let (to_restore, missing) = split_missing_quarantine_roles(&record.role_ids, &guild_roles);
                 let member = guild_id.member(&ctx.http, target).await?;
                 let role_member = &member;
                 let role_http = &ctx.http;
                 let (restored, pending) = restore_quarantine_roles(
-                    &self.store, &guild_id.to_string(), &target.to_string(), &record.role_ids, &record.reason,
+                    &self.store, &guild_id.to_string(), &target.to_string(), &to_restore, &record.reason,
                     |role| async move { role_member.add_role(role_http, role).await.is_ok() },
                 ).await?;
-                if pending == 0 {
-                    format!("Quarantine removed from <@{}>; {} role(s) restored.", target, restored)
+                let dropped = if missing.is_empty() {
+                    String::new()
                 } else {
-                    format!("Quarantine partially restored for <@{target}>: {restored} role(s) restored, {pending} still pending. Pending roles are saved; check permissions and retry /unquarantine.")
+                    format!(" {} saved role(s) no longer exist and were dropped.", missing.len())
+                };
+                if pending == 0 {
+                    format!("Quarantine removed from <@{}>; {} role(s) restored.{dropped}", target, restored)
+                } else {
+                    format!("Quarantine partially restored for <@{target}>: {restored} role(s) restored, {pending} still pending. Pending roles are saved; check permissions and retry /unquarantine.{dropped}")
                 }
             }
             "join-gate" => {
@@ -8468,7 +8591,7 @@ impl Handler {
                 {
                     let _ = ChannelId::new(channel_id).send_message(
                         &ctx.http,
-                        CreateMessage::new().content(format!("New event **{}** is scheduled for <t:{}:F>.", event.name, start.unix_timestamp())),
+                        event_announcement_message(&event.name, start.unix_timestamp()),
                     ).await;
                 }
                 schedule_event_reminder(
@@ -9233,9 +9356,7 @@ impl Handler {
                 let message = panel_channel
                     .send_message(
                         &ctx.http,
-                        serenity::all::CreateMessage::new()
-                            .content(if let Some(description) = description { format!("{title}\n{description}") } else { title.clone() })
-                            .components(vec![CreateActionRow::Buttons(buttons)]),
+                        role_panel_message(&title, description.as_deref(), buttons),
                     )
                     .await?;
                 self.store.set_setting(
@@ -10220,6 +10341,29 @@ async fn respond_raw(ctx: &Context, command: &CommandInteraction, content: &str)
 fn transcript_message(content: &str) -> CreateMessage {
     CreateMessage::new()
         .content(content)
+        .allowed_mentions(CreateAllowedMentions::new())
+}
+
+fn event_announcement_message(name: &str, start_unix: i64) -> CreateMessage {
+    CreateMessage::new()
+        .content(format!(
+            "New event **{name}** is scheduled for <t:{start_unix}:F>."
+        ))
+        .allowed_mentions(CreateAllowedMentions::new())
+}
+
+fn role_panel_message(
+    title: &str,
+    description: Option<&str>,
+    buttons: Vec<CreateButton>,
+) -> CreateMessage {
+    let content = description.map_or_else(
+        || title.to_owned(),
+        |description| format!("{title}\n{description}"),
+    );
+    CreateMessage::new()
+        .content(content)
+        .components(vec![CreateActionRow::Buttons(buttons)])
         .allowed_mentions(CreateAllowedMentions::new())
 }
 
@@ -11606,6 +11750,13 @@ fn is_destructive_audit_action(action: serenity::model::guild::audit_log::Action
     )
 }
 
+/// Audit entries produced by the Helper itself (lockdown restore, temporary
+/// room cleanup, moderation commands) are not evidence of a nuke. `bot_id` is
+/// 0 until `ready`, which means "unknown" and never matches.
+fn audit_action_is_by_helper(executor_id: u64, bot_id: u64) -> bool {
+    bot_id > 0 && executor_id == bot_id
+}
+
 fn join_burst_armed(
     joins: &mut HashMap<String, VecDeque<Instant>>,
     guild_id: &str,
@@ -11703,18 +11854,18 @@ async fn reroll_giveaway(
     guild_id: &str,
     id: i64,
 ) -> Result<Option<String>> {
+    let update_lock = giveaway_display::update_lock(id);
+    let _update = update_lock.lock().await;
     let Some(giveaway) = store.giveaway(id)? else {
         return Ok(None);
     };
     if giveaway.guild_id != guild_id || !giveaway.ended {
         return Ok(None);
     }
-    let mut entries = store.giveaway_entries(id)?;
-    if entries.is_empty() {
+    // Previous winners, including earlier rerolls, are never drawn again.
+    let Some(winner) = store.giveaway_reroll_candidate(guild_id, id)? else {
         return Ok(None);
-    }
-    entries.shuffle(&mut rand::rng());
-    let winner = entries[0].clone();
+    };
     let channel = giveaway.channel_id.parse::<u64>().map(ChannelId::new)?;
     giveaway_display::publish(
         http,
@@ -11724,12 +11875,30 @@ async fn reroll_giveaway(
             giveaway: &giveaway,
             winners: Some(std::slice::from_ref(&winner)),
             rerolled: true,
-            participants: entries.len() as u64,
+            participants: store.giveaway_participant_count(id)?,
         },
         true,
     )
     .await?;
+    store.record_giveaway_reroll(id, &winner)?;
     Ok(Some(winner))
+}
+
+/// Split saved quarantine roles into those to restore and those deleted from
+/// the server. Ids that are not real role ids stay on the restore side, where
+/// they remain pending as before.
+fn split_missing_quarantine_roles(
+    saved: &[String],
+    guild_roles: &HashSet<u64>,
+) -> (Vec<String>, Vec<String>) {
+    let (missing, to_restore): (Vec<String>, Vec<String>) =
+        saved.iter().cloned().partition(|raw| {
+            raw.parse::<u64>()
+                .ok()
+                .filter(|id| *id != 0)
+                .is_some_and(|id| !guild_roles.contains(&id))
+        });
+    (to_restore, missing)
 }
 
 async fn restore_quarantine_roles<F, Fut>(
@@ -12391,6 +12560,57 @@ fn feature_title(key: &str) -> &'static str {
     }
 }
 
+/// What a voice event does to the stored voice XP session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum VoiceSessionChange {
+    Keep,
+    Start(String),
+    Finish,
+    FinishAndStart(String),
+}
+
+/// Decides from the stored session, not from Serenity's `old` state: without
+/// the `cache` feature `old` is always `None`, so a mute would look like a join.
+/// Staying in the same channel (mute, deafen, stream) never restarts a session.
+fn voice_session_change(
+    stored_channel: Option<&str>,
+    new_channel: Option<&str>,
+    new_channel_ignored: bool,
+) -> VoiceSessionChange {
+    if stored_channel == new_channel {
+        return VoiceSessionChange::Keep;
+    }
+    let start = new_channel
+        .filter(|_| !new_channel_ignored)
+        .map(str::to_owned);
+    match (stored_channel, start) {
+        (None, None) => VoiceSessionChange::Keep,
+        (None, Some(channel)) => VoiceSessionChange::Start(channel),
+        (Some(_), None) => VoiceSessionChange::Finish,
+        (Some(_), Some(channel)) => VoiceSessionChange::FinishAndStart(channel),
+    }
+}
+
+/// The `(from, to)` text for the voice audit log, or `None` when the member
+/// stayed in the same channel. `observed_previous` comes from the occupant map:
+/// `None` means the guild has not been seeded, so the previous channel is unknown.
+fn voice_audit_change(
+    observed_previous: Option<Option<ChannelId>>,
+    new: Option<ChannelId>,
+) -> Option<(String, String)> {
+    if observed_previous == Some(new) {
+        return None;
+    }
+    let describe = |channel: Option<ChannelId>| {
+        channel.map_or_else(|| "not connected".to_owned(), |id| format!("<#{id}>"))
+    };
+    let from = match observed_previous {
+        None => "an unknown channel".to_owned(),
+        Some(previous) => describe(previous),
+    };
+    Some((from, describe(new)))
+}
+
 fn scheduled_action_feature(action_type: &str) -> Option<&'static str> {
     match action_type {
         // Releasing a temporary sanction must survive a feature disable.
@@ -12402,6 +12622,80 @@ fn scheduled_action_feature(action_type: &str) -> Option<&'static str> {
         "event_reminder" => Some("community.events"),
         _ => None,
     }
+}
+
+const SCHEDULED_RETRY_BASE_MS: i64 = 30_000;
+const SCHEDULED_RETRY_MAX_MS: i64 = 3_600_000;
+const SCHEDULED_MAX_ATTEMPTS: i64 = 12;
+
+/// What the scheduler does with a job whose delivery returned an error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScheduledFailure {
+    /// The target can never accept this job, so it is removed.
+    Drop,
+    /// The job stays and runs again after this many milliseconds.
+    RetryAfterMs(i64),
+}
+
+/// Discord error codes after which this job type can never succeed.
+fn scheduled_drop_codes(action_type: &str) -> &'static [isize] {
+    match action_type {
+        "reminder" | "event_reminder" => &[
+            10_003, 10_004, 10_007, 10_008, 10_011, 10_013, 10_026, 50_001,
+        ],
+        // Discord ends the timeout on its own at the scheduled time.
+        "anti_spam_untimeout" => &[10_003, 10_004, 10_007, 10_008, 10_011, 10_013, 10_026],
+        // The result stays unannounced: its channel or message is gone.
+        "giveaway_end" | "poll_end" => &[10_003, 10_008],
+        // Unknown Ban (10026) is settled inside the delivery itself.
+        "unban" => &[10_013],
+        // Never Unknown Member or Unknown Guild: a buyer may not have joined
+        // yet, and the bot may be invited back to the guild.
+        "monetization_entitlement" | "web3_wallet_role_sync" => &[10_011],
+        _ => &[],
+    }
+}
+
+/// Job types that give up after `SCHEDULED_MAX_ATTEMPTS` failures in a row.
+fn scheduled_attempts_capped(action_type: &str) -> bool {
+    matches!(
+        action_type,
+        "reminder" | "event_reminder" | "anti_spam_untimeout"
+    )
+}
+
+/// `attempts` counts the failures before this one. Unknown job types retry
+/// with backoff and are never dropped.
+fn scheduled_failure_decision(
+    action_type: &str,
+    attempts: i64,
+    discord_code: Option<isize>,
+) -> ScheduledFailure {
+    if discord_code.is_some_and(|code| scheduled_drop_codes(action_type).contains(&code)) {
+        return ScheduledFailure::Drop;
+    }
+    if scheduled_attempts_capped(action_type)
+        && attempts.saturating_add(1) >= SCHEDULED_MAX_ATTEMPTS
+    {
+        return ScheduledFailure::Drop;
+    }
+    ScheduledFailure::RetryAfterMs(
+        SCHEDULED_RETRY_BASE_MS
+            .saturating_mul(1_i64 << attempts.clamp(0, 10))
+            .min(SCHEDULED_RETRY_MAX_MS),
+    )
+}
+
+/// The Discord error code behind a delivery failure, if Discord sent one.
+fn scheduled_error_code(error: &anyhow::Error) -> Option<isize> {
+    error
+        .chain()
+        .find_map(|cause| match cause.downcast_ref::<serenity::Error>() {
+            Some(serenity::Error::Http(serenity::http::HttpError::UnsuccessfulRequest(
+                response,
+            ))) => Some(response.error.code),
+            _ => None,
+        })
 }
 
 fn should_clear_anti_spam_timeout(
@@ -12479,6 +12773,23 @@ fn welcome_guide_button(
             .label(label)
             .emoji(ReactionType::Unicode(emoji.to_string())),
     )
+}
+
+/// Members held by the join gate (including anti-raid containment) are not
+/// welcomed: the welcome role would undo the quarantine and the public message
+/// would advertise an account that still needs verification.
+fn welcome_applies_to_join(welcome_enabled: bool, gate_blocked: bool) -> bool {
+    welcome_enabled && !gate_blocked
+}
+
+fn welcome_auto_role(welcome: &serde_json::Value, gate_blocked: bool) -> Option<u64> {
+    if gate_blocked {
+        return None;
+    }
+    welcome["autoRole"]
+        .as_str()
+        .and_then(|id| id.parse::<u64>().ok())
+        .filter(|id| *id > 0)
 }
 
 /// Resolve a reusable Studio template without allowing arbitrary JSON to leak
@@ -13269,6 +13580,39 @@ async fn deliver_birthday_announcements(
     Ok(())
 }
 
+/// What a due event reminder does once the live Discord event is known.
+#[derive(Debug, PartialEq, Eq)]
+enum EventReminderCheck {
+    Send,
+    /// The event was cancelled, has ended or is already running.
+    Drop,
+    /// The event's start or name changed outside the bot, so the reminder
+    /// text is stale and the reminder is queued again from the live event.
+    Reschedule,
+}
+
+/// `saved_start` and `saved_name` are absent in reminders queued before they
+/// were recorded; those are sent unless the event is over.
+fn event_reminder_check(
+    status: serenity::all::ScheduledEventStatus,
+    start_unix: i64,
+    name: &str,
+    saved_start: Option<i64>,
+    saved_name: Option<&str>,
+) -> EventReminderCheck {
+    use serenity::all::ScheduledEventStatus as Status;
+    match status {
+        Status::Completed | Status::Canceled | Status::Active => EventReminderCheck::Drop,
+        Status::Scheduled
+            if saved_start.is_some_and(|saved| saved != start_unix)
+                || saved_name.is_some_and(|saved| saved != name) =>
+        {
+            EventReminderCheck::Reschedule
+        }
+        _ => EventReminderCheck::Send,
+    }
+}
+
 fn schedule_event_reminder(
     store: &Store,
     guild_id: &str,
@@ -13299,6 +13643,9 @@ fn schedule_event_reminder(
         "channel_id": channel_id.to_string(),
         "event_id": event_id,
         "text": format!("Reminder: **{}** starts <t:{}:R>.", event_name, start.unix_timestamp()),
+        // The reminder text quotes these; delivery compares them with the live event.
+        "start": start.unix_timestamp(),
+        "name": event_name,
     });
     store.schedule_typed(
         guild_id,
@@ -13308,6 +13655,61 @@ fn schedule_event_reminder(
         &payload.to_string(),
     )?;
     Ok(())
+}
+
+/// One scheduler step: deliver, and on failure either back off or drop the job.
+/// `deliver_scheduled_action` keeps a failed job untouched; the retry policy
+/// lives here so one broken target cannot hold the whole due batch.
+async fn run_due_scheduled_action(
+    http: &serenity::http::Http,
+    store: &Store,
+    job: helper_store::ScheduledAction,
+    now_ms: i64,
+) {
+    let (id, guild_id, action_type, target_id, payload) = job;
+    let Err(error) = deliver_scheduled_action(
+        http,
+        store,
+        id,
+        &guild_id,
+        &action_type,
+        &target_id,
+        &payload,
+    )
+    .await
+    else {
+        return;
+    };
+    let attempts = match store.scheduled_action_attempts(id) {
+        // The delivery already removed the job.
+        Ok(None) => return,
+        Ok(Some(attempts)) => attempts,
+        Err(store_error) => {
+            warn!(job_id = id, %store_error, "could not read scheduled action attempts");
+            // Without this the job would run again on the next tick.
+            if let Err(store_error) =
+                store.retry_scheduled_action(id, now_ms.saturating_add(SCHEDULED_RETRY_BASE_MS))
+            {
+                warn!(job_id = id, %store_error, "could not postpone scheduled action");
+            }
+            return;
+        }
+    };
+    let code = scheduled_error_code(&error);
+    match scheduled_failure_decision(&action_type, attempts, code) {
+        ScheduledFailure::Drop => {
+            warn!(job_id = id, %guild_id, action_type = %action_type, attempts, ?code, %error, "dropping scheduled action that cannot succeed");
+            if let Err(store_error) = store.delete_scheduled_action(id) {
+                warn!(job_id = id, %store_error, "could not drop scheduled action");
+            }
+        }
+        ScheduledFailure::RetryAfterMs(ms) => {
+            warn!(job_id = id, %guild_id, action_type = %action_type, attempts, ?code, %error, retry_in_ms = ms, "scheduled action failed; retrying later");
+            if let Err(store_error) = store.retry_scheduled_action(id, now_ms.saturating_add(ms)) {
+                warn!(job_id = id, %store_error, "could not postpone scheduled action");
+            }
+        }
+    }
 }
 
 async fn deliver_scheduled_action(
@@ -13393,6 +13795,14 @@ async fn deliver_scheduled_action(
             .parse::<u64>()
             .map(serenity::all::UserId::new)
             .map_err(|_| anyhow::anyhow!("invalid scheduled unban user"))?;
+        // A later ban or tempban owns the member's ban now; this release is stale.
+        if let Some(case_id) = value.get("case_id").and_then(serde_json::Value::as_i64)
+            && store.has_ban_case_after(guild_id, target_id, case_id)?
+        {
+            info!(%guild_id, %target_id, case_id, "skipped stale scheduled unban");
+            store.delete_scheduled_action(id)?;
+            return Ok(());
+        }
         if let Err(error) = guild.unban(http, user).await {
             // Unknown Ban is already released; transient failures retain the job.
             if !discord_error_code(&error, 10026) {
@@ -13600,6 +14010,48 @@ async fn deliver_scheduled_action(
         store.delete_scheduled_action(id)?;
         return Ok(());
     }
+    if action_type == "event_reminder" {
+        // The bot does not receive event updates from the gateway, so confirm
+        // the event is still upcoming and unchanged before reminding anyone.
+        let guild = guild_id
+            .parse::<u64>()
+            .map(serenity::all::GuildId::new)
+            .map_err(|_| anyhow::anyhow!("invalid event reminder guild"))?;
+        let Some(event_id) = target_id.parse::<u64>().ok().filter(|id| *id > 0) else {
+            store.delete_scheduled_action(id)?;
+            return Ok(());
+        };
+        let event = match guild
+            .scheduled_event(http, serenity::all::ScheduledEventId::new(event_id), false)
+            .await
+        {
+            Ok(event) => event,
+            // Unknown Guild Scheduled Event: deleted in Discord.
+            Err(error) if discord_error_code(&error, 10070) => {
+                store.delete_scheduled_action(id)?;
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        };
+        match event_reminder_check(
+            event.status,
+            event.start_time.unix_timestamp(),
+            &event.name,
+            value.get("start").and_then(serde_json::Value::as_i64),
+            value.get("name").and_then(serde_json::Value::as_str),
+        ) {
+            EventReminderCheck::Drop => {
+                store.delete_scheduled_action(id)?;
+                return Ok(());
+            }
+            EventReminderCheck::Reschedule => {
+                // Replaces this job with one built from the live event.
+                schedule_event_reminder(store, guild_id, target_id, &event.name, event.start_time)?;
+                return Ok(());
+            }
+            EventReminderCheck::Send => {}
+        }
+    }
     let channel_id = value
         .get("channel_id")
         .and_then(serde_json::Value::as_str)
@@ -13655,6 +14107,9 @@ async fn deliver_scheduled_action(
     store.delete_scheduled_action(id)?;
     Ok(())
 }
+
+/// Keeps one member from filling the shared scheduler queue with reminders.
+const MAX_PENDING_REMINDERS_PER_MEMBER: u32 = 25;
 
 fn reminder_repeat_interval_ms(repeat: &str) -> Option<i64> {
     match repeat {
@@ -13941,6 +14396,49 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn event_announcement_never_parses_mentions() {
+        let payload = serde_json::to_value(super::event_announcement_message(
+            "@everyone <@&42> festa",
+            1_900_000_000,
+        ))
+        .unwrap();
+        let content = payload["content"].as_str().unwrap();
+        assert!(content.contains("@everyone <@&42> festa"), "{content}");
+        assert!(content.contains("<t:1900000000:F>"), "{content}");
+        assert_eq!(payload["allowed_mentions"]["parse"], serde_json::json!([]));
+        for field in ["roles", "users"] {
+            assert!(
+                payload["allowed_mentions"]
+                    .get(field)
+                    .is_none_or(|value| value == &serde_json::json!([]))
+            );
+        }
+    }
+
+    #[test]
+    fn role_panel_message_never_parses_mentions() {
+        let payload = serde_json::to_value(super::role_panel_message(
+            "@everyone Cargos",
+            Some("<@&42>"),
+            vec![serenity::all::CreateButton::new("role:toggle:1").label("A")],
+        ))
+        .unwrap();
+        assert_eq!(payload["content"], "@everyone Cargos\n<@&42>");
+        assert_eq!(payload["allowed_mentions"]["parse"], serde_json::json!([]));
+        for field in ["roles", "users"] {
+            assert!(
+                payload["allowed_mentions"]
+                    .get(field)
+                    .is_none_or(|value| value == &serde_json::json!([]))
+            );
+        }
+        assert_eq!(
+            payload["components"][0]["components"][0]["custom_id"],
+            "role:toggle:1"
+        );
+    }
     #[test]
     fn join_gate_requires_publisher_and_role_binding_from_canonical_publication() {
         let store = helper_store::Store::open(":memory:").unwrap();
@@ -14130,6 +14628,50 @@ mod tests {
         );
     }
 
+    #[test]
+    fn quarantine_roles_split_missing_from_restorable() {
+        let guild_roles: std::collections::HashSet<u64> = [10u64].into_iter().collect();
+        let saved: Vec<String> = vec!["10".into(), "20".into(), "invalid".into(), "0".into()];
+        let (to_restore, missing) = super::split_missing_quarantine_roles(&saved, &guild_roles);
+        assert_eq!(
+            to_restore,
+            vec!["10".to_string(), "invalid".to_string(), "0".to_string()]
+        );
+        assert_eq!(missing, vec!["20".to_string()]);
+    }
+
+    #[test]
+    fn event_reminders_follow_the_live_event() {
+        use super::{EventReminderCheck as R, event_reminder_check as check};
+        use serenity::all::ScheduledEventStatus as S;
+        assert_eq!(
+            check(S::Scheduled, 1000, "Raid", Some(1000), Some("Raid")),
+            R::Send
+        );
+        // Jobs queued before this change carry no start or name.
+        assert_eq!(check(S::Scheduled, 1000, "Raid", None, None), R::Send);
+        assert_eq!(
+            check(S::Canceled, 1000, "Raid", Some(1000), Some("Raid")),
+            R::Drop
+        );
+        assert_eq!(
+            check(S::Completed, 1000, "Raid", Some(1000), Some("Raid")),
+            R::Drop
+        );
+        assert_eq!(
+            check(S::Active, 1000, "Raid", Some(1000), Some("Raid")),
+            R::Drop
+        );
+        assert_eq!(
+            check(S::Scheduled, 2000, "Raid", Some(1000), Some("Raid")),
+            R::Reschedule
+        );
+        assert_eq!(
+            check(S::Scheduled, 1000, "Raid night", Some(1000), Some("Raid")),
+            R::Reschedule
+        );
+    }
+
     #[tokio::test]
     async fn unpublished_poll_results_keep_the_job_even_after_votes_close() {
         let store = helper_store::Store::open(":memory:").unwrap();
@@ -14152,6 +14694,319 @@ mod tests {
             assert!(store.poll(poll).unwrap().unwrap().closed);
             assert_eq!(store.due_scheduled_actions(0, 1).unwrap().len(), 1);
         }
+    }
+
+    /// Local stand-in for the Discord REST API; nothing leaves the machine.
+    async fn mock_discord_http(
+        replies: Vec<(u16, serde_json::Value)>,
+    ) -> (serenity::http::Http, tokio::task::JoinHandle<Vec<String>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for (status, reply) in replies {
+                let (mut socket, _) =
+                    tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut bytes = [0; 4096];
+                    let count = socket.read(&mut bytes).await.unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&bytes[..count]);
+                    if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&request[..end]);
+                        let length = headers
+                            .lines()
+                            .find_map(|line| {
+                                line.to_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .and_then(|v| v.trim().parse::<usize>().ok())
+                            })
+                            .unwrap_or(0);
+                        if request.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
+                    assert!(request.len() < 100_000);
+                }
+                requests.push(String::from_utf8(request).unwrap());
+                let body = if status == 204 {
+                    String::new()
+                } else {
+                    reply.to_string()
+                };
+                socket.write_all(format!("HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            }
+            requests
+        });
+        (
+            serenity::http::HttpBuilder::new("fixture-only")
+                .proxy(base)
+                .ratelimiter_disabled(true)
+                .build(),
+            task,
+        )
+    }
+
+    #[tokio::test]
+    async fn scheduled_unban_skips_when_a_newer_ban_case_exists() {
+        let store = helper_store::Store::open(":memory:").unwrap();
+        let case = store
+            .record_case("1", "tempban", "2", "mod", "r", Some(1))
+            .unwrap();
+        store.replace_scheduled_unban("1", "2", 0, case).unwrap();
+        store
+            .record_case("1", "ban", "2", "mod", "perm", None)
+            .unwrap();
+        let (http, server) = mock_discord_http(vec![]).await;
+        let job = store.due_scheduled_actions(0, 1).unwrap().pop().unwrap();
+        assert!(
+            super::deliver_scheduled_action(&http, &store, job.0, "1", "unban", &job.3, &job.4)
+                .await
+                .is_ok()
+        );
+        assert!(
+            store
+                .due_scheduled_actions(i64::MAX, 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(server.await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn scheduled_unban_lifts_the_ban_of_its_own_case() {
+        let store = helper_store::Store::open(":memory:").unwrap();
+        let case = store
+            .record_case("1", "tempban", "2", "mod", "r", Some(1))
+            .unwrap();
+        store.replace_scheduled_unban("1", "2", 0, case).unwrap();
+        let (http, server) = mock_discord_http(vec![(204, serde_json::Value::Null)]).await;
+        let job = store.due_scheduled_actions(0, 1).unwrap().pop().unwrap();
+        assert!(
+            super::deliver_scheduled_action(&http, &store, job.0, "1", "unban", &job.3, &job.4)
+                .await
+                .is_ok()
+        );
+        assert!(
+            store
+                .due_scheduled_actions(i64::MAX, 10)
+                .unwrap()
+                .is_empty()
+        );
+        let reqs = server.await.unwrap();
+        assert_eq!(reqs.len(), 1);
+        assert!(reqs[0].starts_with("DELETE /api/v10/guilds/1/bans/2 "));
+    }
+
+    #[test]
+    fn scheduled_failures_back_off_and_drop_only_dead_targets() {
+        use super::{ScheduledFailure as F, scheduled_failure_decision as decide};
+        assert_eq!(decide("reminder", 0, None), F::RetryAfterMs(30_000));
+        assert_eq!(decide("reminder", 1, None), F::RetryAfterMs(60_000));
+        assert_eq!(decide("reminder", 7, None), F::RetryAfterMs(3_600_000));
+        assert_eq!(decide("reminder", 11, None), F::Drop);
+        assert_eq!(decide("reminder", i64::MAX, None), F::Drop);
+        assert_eq!(decide("reminder", 0, Some(10_003)), F::Drop);
+        assert_eq!(decide("reminder", 0, Some(50_001)), F::Drop);
+        assert_eq!(decide("reminder", 0, Some(50_013)), F::RetryAfterMs(30_000));
+        assert_eq!(decide("anti_spam_untimeout", 0, Some(10_007)), F::Drop);
+        assert_eq!(decide("poll_end", 0, Some(10_008)), F::Drop);
+        assert_eq!(decide("giveaway_end", 0, Some(10_003)), F::Drop);
+        assert_eq!(decide("poll_end", 0, Some(50_001)), F::RetryAfterMs(30_000));
+        assert_eq!(
+            decide("giveaway_end", 0, Some(10_004)),
+            F::RetryAfterMs(30_000)
+        );
+        assert_eq!(decide("giveaway_end", 40, None), F::RetryAfterMs(3_600_000));
+        assert_eq!(decide("unban", 0, Some(10_013)), F::Drop);
+        assert_eq!(decide("unban", 0, Some(10_004)), F::RetryAfterMs(30_000));
+        assert_eq!(
+            decide("unban", 500, Some(50_013)),
+            F::RetryAfterMs(3_600_000)
+        );
+        assert_eq!(decide("unban", -5, None), F::RetryAfterMs(30_000));
+        assert_eq!(
+            decide("monetization_entitlement", 0, Some(10_007)),
+            F::RetryAfterMs(30_000)
+        );
+        assert_eq!(
+            decide("monetization_entitlement", 0, Some(10_004)),
+            F::RetryAfterMs(30_000)
+        );
+        assert_eq!(decide("monetization_entitlement", 0, Some(10_011)), F::Drop);
+        assert_eq!(
+            decide("web3_wallet_role_sync", 0, Some(10_007)),
+            F::RetryAfterMs(30_000)
+        );
+        assert_eq!(
+            decide("shop_notice", 0, Some(10_003)),
+            F::RetryAfterMs(30_000)
+        );
+        assert_eq!(decide("ticket_sla", 50, None), F::RetryAfterMs(3_600_000));
+    }
+
+    /// A due reminder for channel 5 in guild 1, with reminders enabled.
+    fn due_reminder_store() -> (helper_store::Store, helper_store::ScheduledAction) {
+        let store = helper_store::Store::open(":memory:").unwrap();
+        store
+            .set_setting("1", "feature.utility.reminders", "true")
+            .unwrap();
+        store
+            .schedule("1", "2", 0, r#"{"channel_id":"5","text":"hi"}"#)
+            .unwrap();
+        let job = store.due_scheduled_actions(0, 1).unwrap().pop().unwrap();
+        (store, job)
+    }
+
+    #[tokio::test]
+    async fn scheduled_reminder_is_sent_and_consumed() {
+        let (store, job) = due_reminder_store();
+        let (http, server) = mock_discord_http(vec![(
+            200,
+            serde_json::to_value(serenity::all::Message::default()).unwrap(),
+        )])
+        .await;
+        super::run_due_scheduled_action(&http, &store, job.clone(), 0).await;
+        assert!(
+            store
+                .due_scheduled_actions(i64::MAX, 10)
+                .unwrap()
+                .is_empty()
+        );
+        let reqs = server.await.unwrap();
+        assert_eq!(reqs.len(), 1);
+        assert!(reqs[0].starts_with("POST /api/v10/channels/5/messages "));
+    }
+
+    #[tokio::test]
+    async fn scheduled_reminder_to_a_deleted_channel_is_dropped() {
+        let (store, job) = due_reminder_store();
+        let id = job.0;
+        let (http, server) = mock_discord_http(vec![(
+            404,
+            serde_json::json!({"code": 10003, "message": "Unknown Channel"}),
+        )])
+        .await;
+        super::run_due_scheduled_action(&http, &store, job.clone(), 0).await;
+        assert!(
+            store
+                .due_scheduled_actions(i64::MAX, 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(store.scheduled_action_attempts(id).unwrap(), None);
+        let reqs = server.await.unwrap();
+        assert_eq!(reqs.len(), 1);
+        assert!(reqs[0].starts_with("POST /api/v10/channels/5/messages "));
+    }
+
+    #[tokio::test]
+    async fn scheduled_reminder_waits_after_missing_permissions() {
+        let (store, job) = due_reminder_store();
+        let id = job.0;
+        let (http, server) = mock_discord_http(vec![(
+            403,
+            serde_json::json!({"code": 50013, "message": "Missing Permissions"}),
+        )])
+        .await;
+        super::run_due_scheduled_action(&http, &store, job.clone(), 0).await;
+        assert!(store.due_scheduled_actions(29_999, 10).unwrap().is_empty());
+        assert_eq!(store.due_scheduled_actions(30_000, 10).unwrap().len(), 1);
+        assert_eq!(store.scheduled_action_attempts(id).unwrap(), Some(1));
+        let reqs = server.await.unwrap();
+        assert_eq!(reqs.len(), 1);
+        assert!(reqs[0].starts_with("POST /api/v10/channels/5/messages "));
+    }
+
+    #[tokio::test]
+    async fn scheduled_unban_is_kept_after_missing_permissions() {
+        let store = helper_store::Store::open(":memory:").unwrap();
+        store.schedule_typed("1", "unban", "2", 0, "").unwrap();
+        let job = store.due_scheduled_actions(0, 1).unwrap().pop().unwrap();
+        let id = job.0;
+        let (http, server) = mock_discord_http(vec![(
+            403,
+            serde_json::json!({"code": 50013, "message": "Missing Permissions"}),
+        )])
+        .await;
+        super::run_due_scheduled_action(&http, &store, job.clone(), 0).await;
+        assert!(store.due_scheduled_actions(29_999, 10).unwrap().is_empty());
+        assert_eq!(store.due_scheduled_actions(30_000, 10).unwrap().len(), 1);
+        assert_eq!(store.scheduled_action_attempts(id).unwrap(), Some(1));
+        let reqs = server.await.unwrap();
+        assert_eq!(reqs.len(), 1);
+        assert!(reqs[0].starts_with("DELETE /api/v10/guilds/1/bans/2 "));
+    }
+
+    /// A due reminder for Discord event 7 in guild 1, posting to channel 5.
+    fn due_event_reminder_store() -> (helper_store::Store, helper_store::ScheduledAction) {
+        let store = helper_store::Store::open(":memory:").unwrap();
+        store
+            .set_setting("1", "feature.community.events", "true")
+            .unwrap();
+        store
+            .schedule_typed(
+                "1",
+                "event_reminder",
+                "7",
+                0,
+                r#"{"channel_id":"5","event_id":"7","text":"x","start":1893456000,"name":"Raid"}"#,
+            )
+            .unwrap();
+        let job = store.due_scheduled_actions(0, 1).unwrap().pop().unwrap();
+        (store, job)
+    }
+
+    #[tokio::test]
+    async fn event_reminder_for_a_deleted_event_is_dropped_without_posting() {
+        let (store, job) = due_event_reminder_store();
+        let (http, server) = mock_discord_http(vec![(
+            404,
+            serde_json::json!({"code": 10070, "message": "Unknown Guild Scheduled Event"}),
+        )])
+        .await;
+        super::run_due_scheduled_action(&http, &store, job, 0).await;
+        assert!(
+            store
+                .due_scheduled_actions(i64::MAX, 10)
+                .unwrap()
+                .is_empty()
+        );
+        let reqs = server.await.unwrap();
+        assert_eq!(reqs.len(), 1);
+        assert!(reqs[0].starts_with("GET /api/v10/guilds/1/scheduled-events/7"));
+    }
+
+    #[tokio::test]
+    async fn event_reminder_for_an_unchanged_event_is_posted() {
+        let (store, job) = due_event_reminder_store();
+        let (http, server) = mock_discord_http(vec![
+            (
+                200,
+                serde_json::json!({"id":"7","guild_id":"1","channel_id":null,"name":"Raid","scheduled_start_time":"2030-01-01T00:00:00+00:00","privacy_level":2,"status":1,"entity_type":3}),
+            ),
+            (
+                200,
+                serde_json::to_value(serenity::all::Message::default()).unwrap(),
+            ),
+        ])
+        .await;
+        super::run_due_scheduled_action(&http, &store, job, 0).await;
+        assert!(
+            store
+                .due_scheduled_actions(i64::MAX, 10)
+                .unwrap()
+                .is_empty()
+        );
+        let reqs = server.await.unwrap();
+        assert_eq!(reqs.len(), 2);
+        assert!(reqs[0].starts_with("GET /api/v10/guilds/1/scheduled-events/7"));
+        assert!(reqs[1].starts_with("POST /api/v10/channels/5/messages "));
     }
 
     #[test]
@@ -14370,10 +15225,10 @@ mod tests {
         HELPER_LANGUAGE_SETTING, HELPER_LOCALES, account_age_days,
         adapter::{DiscordAdapter, Effect, FakeDiscordAdapter},
         anti_nuke_containment_deadline, anti_spam_content_metrics, anti_spam_log_message,
-        anti_spam_warning_reason, anti_spam_warning_targets, command_feature_key,
-        custom_command_channel_ignored, custom_command_is_staff, english_bot_text,
-        evaluate_join_gate_verification, evaluate_nickname, feature_enabled, feature_title,
-        helper_command_counts_as_value, helper_gateway_intents, helper_locale,
+        anti_spam_warning_reason, anti_spam_warning_targets, audit_action_is_by_helper,
+        command_feature_key, custom_command_channel_ignored, custom_command_is_staff,
+        english_bot_text, evaluate_join_gate_verification, evaluate_nickname, feature_enabled,
+        feature_title, helper_command_counts_as_value, helper_gateway_intents, helper_locale,
         helper_locale_for_guild, helper_setup_is_complete, instagram_access_allowed,
         is_destructive_audit_action, join_burst_armed, parse_custom_command, parse_duration,
         parse_reminder_delay, parse_scheduled_event_window, permission_passport_message,
@@ -14648,6 +15503,28 @@ mod tests {
         assert!(!decision.assign_verified_role);
         assert!(!decision.remove_quarantine_role);
         assert!(decision.already_verified);
+    }
+
+    #[test]
+    fn blocked_joiners_get_no_welcome_or_welcome_auto_role() {
+        assert!(super::welcome_applies_to_join(true, false));
+        assert!(!super::welcome_applies_to_join(true, true));
+        assert!(!super::welcome_applies_to_join(false, false));
+        let welcome = serde_json::json!({"autoRole": "123"});
+        assert_eq!(super::welcome_auto_role(&welcome, false), Some(123));
+        assert_eq!(super::welcome_auto_role(&welcome, true), None);
+        assert_eq!(
+            super::welcome_auto_role(&serde_json::json!({"autoRole": "0"}), false),
+            None
+        );
+        assert_eq!(
+            super::welcome_auto_role(&serde_json::json!({"autoRole": "abc"}), false),
+            None
+        );
+        assert_eq!(
+            super::welcome_auto_role(&serde_json::json!({}), false),
+            None
+        );
     }
 
     #[test]
@@ -15038,6 +15915,14 @@ mod tests {
         assert!(!is_destructive_audit_action(
             serenity::model::guild::audit_log::Action::GuildUpdate
         ));
+    }
+
+    #[test]
+    fn anti_nuke_ignores_the_helpers_own_audit_actions() {
+        assert!(audit_action_is_by_helper(42, 42));
+        assert!(!audit_action_is_by_helper(41, 42)); // anyone else still counts (normal anti-nuke path)
+        assert!(!audit_action_is_by_helper(42, 0)); // bot id still unknown before `ready`
+        assert!(!audit_action_is_by_helper(0, 0));
     }
 
     #[test]
@@ -15617,5 +16502,56 @@ mod tests {
             "fallback"
         );
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn voice_transitions_follow_the_stored_session_not_serenity_old() {
+        use super::{VoiceSessionChange as C, voice_session_change as change};
+        assert_eq!(change(Some("1"), Some("1"), false), C::Keep); // mute/deafen/stream
+        assert_eq!(change(None, None, false), C::Keep);
+        assert_eq!(change(Some("1"), None, false), C::Finish); // leave
+        assert_eq!(change(None, Some("2"), false), C::Start("2".into())); // join
+        assert_eq!(change(None, Some("2"), true), C::Keep); // join ignored channel
+        assert_eq!(
+            change(Some("1"), Some("2"), false),
+            C::FinishAndStart("2".into())
+        );
+        assert_eq!(change(Some("1"), Some("2"), true), C::Finish); // move into ignored
+        use serenity::all::ChannelId;
+        assert_eq!(
+            super::voice_audit_change(Some(Some(ChannelId::new(5))), Some(ChannelId::new(5))),
+            None
+        );
+        assert_eq!(
+            super::voice_audit_change(Some(None), Some(ChannelId::new(5))),
+            Some(("not connected".into(), "<#5>".into()))
+        );
+        assert_eq!(
+            super::voice_audit_change(None, Some(ChannelId::new(5))),
+            Some(("an unknown channel".into(), "<#5>".into()))
+        );
+        assert_eq!(
+            super::voice_audit_change(Some(Some(ChannelId::new(5))), None),
+            Some(("<#5>".into(), "not connected".into()))
+        );
+    }
+
+    #[test]
+    fn voice_xp_join_mute_leave_awards_whole_minutes() {
+        use super::{VoiceSessionChange as C, voice_session_change as change};
+        let store = helper_store::Store::open(":memory:").unwrap();
+        assert_eq!(change(None, Some("c"), false), C::Start("c".into()));
+        store.start_voice_session("g", "u", "c", 100).unwrap();
+        let stored = store
+            .active_voice_session("g", "u")
+            .unwrap()
+            .map(|s| s.channel_id);
+        assert_eq!(change(stored.as_deref(), Some("c"), false), C::Keep); // mute: no restart
+        let stored = store
+            .active_voice_session("g", "u")
+            .unwrap()
+            .map(|s| s.channel_id);
+        assert_eq!(change(stored.as_deref(), None, false), C::Finish);
+        assert_eq!(store.finish_voice_session("g", "u", 700).unwrap(), Some(10));
     }
 }

@@ -14,5 +14,10 @@
   "r_eb4a6ce8e56d": " con i nomi di chi invita",
   "r_f22ae96535a7": " (solo animate)",
   "r_fe6ebea0bf5e": " · nota interna salvata",
-  "r_4aeacdd823e2": "Creator Channel: <#{0}>. Entra per creare la tua stanza."
+  "r_4aeacdd823e2": "Creator Channel: <#{0}>. Entra per creare la tua stanza.",
+  "r_5b2765ff3bd5": "Hai già 25 promemoria in sospeso in questo server. Aspetta che uno venga inviato prima di aggiungerne un altro.",
+  "r_76dcd789bfcb": "Estrazione a premi non trovata, ancora attiva, ancora in fase di annuncio o senza altri partecipanti da scegliere.",
+  "r_03bbc7b8b6ed": " Ruoli salvati che non esistono più e sono stati scartati: {0}.",
+  "r_db9acf706d49": "Quarantena rimossa per <@{0}>; {1} ruoli ripristinati.{2}",
+  "r_1b29f6412df3": "Ruoli di quarantena parzialmente ripristinati per <@{0}>: {1} ruoli ripristinati, {2} ancora in sospeso. I ruoli in sospeso sono salvati; controlla i permessi e riprova /unquarantine.{3}"
 }

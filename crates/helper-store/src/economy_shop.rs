@@ -214,6 +214,43 @@ impl Store {
         Ok(result)
     }
 
+    /// Queue the staff notice for a pending order the Helper could not deliver
+    /// (for example a role Discord refused). Same job as manual delivery.
+    pub fn queue_shop_review_notice(&self, guild: &str, order_id: i64) -> Result<bool> {
+        let mut conn = self.conn.lock().expect("store mutex poisoned");
+        let tx = conn.transaction()?;
+        let pending: Option<String> = tx
+            .query_row(
+                "SELECT status FROM economy_orders WHERE guild_id=?1 AND id=?2",
+                params![guild, order_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if pending.as_deref() != Some("pending") {
+            return Ok(false);
+        }
+        let channel:Option<String>=tx.query_row("SELECT value FROM settings WHERE guild_id=?1 AND key='community.economy.staff_channel'",[guild],|row|row.get(0)).optional()?;
+        if !channel
+            .as_deref()
+            .is_some_and(|id| id.parse::<u64>().is_ok_and(|id| id > 0))
+        {
+            return Ok(false);
+        }
+        let target = order_id.to_string();
+        let queued: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM scheduled_actions WHERE guild_id=?1 AND type='shop_notice' AND target_id=?2)",
+            params![guild, target],
+            |row| row.get(0),
+        )?;
+        if queued {
+            return Ok(false);
+        }
+        let now = Utc::now().timestamp_millis();
+        tx.execute("INSERT INTO scheduled_actions(guild_id,type,target_id,execute_at,payload) VALUES(?1,'shop_notice',?2,?3,'{}')",params![guild,target,now])?;
+        tx.commit()?;
+        Ok(true)
+    }
+
     pub fn resolve_shop_order(
         &self,
         guild: &str,
@@ -371,7 +408,7 @@ mod tests {
             1
         );
         assert_eq!(store.economy_account("g", "u").unwrap().balance, 20);
-        store.delete_member_voluntary_data("g", "u").unwrap();
+        store.purge_user("g", "u").unwrap();
         assert!(store.shop_orders("g", i64::MAX).unwrap().is_empty());
         assert_eq!(store.shop_products("g").unwrap().len(), 1);
     }
@@ -433,5 +470,57 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+    #[test]
+    fn role_delivery_failure_queues_one_review_notice() {
+        let store = Store::open(":memory:").unwrap();
+        store.claim_daily("g", "u", 1000).unwrap();
+        store
+            .save_shop_product(
+                "g",
+                None,
+                0,
+                &ShopProductInput {
+                    name: "VIP".into(),
+                    price: 80,
+                    delivery: "role".into(),
+                    role_id: Some("123456789012345678".into()),
+                },
+            )
+            .unwrap();
+        let p = store.shop_products("g").unwrap().remove(0);
+        let order = store
+            .buy_shop_product("g", "u", "Name", p.id, p.version, "r1")
+            .unwrap();
+        assert_eq!(order.status, "pending");
+        // A role purchase alone still queues nothing.
+        assert!(
+            store
+                .due_scheduled_actions(i64::MAX, 100)
+                .unwrap()
+                .is_empty()
+        );
+        // Without a staff channel there is nowhere to send the notice.
+        assert!(!store.queue_shop_review_notice("g", order.id).unwrap());
+        store
+            .set_setting("g", "community.economy.staff_channel", "20")
+            .unwrap();
+        assert!(store.queue_shop_review_notice("g", order.id).unwrap());
+        assert!(!store.queue_shop_review_notice("g", order.id).unwrap());
+        let jobs = store.due_scheduled_actions(i64::MAX, 100).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].2, "shop_notice");
+        assert_eq!(jobs[0].3, order.id.to_string());
+        store
+            .resolve_shop_order("g", order.id, "refunded", "staff")
+            .unwrap();
+        assert!(
+            store
+                .due_scheduled_actions(i64::MAX, 100)
+                .unwrap()
+                .is_empty()
+        );
+        // A resolved order is no longer pending, so no new notice.
+        assert!(!store.queue_shop_review_notice("g", order.id).unwrap());
     }
 }

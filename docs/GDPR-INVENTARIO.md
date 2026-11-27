@@ -51,6 +51,70 @@ reter com prazo e dar direitos**.
 | `localStorage vh_sess` (browser) | token de sessão + timestamp                          | Persistir sessão entre F5 (timeout 5 min)   | **Estritamente necessário** | Limpo no logout / 5 min inativo                             |
 | Token OAuth Discord              | access token implícito                               | Verificar identidade no login               | **Estritamente necessário** | **Não persistido** (trocado por sessão e descartado)        |
 
+## Helper em Rust: dados pessoais (desde 2026-11)
+
+### Economia de quem sai (30 dias)
+
+Quando um membro sai, é expulso ou banido, a sua economia (saldo, histórico, tempos de espera, encomendas, incluindo
+as pendentes, e os avisos da loja dessas encomendas) fica guardada **30 dias** (decisão do dono de 25/11/2026). Fica
+marcada na tabela `member_departures` (servidor, utilizador, hora da saída). Se o membro reentrar, a marca sai e fica
+tudo como estava. Ao fim de 30 dias, a limpeza apaga a economia e a marca, salvo se houver sinal de que voltou:
+entrada registada depois da saída, ou XP, comando, `/daily` ou recompensa mais de 5 minutos depois da saída. Enquanto
+está fora, o membro não aparece no ranking de saldo. `/privacidade apagar` e apagar o servidor apagam logo a economia e
+a marca.
+
+### Saída de um membro e apagamento a pedido
+
+**Quando um membro sai, é expulso ou banido**, apagam-se logo:
+- votos em sugestões;
+- participações em sorteios;
+- votos em sondagens;
+- lembretes;
+- inscrições em eventos;
+- estado AFK;
+- níveis e eventos de XP;
+- sessão de voz aberta;
+- aniversário;
+- tags e sugestões que criou.
+
+As conquistas ficam (decisão do dono a 26/11). A economia tem regra própria (ver "Economia de quem sai").
+
+**`/privacidade apagar`** apaga, além disso, as conquistas, a economia, a marca de saída e a atribuição de convite do
+membro. Também retira o seu identificador das atribuições de quem ele convidou. A exportação inclui a atribuição de
+convite (código e data), mas não quem convidou. Os registos de moderação ficam (art. 17.º/3-e).
+
+**Apagar o servidor** apaga todos os dados desse servidor, incluindo as tabelas antigas do bot em Node (`notes`,
+`sticky_roles`) quando existem. `invite_snapshots` guarda o criador de cada convite tal como o Discord o mostra; volta a
+ser lido do Discord enquanto o convite existir e apaga-se com o servidor.
+
+### Retenção automática
+
+Corre de hora a hora no gateway do Helper. Apaga:
+
+| Dados | Prazo |
+|---|---|
+| Economia de quem saiu (`member_departures`) | 30 dias depois da saída |
+| `audit_events` | 30 dias |
+| `activity_log` | 90 dias |
+| Crescimento de servidores que removeram o Helper | 30 dias depois da saída |
+| `infractions`, `quarantine` | 1 ano |
+| `cases` | 2 anos |
+| `scheduled_actions` | 90 dias depois da data prevista |
+| `tickets` fechados | 1 ano depois de fechar |
+| `suggestions` e votos | 1 ano |
+| `giveaways`, `polls` terminados (com entradas, resultados e votos) | 90 dias depois de terminar |
+| `stats` | 1 ano |
+| `xp_events` | 1 ano |
+| `event_registrations` | 1 ano depois da inscrição |
+| `voice_sessions` paradas | 24 horas |
+| `welcome_delivery_claims` | 24 horas |
+| `achievement_links` expirados | 24 horas depois de expirar |
+| Sessões do painel e estados OAuth | 24 horas depois de expirar |
+| `notes` (tabela antiga do Node) | 2 anos |
+| `sticky_roles` (tabela antiga do Node) | 1 ano |
+
+`invite_attributions` não tem prazo: apaga-se com `/privacidade apagar` ou com o servidor.
+
 ## Conclusões que alimentam as fases seguintes
 
 - **Sem cookies não-essenciais → sem banner de consentimento.** O cookie e o localStorage

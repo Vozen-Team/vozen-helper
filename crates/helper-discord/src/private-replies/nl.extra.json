@@ -14,5 +14,10 @@
 "r_eb4a6ce8e56d":" met namen van uitnodigers",
 "r_f22ae96535a7":" (alleen bewegende)",
 "r_fe6ebea0bf5e":" · interne notitie opgeslagen",
-  "r_4aeacdd823e2": "Creator Channel: <#{0}>. Neem deel om je kamer te maken."
+  "r_4aeacdd823e2": "Creator Channel: <#{0}>. Neem deel om je kamer te maken.",
+  "r_5b2765ff3bd5": "Je hebt al 25 openstaande herinneringen op deze server. Wacht tot er een is verstuurd voordat je er nog een toevoegt.",
+  "r_76dcd789bfcb": "Weggeefactie niet gevonden, nog actief, wordt nog aangekondigd of heeft geen andere deelnemers om te kiezen.",
+  "r_03bbc7b8b6ed": " {0} opgeslagen rol(len) bestaan niet meer en zijn weggelaten.",
+  "r_db9acf706d49": "Quarantaine opgeheven voor <@{0}>; {1} rollen hersteld.{2}",
+  "r_1b29f6412df3": "Rollen na quarantaine gedeeltelijk hersteld voor <@{0}>: {1} rollen hersteld, {2} nog in afwachting. Openstaande rollen zijn opgeslagen; controleer de machtigingen en probeer /unquarantine opnieuw.{3}"
 }

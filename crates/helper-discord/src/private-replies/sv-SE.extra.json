@@ -14,5 +14,10 @@
   "r_eb4a6ce8e56d": " med inbjudarnas namn",
   "r_f22ae96535a7": " (endast animerade)",
   "r_fe6ebea0bf5e": " · intern anteckning sparad",
-  "r_4aeacdd823e2": "Creator Channel: <#{0}>. Anslut för att skapa ditt rum."
+  "r_4aeacdd823e2": "Creator Channel: <#{0}>. Anslut för att skapa ditt rum.",
+  "r_5b2765ff3bd5": "Du har redan 25 väntande påminnelser på den här servern. Vänta tills en av dem har skickats innan du lägger till en ny.",
+  "r_76dcd789bfcb": "Utlottningen hittades inte, pågår fortfarande, håller fortfarande på att tillkännages eller saknar andra deltagare att välja.",
+  "r_03bbc7b8b6ed": " {0} sparade roll(er) finns inte längre och togs bort.",
+  "r_db9acf706d49": "Karantänen har hävts för <@{0}>. {1} roller har återställts.{2}",
+  "r_1b29f6412df3": "Karantänen delvis återställd för <@{0}>: {1} roller återställda, {2} återstår. Återstående roller är sparade; kontrollera behörigheterna och försök med /unquarantine igen.{3}"
 }

@@ -14,5 +14,10 @@
 "r_eb4a6ce8e56d":" med navne på dem, der inviterede",
 "r_f22ae96535a7":" (kun animerede)",
 "r_fe6ebea0bf5e":" · intern note gemt",
-  "r_4aeacdd823e2": "Creator Channel: <#{0}>. Tilslut dig for at oprette dit rum."
+  "r_4aeacdd823e2": "Creator Channel: <#{0}>. Tilslut dig for at oprette dit rum.",
+  "r_5b2765ff3bd5": "Du har allerede 25 ventende påmindelser på denne server. Vent, til en af dem er sendt, før du tilføjer en ny.",
+  "r_76dcd789bfcb": "Lodtrækningen blev ikke fundet, er stadig aktiv, bliver stadig annonceret eller har ingen andre deltagere at vælge.",
+  "r_03bbc7b8b6ed": " {0} gemte rolle(r) findes ikke længere og blev fjernet.",
+  "r_db9acf706d49": "Karantæne fjernet fra <@{0}>; {1} roller gendannet.{2}",
+  "r_1b29f6412df3": "Roller efter karantæne delvist gendannet for <@{0}>: {1} roller gendannet, {2} afventer stadig. Afventende roller er gemt; kontrollér tilladelser, og prøv /unquarantine igen.{3}"
 }

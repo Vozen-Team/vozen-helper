@@ -29,6 +29,16 @@ pub fn is_valid_workflow_reaction(raw: &str) -> bool {
         && !value.contains(':')
 }
 
+/// A birthday is a day and month only, with no year, so 29 February is valid.
+pub fn is_valid_birthday(month: u32, day: u32) -> bool {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => (1..=31).contains(&day),
+        4 | 6 | 9 | 11 => (1..=30).contains(&day),
+        2 => (1..=29).contains(&day),
+        _ => false,
+    }
+}
+
 /// Lifecycle state exposed by the configuration catalogue.  The panel must
 /// never infer this state from a boolean toggle: a feature can be configured
 /// without having a runtime adapter, or can be temporarily unhealthy.
@@ -322,4 +332,20 @@ pub struct ApiError {
     pub code: String,
     pub message: String,
     pub request_id: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn birthday_days_follow_the_calendar() {
+        assert!(is_valid_birthday(2, 29));
+        assert!(is_valid_birthday(4, 30));
+        assert!(is_valid_birthday(12, 31));
+        assert!(!is_valid_birthday(2, 30));
+        assert!(!is_valid_birthday(4, 31));
+        assert!(!is_valid_birthday(13, 1));
+        assert!(!is_valid_birthday(1, 0));
+    }
 }

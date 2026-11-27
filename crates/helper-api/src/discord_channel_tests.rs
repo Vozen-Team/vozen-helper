@@ -404,3 +404,60 @@ async fn quick_setup_rejects_foreign_guild_channel_before_saving_or_publishing()
     );
     server.abort();
 }
+
+#[tokio::test]
+async fn quick_setup_welcome_detects_concurrent_feature_edit() {
+    let (state, claims) = subscription_state();
+    let store = state.store.clone();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = calls.clone();
+    let mock = Router::new().route(
+        "/channels/{channel}",
+        get(move || {
+            let store = store.clone();
+            let counter = counter.clone();
+            async move {
+                // Another tab saves the welcome feature while this step runs.
+                if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                    store
+                        .publish_feature_setting(
+                            GUILD,
+                            "support.welcome",
+                            true,
+                            "{}",
+                            None,
+                            "other",
+                            &[],
+                        )
+                        .unwrap();
+                }
+                Json(serde_json::json!({"id":CHANNEL,"guild_id":GUILD,"type":0}))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+    let payload =
+        serde_json::json!({"status":"applied","enabled":true,"config":{"channel":CHANNEL}});
+    let (status, body) = request_subscription(
+        state.clone(),
+        &claims,
+        base,
+        "PUT",
+        "/api/quick-setup/steps/welcome",
+        payload,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "feature_revision_conflict", "{body}");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let record = state
+        .store
+        .get_feature_setting(GUILD, "support.welcome")
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.config_json, "{}");
+    assert_eq!(record.revision, 1);
+    server.abort();
+}

@@ -14,5 +14,10 @@
   "r_eb4a6ce8e56d": " con los nombres de quienes invitan",
   "r_f22ae96535a7": " (solo animados)",
   "r_fe6ebea0bf5e": " · nota interna guardada",
-  "r_4aeacdd823e2": "Creator Channel: <#{0}>. Entra para crear tu sala."
+  "r_4aeacdd823e2": "Creator Channel: <#{0}>. Entra para crear tu sala.",
+  "r_5b2765ff3bd5": "Ya tienes 25 recordatorios pendientes en este servidor. Espera a que se envíe alguno antes de añadir otro.",
+  "r_76dcd789bfcb": "Sorteo no encontrado, todavía activo, todavía anunciándose o sin otros participantes para elegir.",
+  "r_03bbc7b8b6ed": " {0} rol(es) guardado(s) ya no existen y se descartaron.",
+  "r_db9acf706d49": "Cuarentena retirada de <@{0}>; {1} rol(es) restaurado(s).{2}",
+  "r_1b29f6412df3": "Restauración parcial de los roles de cuarentena de <@{0}>: {1} rol(es) restaurado(s), {2} aún pendiente(s). Los roles pendientes están guardados; comprueba los permisos y vuelve a ejecutar /unquarantine.{3}"
 }

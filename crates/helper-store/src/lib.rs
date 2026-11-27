@@ -18,7 +18,9 @@ pub use achievement_activity::AchievementProgress;
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Duration, Utc};
-use helper_contracts::{EntitlementSnapshot, SessionClaims, is_valid_workflow_reaction};
+use helper_contracts::{
+    EntitlementSnapshot, SessionClaims, is_valid_birthday, is_valid_workflow_reaction,
+};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::{
     path::{Path, PathBuf},
@@ -31,6 +33,20 @@ pub struct Store {
     conn: Arc<Mutex<Connection>>,
     database_path: Option<std::path::PathBuf>,
 }
+
+/// Version of the schema produced by `Store::migrate`, stored in `helper_meta`
+/// under `rust_schema_version`. Raise it by one whenever `migrate` changes the
+/// schema (new table, column or index). A future step that is not idempotent
+/// (for example a column rename) runs only when the stored version is lower.
+/// `PRAGMA user_version` belongs to the Node bot (src/store/db.ts) on databases
+/// converted in place, so it must not be used here.
+const RUST_SCHEMA_VERSION: i64 = 2;
+
+/// Owner decision 2026-11-25: a departed member's economy is kept this long.
+const DEPARTED_ECONOMY_RETENTION_DAYS: i64 = 30;
+/// Activity (other than a rejoin) this long after a departure proves the member
+/// came back even if the rejoin event was missed.
+const DEPARTURE_PRESENCE_GRACE_MS: i64 = 5 * 60 * 1_000;
 
 #[derive(Debug, Clone, Copy, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -903,7 +919,12 @@ impl Store {
         } else {
             Some(path.as_ref().to_path_buf())
         };
-        let conn = Connection::open(path).context("open helper sqlite")?;
+        let mut conn = Connection::open(path).context("open helper sqlite")?;
+        // Two Stores (API and gateway) share this file in Serve mode. Every
+        // transaction takes the write lock at BEGIN and waits for the other
+        // connection instead of failing when it upgrades from read to write.
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        conn.set_transaction_behavior(rusqlite::TransactionBehavior::Immediate);
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         let store = Self {
@@ -1016,6 +1037,19 @@ impl Store {
         // The event key is scoped to a guild because Discord identifiers from
         // different sources may legitimately overlap in fixtures/imports.
         conn.execute_batch("CREATE TABLE IF NOT EXISTS xp_events (guild_id TEXT NOT NULL, user_id TEXT NOT NULL, event_key TEXT NOT NULL, source TEXT NOT NULL, amount INTEGER NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY(guild_id,event_key)); CREATE INDEX IF NOT EXISTS idx_xp_events_user_time ON xp_events(guild_id,user_id,created_at DESC);")?;
+        // Same names as the Node schema (src/store/db.ts) so databases converted
+        // in place keep their existing indexes instead of getting duplicates.
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_cases_target ON cases(guild_id,target_id);
+             CREATE INDEX IF NOT EXISTS idx_activity_user ON activity_log(guild_id,user_id);
+             CREATE INDEX IF NOT EXISTS idx_levels_xp ON levels(guild_id,xp DESC);",
+        )?;
+        // Owner decision 2026-11-25: a departed member's economy is kept for 30
+        // days behind this marker, then erased by `prune_retention`.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS member_departures (guild_id TEXT NOT NULL, user_id TEXT NOT NULL, left_at INTEGER NOT NULL, PRIMARY KEY(guild_id,user_id));
+             CREATE INDEX IF NOT EXISTS idx_member_departures_left ON member_departures(left_at);",
+        )?;
         conn.execute_batch("CREATE TABLE IF NOT EXISTS birthdays (guild_id TEXT NOT NULL, user_id TEXT NOT NULL, month INTEGER NOT NULL, day INTEGER NOT NULL, last_announced_year INTEGER, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY(guild_id,user_id)); CREATE INDEX IF NOT EXISTS idx_birthdays_day ON birthdays(month,day,last_announced_year); CREATE TABLE IF NOT EXISTS economy_accounts (guild_id TEXT NOT NULL, user_id TEXT NOT NULL, balance INTEGER NOT NULL DEFAULT 0, last_daily_at INTEGER, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY(guild_id,user_id)); CREATE INDEX IF NOT EXISTS idx_economy_guild_balance ON economy_accounts(guild_id,balance DESC); CREATE TABLE IF NOT EXISTS economy_ledger (id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id TEXT NOT NULL, user_id TEXT NOT NULL, amount INTEGER NOT NULL, reason TEXT NOT NULL, idempotency_key TEXT NOT NULL UNIQUE, created_at INTEGER NOT NULL); CREATE INDEX IF NOT EXISTS idx_economy_ledger_account ON economy_ledger(guild_id,user_id,created_at DESC); CREATE TABLE IF NOT EXISTS temp_channels (guild_id TEXT NOT NULL, channel_id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, created_at INTEGER NOT NULL); CREATE INDEX IF NOT EXISTS idx_temp_channels_guild ON temp_channels(guild_id); CREATE TABLE IF NOT EXISTS voice_sessions (guild_id TEXT NOT NULL, user_id TEXT NOT NULL, channel_id TEXT NOT NULL, started_at INTEGER NOT NULL, PRIMARY KEY(guild_id,user_id)); CREATE INDEX IF NOT EXISTS idx_voice_sessions_guild ON voice_sessions(guild_id,started_at);")?;
         economy_shop::migrate(&conn)?;
         conn.execute_batch("CREATE TABLE IF NOT EXISTS economy_cooldowns (guild_id TEXT NOT NULL, user_id TEXT NOT NULL, kind TEXT NOT NULL, last_claim_at INTEGER NOT NULL, PRIMARY KEY(guild_id,user_id,kind)); CREATE INDEX IF NOT EXISTS idx_economy_cooldowns_kind ON economy_cooldowns(guild_id,kind,last_claim_at);")?;
@@ -1075,6 +1109,19 @@ impl Store {
                 )?;
             }
         }
+        // Consecutive delivery failures, so the scheduler can back off and give
+        // up on targets that can never succeed instead of retrying every second.
+        let scheduled_attempts_exists: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('scheduled_actions') WHERE name='attempts'",
+            [],
+            |row| row.get(0),
+        )?;
+        if scheduled_attempts_exists == 0 {
+            conn.execute(
+                "ALTER TABLE scheduled_actions ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
         conn.execute_batch("CREATE TABLE IF NOT EXISTS event_registrations (guild_id TEXT NOT NULL, event_id TEXT NOT NULL, user_id TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'registered', created_at INTEGER NOT NULL, checked_in_at INTEGER, PRIMARY KEY(guild_id,event_id,user_id)); CREATE INDEX IF NOT EXISTS idx_event_registrations_event ON event_registrations(guild_id,event_id,status);")?;
         conn.execute_batch("CREATE TABLE IF NOT EXISTS twitch_subscriptions (id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id TEXT NOT NULL, source_login TEXT NOT NULL, source_user_id TEXT NOT NULL, target_channel_id TEXT NOT NULL, message_template TEXT NOT NULL DEFAULT '{broadcaster} is live!\\nhttps://twitch.tv/{login}', mention TEXT NOT NULL DEFAULT '', enabled INTEGER NOT NULL DEFAULT 1, pending_event_id TEXT, pending_stream_id TEXT, pending_started_at TEXT, last_event_id TEXT, next_poll_at INTEGER NOT NULL, failure_count INTEGER NOT NULL DEFAULT 0, last_error TEXT, created_by TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, UNIQUE(guild_id,source_user_id,target_channel_id)); CREATE INDEX IF NOT EXISTS idx_twitch_due ON twitch_subscriptions(enabled,next_poll_at); CREATE INDEX IF NOT EXISTS idx_twitch_user ON twitch_subscriptions(source_user_id,enabled); CREATE INDEX IF NOT EXISTS idx_twitch_guild ON twitch_subscriptions(guild_id,updated_at DESC);")?;
         let twitch_last_event_exists: i64 = conn.query_row(
@@ -1098,6 +1145,10 @@ impl Store {
         tx.commit()?;
         drop(conn);
         self.migrate_achievement_activity()?;
+        self.conn.lock().expect("store mutex poisoned").execute(
+            "INSERT INTO helper_meta(key,value) VALUES('rust_schema_version',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value WHERE CAST(helper_meta.value AS INTEGER) < CAST(excluded.value AS INTEGER)",
+            [RUST_SCHEMA_VERSION.to_string()],
+        )?;
         Ok(())
     }
 
@@ -1508,6 +1559,41 @@ impl Store {
         )?)
     }
 
+    /// Failed delivery attempts of one scheduled action; `None` when the job
+    /// no longer exists.
+    pub fn scheduled_action_attempts(&self, id: i64) -> Result<Option<i64>> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        Ok(conn
+            .query_row(
+                "SELECT attempts FROM scheduled_actions WHERE id=?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Counts one more failure and moves the job to its next attempt, which
+    /// takes it out of the due batch until then. False when the job is gone.
+    pub fn retry_scheduled_action(&self, id: i64, next_execute_at: i64) -> Result<bool> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let changed = conn.execute(
+            "UPDATE scheduled_actions SET attempts=attempts+1, execute_at=?2 WHERE id=?1",
+            params![id, next_execute_at],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Reminders a member still has waiting in one guild.
+    pub fn pending_reminder_count(&self, guild_id: &str, user_id: &str) -> Result<u32> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM scheduled_actions WHERE guild_id=?1 AND type='reminder' AND target_id=?2",
+            params![guild_id, user_id],
+            |row| row.get(0),
+        )?;
+        Ok(u32::try_from(count).unwrap_or(u32::MAX))
+    }
+
     /// Records a provider event exactly once. The boolean is false for a
     /// duplicate webhook, making at-least-once providers idempotent.
     pub fn record_provider_event(
@@ -1573,16 +1659,31 @@ impl Store {
         )? > 0)
     }
 
-    /// Remove only voluntary member state. Moderation records remain intact so
-    /// that the server's audit history is not silently rewritten when a member
-    /// leaves or requests deletion of personal preferences.
+    /// Remove only voluntary member state when a member leaves now. Moderation
+    /// records remain intact so that the server's audit history is not
+    /// silently rewritten. The economy (balance, ledger, cooldowns, orders and
+    /// their shop notices) is kept for 30 days behind a `member_departures`
+    /// marker (owner decision 2026-11-25); everything else is removed at once.
     pub fn delete_member_voluntary_data(
         &self,
         guild_id: &str,
         user_id: &str,
     ) -> Result<serde_json::Value> {
+        self.delete_member_voluntary_data_at(guild_id, user_id, Utc::now().timestamp_millis())
+    }
+
+    /// Same as `delete_member_voluntary_data` for a departure observed at
+    /// `left_at_ms`. When a rejoin was already recorded at or after that time,
+    /// the member is back and no departure marker is written.
+    pub fn delete_member_voluntary_data_at(
+        &self,
+        guild_id: &str,
+        user_id: &str,
+        left_at_ms: i64,
+    ) -> Result<serde_json::Value> {
         let mut conn = self.conn.lock().expect("store mutex poisoned");
         let tx = conn.transaction()?;
+        let freed_events = seated_event_ids(&tx, guild_id, user_id)?;
         let mut deleted = serde_json::Map::new();
         for (name, statement) in [
             (
@@ -1623,26 +1724,6 @@ impl Store {
                 "DELETE FROM birthdays WHERE guild_id=?2 AND user_id=?1",
             ),
             (
-                "shop_notifications",
-                "DELETE FROM scheduled_actions WHERE guild_id=?2 AND type='shop_notice' AND target_id IN (SELECT CAST(id AS TEXT) FROM economy_orders WHERE guild_id=?2 AND user_id=?1)",
-            ),
-            (
-                "economy_orders",
-                "DELETE FROM economy_orders WHERE guild_id=?2 AND user_id=?1",
-            ),
-            (
-                "economy_accounts",
-                "DELETE FROM economy_accounts WHERE guild_id=?2 AND user_id=?1",
-            ),
-            (
-                "economy_ledger",
-                "DELETE FROM economy_ledger WHERE guild_id=?2 AND user_id=?1",
-            ),
-            (
-                "economy_cooldowns",
-                "DELETE FROM economy_cooldowns WHERE guild_id=?2 AND user_id=?1",
-            ),
-            (
                 "tags",
                 "DELETE FROM tags WHERE guild_id=?2 AND author_id=?1",
             ),
@@ -1656,8 +1737,35 @@ impl Store {
                 deleted.insert(name.to_string(), serde_json::json!(count));
             }
         }
+        for event_id in &freed_events {
+            promote_next_waitlisted(&tx, guild_id, event_id)?;
+        }
+        // The leave handler waits on Discord before reaching this point, so a
+        // rejoin may already have been handled; a marker written now would be
+        // left on a present member.
+        let rejoined: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM activity_log WHERE guild_id=?1 AND user_id=?2 AND type='member_join' AND created_at>=?3)",
+            params![guild_id, user_id, left_at_ms],
+            |row| row.get(0),
+        )?;
+        if !rejoined {
+            tx.execute(
+                "INSERT INTO member_departures(guild_id,user_id,left_at) VALUES(?1,?2,?3) ON CONFLICT(guild_id,user_id) DO UPDATE SET left_at=excluded.left_at",
+                params![guild_id, user_id, left_at_ms],
+            )?;
+        }
         tx.commit()?;
         Ok(serde_json::Value::Object(deleted))
+    }
+
+    /// A member who rejoins gets their kept economy back. Returns whether a
+    /// departure marker was removed.
+    pub fn clear_member_departure(&self, guild_id: &str, user_id: &str) -> Result<bool> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        Ok(conn.execute(
+            "DELETE FROM member_departures WHERE guild_id=?1 AND user_id=?2",
+            params![guild_id, user_id],
+        )? > 0)
     }
 
     pub fn upsert_tag(
@@ -1730,13 +1838,14 @@ impl Store {
     }
 
     pub fn set_birthday(&self, guild_id: &str, user_id: &str, month: u32, day: u32) -> Result<()> {
-        if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        if !is_valid_birthday(month, day) {
             bail!("invalid_birthday");
         }
         let now = Utc::now().timestamp_millis();
         let conn = self.conn.lock().expect("store mutex poisoned");
+        // Saving the same date again keeps this year's announcement mark.
         conn.execute(
-            "INSERT INTO birthdays(guild_id,user_id,month,day,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?5) ON CONFLICT(guild_id,user_id) DO UPDATE SET month=excluded.month,day=excluded.day,last_announced_year=NULL,updated_at=excluded.updated_at",
+            "INSERT INTO birthdays(guild_id,user_id,month,day,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?5) ON CONFLICT(guild_id,user_id) DO UPDATE SET month=excluded.month,day=excluded.day,last_announced_year=CASE WHEN birthdays.month=excluded.month AND birthdays.day=excluded.day THEN birthdays.last_announced_year ELSE NULL END,updated_at=excluded.updated_at",
             params![guild_id, user_id, month, day, now],
         )?;
         Ok(())
@@ -1758,9 +1867,15 @@ impl Store {
         limit: u32,
     ) -> Result<Vec<BirthdayRecord>> {
         let conn = self.conn.lock().expect("store mutex poisoned");
-        let mut stmt = conn.prepare("SELECT guild_id,user_id,month,day,last_announced_year FROM birthdays WHERE month=?1 AND day=?2 AND (last_announced_year IS NULL OR last_announced_year<>?3) LIMIT ?4")?;
+        let mut stmt = conn.prepare("SELECT guild_id,user_id,month,day,last_announced_year FROM birthdays WHERE ((month=?1 AND day=?2) OR (?5=1 AND month=2 AND day=29)) AND (last_announced_year IS NULL OR last_announced_year<>?3) LIMIT ?4")?;
         let rows = stmt.query_map(
-            params![month, day, year, i64::from(limit.min(500))],
+            params![
+                month,
+                day,
+                year,
+                i64::from(limit.min(500)),
+                leap_day_falls_back_today(month, day, year)
+            ],
             |row| {
                 Ok(BirthdayRecord {
                     guild_id: row.get(0)?,
@@ -1786,10 +1901,17 @@ impl Store {
     ) -> Result<Vec<BirthdayRecord>> {
         let conn = self.conn.lock().expect("store mutex poisoned");
         let mut stmt = conn.prepare(
-            "SELECT guild_id,user_id,month,day,last_announced_year FROM birthdays WHERE guild_id=?1 AND month=?2 AND day=?3 AND (last_announced_year IS NULL OR last_announced_year<>?4) LIMIT ?5",
+            "SELECT guild_id,user_id,month,day,last_announced_year FROM birthdays WHERE guild_id=?1 AND ((month=?2 AND day=?3) OR (?6=1 AND month=2 AND day=29)) AND (last_announced_year IS NULL OR last_announced_year<>?4) LIMIT ?5",
         )?;
         let rows = stmt.query_map(
-            params![guild_id, month, day, year, i64::from(limit.min(500))],
+            params![
+                guild_id,
+                month,
+                day,
+                year,
+                i64::from(limit.min(500)),
+                leap_day_falls_back_today(month, day, year)
+            ],
             |row| {
                 Ok(BirthdayRecord {
                     guild_id: row.get(0)?,
@@ -1953,7 +2075,7 @@ impl Store {
     pub fn economy_top(&self, guild_id: &str, limit: u32) -> Result<Vec<(String, i64)>> {
         let conn = self.conn.lock().expect("store mutex poisoned");
         let mut stmt = conn.prepare(
-            "SELECT user_id,balance FROM economy_accounts WHERE guild_id=?1 AND balance>0 ORDER BY balance DESC,user_id ASC LIMIT ?2",
+            "SELECT user_id,balance FROM economy_accounts WHERE guild_id=?1 AND balance>0 AND NOT EXISTS (SELECT 1 FROM member_departures d WHERE d.guild_id=economy_accounts.guild_id AND d.user_id=economy_accounts.user_id) ORDER BY balance DESC,user_id ASC LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![guild_id, i64::from(limit.clamp(1, 25))], |row| {
             Ok((row.get(0)?, row.get(1)?))
@@ -4001,7 +4123,9 @@ impl Store {
 
     /// Arms the temporary anti-raid containment gate. The original manual
     /// gate state is captured only once, so repeated bursts can extend the
-    /// deadline without accidentally making the temporary gate permanent.
+    /// deadline but never shorten an active one, without accidentally making
+    /// the temporary gate permanent. A deadline left by a released latch, or
+    /// one that cannot be read, is ignored so it can never hold the gate.
     pub fn arm_anti_raid_latch(&self, guild_id: &str, gate_until: i64) -> Result<()> {
         let mut conn = self.conn.lock().expect("store mutex poisoned");
         let tx = conn.transaction()?;
@@ -4012,6 +4136,21 @@ impl Store {
                 |row| row.get(0),
             )
             .optional()?;
+        let stored_gate_until: Option<String> = tx
+            .query_row(
+                "SELECT value FROM settings WHERE guild_id=?1 AND key='security.anti_raid.gate_until'",
+                [guild_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let active_deadline = stored_gate_until
+            .as_deref()
+            .and_then(|value| value.parse::<i64>().ok())
+            .filter(|_| latch_active.as_deref() == Some("true"));
+        let effective_gate_until = match active_deadline {
+            Some(existing) => existing.max(gate_until),
+            None => gate_until,
+        };
         let now = Utc::now().timestamp_millis();
         if latch_active.as_deref() != Some("true") {
             let gate_enabled: Option<String> = tx
@@ -4032,7 +4171,10 @@ impl Store {
         }
         for (key, value) in [
             ("security.join_gate.enabled", "true".to_string()),
-            ("security.anti_raid.gate_until", gate_until.to_string()),
+            (
+                "security.anti_raid.gate_until",
+                effective_gate_until.to_string(),
+            ),
             ("security.anti_raid.latch_active", "true".to_string()),
         ] {
             tx.execute(
@@ -4537,6 +4679,7 @@ impl Store {
              UNION ALL SELECT 'xp_event' AS kind, printf('%+d %s', amount, source), created_at FROM xp_events WHERE guild_id=?1 AND user_id=?2
              UNION ALL SELECT 'achievement_activity' AS kind, printf('%s: %d', kind, value), 0 FROM achievement_activity WHERE guild_id=?1 AND user_id=?2
              UNION ALL SELECT 'achievement' AS kind, achievement_key, unlocked_at FROM achievements WHERE guild_id=?1 AND user_id=?2
+             UNION ALL SELECT 'invite_attribution' AS kind, code, joined_at FROM invite_attributions WHERE guild_id=?1 AND user_id=?2
              ORDER BY kind",
         )?;
         for row in stmt.query_map(params![guild_id, user_id], |row| {
@@ -4607,6 +4750,7 @@ impl Store {
     pub fn purge_user(&self, guild_id: &str, user_id: &str) -> Result<serde_json::Value> {
         let mut conn = self.conn.lock().expect("store mutex poisoned");
         let tx = conn.transaction()?;
+        let freed_events = seated_event_ids(&tx, guild_id, user_id)?;
         let mut deleted = serde_json::Map::new();
         for (name, statement) in [
             (
@@ -4687,6 +4831,18 @@ impl Store {
                 "DELETE FROM economy_cooldowns WHERE guild_id=?2 AND user_id=?1",
             ),
             (
+                "member_departures",
+                "DELETE FROM member_departures WHERE guild_id=?2 AND user_id=?1",
+            ),
+            (
+                "invite_attributions",
+                "DELETE FROM invite_attributions WHERE guild_id=?2 AND user_id=?1",
+            ),
+            (
+                "invite_attributions_inviter_cleared",
+                "UPDATE invite_attributions SET inviter_id=NULL WHERE guild_id=?2 AND inviter_id=?1",
+            ),
+            (
                 "tags",
                 "DELETE FROM tags WHERE guild_id=?2 AND author_id=?1",
             ),
@@ -4699,6 +4855,9 @@ impl Store {
             if count > 0 {
                 deleted.insert(name.to_string(), serde_json::json!(count));
             }
+        }
+        for event_id in &freed_events {
+            promote_next_waitlisted(&tx, guild_id, event_id)?;
         }
         tx.commit()?;
         Ok(serde_json::json!({
@@ -4894,13 +5053,13 @@ impl Store {
                 .get("day")
                 .and_then(serde_json::Value::as_u64)
                 .ok_or_else(|| anyhow!("invalid_birthday_day"))?;
-            if !(1..=64).contains(&user_id.len())
-                || !(1..=12).contains(&month)
-                || !(1..=31).contains(&day)
-            {
+            let (Ok(month), Ok(day)) = (u32::try_from(month), u32::try_from(day)) else {
+                bail!("invalid_birthday");
+            };
+            if !(1..=64).contains(&user_id.len()) || !is_valid_birthday(month, day) {
                 bail!("invalid_birthday");
             }
-            parsed_birthdays.push((user_id, month as u32, day as u32));
+            parsed_birthdays.push((user_id, month, day));
         }
 
         Ok(PreparedConfigImport {
@@ -5121,8 +5280,9 @@ impl Store {
             )?;
         }
         for (user_id, month, day) in parsed_birthdays {
+            // An unchanged date keeps this year's announcement mark.
             tx.execute(
-                "INSERT INTO birthdays(guild_id,user_id,month,day,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?5) ON CONFLICT(guild_id,user_id) DO UPDATE SET month=excluded.month,day=excluded.day,last_announced_year=NULL,updated_at=excluded.updated_at",
+                "INSERT INTO birthdays(guild_id,user_id,month,day,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?5) ON CONFLICT(guild_id,user_id) DO UPDATE SET month=excluded.month,day=excluded.day,last_announced_year=CASE WHEN birthdays.month=excluded.month AND birthdays.day=excluded.day THEN birthdays.last_announced_year ELSE NULL END,updated_at=excluded.updated_at",
                 params![guild_id, user_id, month, day, Utc::now().timestamp_millis()],
             )?;
         }
@@ -5174,6 +5334,7 @@ impl Store {
             "DELETE FROM economy_accounts WHERE guild_id=?1",
             "DELETE FROM economy_cooldowns WHERE guild_id=?1",
             "DELETE FROM economy_ledger WHERE guild_id=?1",
+            "DELETE FROM member_departures WHERE guild_id=?1",
             "DELETE FROM temp_channels WHERE guild_id=?1",
             "DELETE FROM stats WHERE guild_id=?1",
             "DELETE FROM tickets WHERE guild_id=?1",
@@ -5205,6 +5366,15 @@ impl Store {
         ] {
             tx.execute(statement, [guild_id])?;
         }
+        // Node-era tables (src/store/db.ts) that the Rust runtime never reads.
+        for (table, statement) in [
+            ("notes", "DELETE FROM notes WHERE guild_id=?1"),
+            ("sticky_roles", "DELETE FROM sticky_roles WHERE guild_id=?1"),
+        ] {
+            if legacy_table_exists(&tx, table)? {
+                tx.execute(statement, [guild_id])?;
+            }
+        }
         tx.commit()?;
         Ok(())
     }
@@ -5220,6 +5390,8 @@ impl Store {
         let cutoff_date_1y = (now - Duration::days(365)).format("%Y-%m-%d").to_string();
         let cutoff_rfc3339 = (now - Duration::hours(24)).to_rfc3339();
         let cutoff_seconds = (now - Duration::hours(24)).timestamp();
+        let cutoff_departed =
+            (now - Duration::days(DEPARTED_ECONOMY_RETENTION_DAYS)).timestamp_millis();
 
         let mut conn = self.conn.lock().expect("store mutex poisoned");
         let tx = conn.transaction()?;
@@ -5229,6 +5401,60 @@ impl Store {
                 deleted.insert(name.to_string(), serde_json::json!(count));
             }
         };
+
+        // Departed members' economy (owner decision 2026-11-25). A member with
+        // any sign of having come back keeps it whatever the age of the marker:
+        // a rejoin recorded at or after the departure, or XP, a command, a
+        // daily or a reward claimed after the grace period. A ban is no proof.
+        remove(
+            "member_departures_returned",
+            tx.execute(
+                "DELETE FROM member_departures WHERE EXISTS (SELECT 1 FROM activity_log a WHERE a.guild_id=member_departures.guild_id AND a.user_id=member_departures.user_id AND a.type='member_join' AND a.created_at >= member_departures.left_at) OR EXISTS (SELECT 1 FROM activity_log a WHERE a.guild_id=member_departures.guild_id AND a.user_id=member_departures.user_id AND a.type='helper_command' AND a.created_at > member_departures.left_at + ?1) OR EXISTS (SELECT 1 FROM xp_events x WHERE x.guild_id=member_departures.guild_id AND x.user_id=member_departures.user_id AND x.created_at > member_departures.left_at + ?1) OR EXISTS (SELECT 1 FROM economy_accounts e WHERE e.guild_id=member_departures.guild_id AND e.user_id=member_departures.user_id AND e.last_daily_at > member_departures.left_at + ?1) OR EXISTS (SELECT 1 FROM economy_cooldowns c WHERE c.guild_id=member_departures.guild_id AND c.user_id=member_departures.user_id AND c.last_claim_at > member_departures.left_at + ?1)",
+                params![DEPARTURE_PRESENCE_GRACE_MS],
+            )?,
+        );
+        remove(
+            "departed_shop_notifications",
+            tx.execute(
+                "DELETE FROM scheduled_actions WHERE type='shop_notice' AND (guild_id,target_id) IN (SELECT guild_id,CAST(id AS TEXT) FROM economy_orders WHERE (guild_id,user_id) IN (SELECT guild_id,user_id FROM member_departures WHERE left_at < ?1))",
+                [cutoff_departed],
+            )?,
+        );
+        remove(
+            "departed_economy_orders",
+            tx.execute(
+                "DELETE FROM economy_orders WHERE (guild_id,user_id) IN (SELECT guild_id,user_id FROM member_departures WHERE left_at < ?1)",
+                [cutoff_departed],
+            )?,
+        );
+        remove(
+            "departed_economy_accounts",
+            tx.execute(
+                "DELETE FROM economy_accounts WHERE (guild_id,user_id) IN (SELECT guild_id,user_id FROM member_departures WHERE left_at < ?1)",
+                [cutoff_departed],
+            )?,
+        );
+        remove(
+            "departed_economy_ledger",
+            tx.execute(
+                "DELETE FROM economy_ledger WHERE (guild_id,user_id) IN (SELECT guild_id,user_id FROM member_departures WHERE left_at < ?1)",
+                [cutoff_departed],
+            )?,
+        );
+        remove(
+            "departed_economy_cooldowns",
+            tx.execute(
+                "DELETE FROM economy_cooldowns WHERE (guild_id,user_id) IN (SELECT guild_id,user_id FROM member_departures WHERE left_at < ?1)",
+                [cutoff_departed],
+            )?,
+        );
+        remove(
+            "member_departures_expired",
+            tx.execute(
+                "DELETE FROM member_departures WHERE left_at < ?1",
+                [cutoff_departed],
+            )?,
+        );
 
         remove(
             "audit_events",
@@ -5376,6 +5602,43 @@ impl Store {
                 [cutoff_seconds],
             )?,
         );
+        remove(
+            "event_registrations",
+            tx.execute(
+                "DELETE FROM event_registrations WHERE created_at < ?1",
+                [cutoff_1y],
+            )?,
+        );
+        remove(
+            "welcome_delivery_claims",
+            tx.execute(
+                "DELETE FROM welcome_delivery_claims WHERE claimed_at < ?1",
+                [cutoff_seconds],
+            )?,
+        );
+        remove(
+            "achievement_links",
+            tx.execute(
+                "DELETE FROM achievement_links WHERE expires_at < ?1",
+                [cutoff_seconds],
+            )?,
+        );
+        // Node-era tables (src/store/db.ts); periods copied from src/store/gdpr.ts.
+        if legacy_table_exists(&tx, "notes")? {
+            remove(
+                "notes",
+                tx.execute("DELETE FROM notes WHERE created_at < ?1", [cutoff_2y])?,
+            );
+        }
+        if legacy_table_exists(&tx, "sticky_roles")? {
+            remove(
+                "sticky_roles",
+                tx.execute(
+                    "DELETE FROM sticky_roles WHERE updated_at < ?1",
+                    [cutoff_1y],
+                )?,
+            );
+        }
         tx.commit()?;
         Ok(RetentionSummary {
             deleted: serde_json::Value::Object(deleted),
@@ -5510,6 +5773,47 @@ impl Store {
         )
         .optional()
         .map_err(Into::into)
+    }
+
+    /// Close voice sessions that a fresh gateway snapshot does not confirm.
+    /// Nothing is credited: the bot cannot know when an absent member left.
+    /// An empty `present` list is valid and means nobody is in voice.
+    pub fn reconcile_voice_presence(
+        &self,
+        guild_id: &str,
+        present: &[(String, String)],
+    ) -> Result<usize> {
+        let present: std::collections::HashSet<(&str, &str)> = present
+            .iter()
+            .map(|(user_id, channel_id)| (user_id.as_str(), channel_id.as_str()))
+            .collect();
+        let mut conn = self.conn.lock().expect("store mutex poisoned");
+        let tx = conn.transaction()?;
+        let mut closed = 0;
+        for (select, delete) in [
+            (
+                "SELECT user_id,channel_id FROM voice_sessions WHERE guild_id=?1",
+                "DELETE FROM voice_sessions WHERE guild_id=?1 AND user_id=?2 AND channel_id=?3",
+            ),
+            (
+                "SELECT user_id,channel_id FROM achievement_voice WHERE guild_id=?1",
+                "DELETE FROM achievement_voice WHERE guild_id=?1 AND user_id=?2 AND channel_id=?3",
+            ),
+        ] {
+            let sessions = tx
+                .prepare(select)?
+                .query_map(params![guild_id], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            for (user_id, channel_id) in sessions.iter().filter(|(user_id, channel_id)| {
+                !present.contains(&(user_id.as_str(), channel_id.as_str()))
+            }) {
+                closed += tx.execute(delete, params![guild_id, user_id, channel_id])?;
+            }
+        }
+        tx.commit()?;
+        Ok(closed)
     }
 
     pub fn level_for(&self, guild_id: &str, user_id: &str) -> Result<i64> {
@@ -5733,6 +6037,42 @@ impl Store {
         Ok(conn.last_insert_rowid())
     }
 
+    /// Schedules the release of a tempban, replacing any earlier release for
+    /// the same member so only the most recent tempban decides when it ends.
+    pub fn replace_scheduled_unban(
+        &self,
+        guild_id: &str,
+        user_id: &str,
+        execute_at: i64,
+        case_id: i64,
+    ) -> Result<i64> {
+        let mut conn = self.conn.lock().expect("store mutex poisoned");
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM scheduled_actions WHERE guild_id=?1 AND type='unban' AND target_id=?2",
+            params![guild_id, user_id],
+        )?;
+        // The job remembers its case so a later ban can be told apart.
+        let payload = serde_json::json!({"case_id": case_id}).to_string();
+        tx.execute(
+            "INSERT INTO scheduled_actions(guild_id,type,target_id,execute_at,payload,case_id) VALUES(?1,'unban',?2,?3,?4,?5)",
+            params![guild_id, user_id, execute_at, payload, case_id],
+        )?;
+        let id = tx.last_insert_rowid();
+        tx.commit()?;
+        Ok(id)
+    }
+
+    /// A newer ban or tempban supersedes the release scheduled by `case_id`.
+    pub fn has_ban_case_after(&self, guild_id: &str, user_id: &str, case_id: i64) -> Result<bool> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        Ok(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM cases WHERE guild_id=?1 AND target_id=?2 AND type IN ('ban','tempban') AND id>?3)",
+            params![guild_id, user_id, case_id],
+            |row| row.get(0),
+        )?)
+    }
+
     pub fn open_ticket(&self, guild_id: &str, user_id: &str, channel_id: &str) -> Result<()> {
         let conn = self.conn.lock().expect("store mutex poisoned");
         conn.execute(
@@ -5814,6 +6154,59 @@ impl Store {
             "UPDATE tickets SET status='closed',closed_at=?2 WHERE channel_id=?1 AND status='open'",
             params![channel_id, Utc::now().timestamp_millis()],
         )? > 0)
+    }
+
+    /// The channel is gone, so no transcript can be produced; closing frees the opener's limit.
+    pub fn close_ticket_for_deleted_channel(
+        &self,
+        guild_id: &str,
+        channel_id: &str,
+    ) -> Result<bool> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        Ok(conn.execute(
+            "UPDATE tickets SET status='closed',closed_at=?3 WHERE guild_id=?1 AND channel_id=?2 AND status='open'",
+            params![guild_id, channel_id, Utc::now().timestamp_millis()],
+        )? > 0)
+    }
+
+    /// Closes this guild's open tickets whose channel is missing from a full
+    /// channel snapshot, such as the one in GUILD_CREATE. Like a deleted
+    /// channel, these tickets get no transcript. An empty snapshot is suspect
+    /// and closes nothing, and tickets opened in the last minute are skipped
+    /// because they may be newer than the snapshot.
+    pub fn close_tickets_without_channel(
+        &self,
+        guild_id: &str,
+        present_channel_ids: &[String],
+    ) -> Result<usize> {
+        if present_channel_ids.is_empty() {
+            return Ok(0);
+        }
+        let present: std::collections::HashSet<&str> =
+            present_channel_ids.iter().map(String::as_str).collect();
+        let now = Utc::now().timestamp_millis();
+        let mut conn = self.conn.lock().expect("store mutex poisoned");
+        let tx = conn.transaction()?;
+        let open_channels = tx
+            .prepare(
+                "SELECT channel_id FROM tickets WHERE guild_id=?1 AND status='open' AND created_at<?2",
+            )?
+            .query_map(params![guild_id, now - 60_000], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut closed = 0;
+        for channel_id in open_channels
+            .iter()
+            .filter(|channel_id| !present.contains(channel_id.as_str()))
+        {
+            closed += tx.execute(
+                "UPDATE tickets SET status='closed',closed_at=?3 WHERE guild_id=?1 AND channel_id=?2 AND status='open'",
+                params![guild_id, channel_id, now],
+            )?;
+        }
+        tx.commit()?;
+        Ok(closed)
     }
 
     pub fn reopen_ticket(&self, channel_id: &str) -> Result<bool> {
@@ -5927,22 +6320,7 @@ impl Store {
             params![guild_id, event_id, user_id],
         )?;
         let promoted = if status == "registered" || status == "checked_in" {
-            let next: Option<(i64, String)> = tx
-                .query_row(
-                    "SELECT rowid,user_id FROM event_registrations WHERE guild_id=?1 AND event_id=?2 AND status='waitlisted' ORDER BY created_at ASC,rowid ASC LIMIT 1",
-                    params![guild_id, event_id],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .optional()?;
-            if let Some((rowid, user_id)) = next {
-                tx.execute(
-                    "UPDATE event_registrations SET status='registered' WHERE rowid=?1",
-                    [rowid],
-                )?;
-                Some(user_id)
-            } else {
-                None
-            }
+            promote_next_waitlisted(&tx, guild_id, event_id)?
         } else {
             None
         };
@@ -6310,6 +6688,74 @@ impl Store {
             "UPDATE giveaway_results SET claimed_at=NULL WHERE giveaway_id=?1 AND claimed_at=?2 AND announced=0",
             params![id, claim_at],
         )?;
+        Ok(())
+    }
+
+    /// Pick a reroll winner among entrants who have not won this giveaway yet.
+    /// None while the original announcement is still running.
+    pub fn giveaway_reroll_candidate(&self, guild_id: &str, id: i64) -> Result<Option<String>> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let ended: Option<bool> = conn
+            .query_row(
+                "SELECT ended FROM giveaways WHERE id=?1 AND guild_id=?2",
+                params![id, guild_id],
+                |row| row.get::<_, i64>(0).map(|ended| ended != 0),
+            )
+            .optional()?;
+        if ended != Some(true) {
+            return Ok(None);
+        }
+        let result: Option<(String, bool)> = conn
+            .query_row(
+                "SELECT winners_json,announced FROM giveaway_results WHERE giveaway_id=?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get::<_, i64>(1)? != 0)),
+            )
+            .optional()?;
+        let winners_json = match result {
+            Some((_, false)) => return Ok(None),
+            Some((raw, true)) => raw,
+            None => "[]".to_string(),
+        };
+        Ok(conn
+            .query_row(
+                "SELECT user_id FROM giveaway_entries WHERE giveaway_id=?1 AND user_id NOT IN (SELECT value FROM json_each(?2)) ORDER BY RANDOM() LIMIT 1",
+                params![id, winners_json],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Add a reroll winner to the giveaway's recorded winners.
+    pub fn record_giveaway_reroll(&self, id: i64, winner: &str) -> Result<()> {
+        let mut conn = self.conn.lock().expect("store mutex poisoned");
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let existing: Option<String> = tx
+            .query_row(
+                "SELECT winners_json FROM giveaway_results WHERE giveaway_id=?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match existing {
+            Some(raw) => {
+                let mut winners: Vec<String> = serde_json::from_str(&raw)?;
+                if !winners.iter().any(|known| known == winner) {
+                    winners.push(winner.to_string());
+                    tx.execute(
+                        "UPDATE giveaway_results SET winners_json=?2 WHERE giveaway_id=?1",
+                        params![id, serde_json::to_string(&winners)?],
+                    )?;
+                }
+            }
+            None => {
+                tx.execute(
+                    "INSERT INTO giveaway_results(giveaway_id,winners_json,announced) VALUES(?1,?2,1)",
+                    params![id, serde_json::to_string(&[winner])?],
+                )?;
+            }
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -6697,6 +7143,55 @@ fn parse_dt(value: &str) -> Result<DateTime<Utc>> {
     Ok(DateTime::parse_from_rfc3339(value)?.with_timezone(&Utc))
 }
 
+/// 1 when 29 February birthdays are celebrated on this date: 28 February of a
+/// year without a 29th. The date is the guild's local date.
+fn leap_day_falls_back_today(month: u32, day: u32, year: i32) -> i64 {
+    i64::from(month == 2 && day == 28 && chrono::NaiveDate::from_ymd_opt(year, 2, 29).is_none())
+}
+
+/// Give a freed event seat to the oldest waitlisted member. Takes the caller's
+/// open connection or transaction; the store mutex is not reentrant.
+fn promote_next_waitlisted(
+    conn: &Connection,
+    guild_id: &str,
+    event_id: &str,
+) -> Result<Option<String>> {
+    let next: Option<(i64, String)> = conn
+        .query_row(
+            "SELECT rowid,user_id FROM event_registrations WHERE guild_id=?1 AND event_id=?2 AND status='waitlisted' ORDER BY created_at ASC,rowid ASC LIMIT 1",
+            params![guild_id, event_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((rowid, user_id)) = next else {
+        return Ok(None);
+    };
+    conn.execute(
+        "UPDATE event_registrations SET status='registered' WHERE rowid=?1",
+        [rowid],
+    )?;
+    Ok(Some(user_id))
+}
+
+/// Events where this member holds a seat that leaving would free.
+fn seated_event_ids(conn: &Connection, guild_id: &str, user_id: &str) -> Result<Vec<String>> {
+    let mut statement = conn.prepare(
+        "SELECT event_id FROM event_registrations WHERE guild_id=?1 AND user_id=?2 AND status IN ('registered','checked_in')",
+    )?;
+    let rows = statement.query_map(params![guild_id, user_id], |row| row.get(0))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<String>>>()?)
+}
+
+/// Tables created by the Node bot exist only on databases converted in place.
+/// The name is a bound parameter; callers pass fixed literals.
+fn legacy_table_exists(tx: &rusqlite::Transaction<'_>, table: &str) -> Result<bool> {
+    Ok(tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+        [table],
+        |row| row.get(0),
+    )?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6785,6 +7280,117 @@ mod tests {
     }
 
     #[test]
+    fn tempban_unban_jobs_are_replaced_and_know_their_case() {
+        let store = Store::open(":memory:").unwrap();
+        let first = store
+            .record_case("g", "tempban", "u", "mod", "r", Some(1_000))
+            .unwrap();
+        store.replace_scheduled_unban("g", "u", 100, first).unwrap();
+        let second = store
+            .record_case("g", "tempban", "u", "mod", "r", Some(2_000))
+            .unwrap();
+        store
+            .replace_scheduled_unban("g", "u", 200, second)
+            .unwrap();
+        let jobs = store.due_scheduled_actions(i64::MAX, 10).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].2, "unban");
+        assert_eq!(jobs[0].3, "u");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&jobs[0].4).unwrap()["case_id"],
+            second
+        );
+
+        let other_target = store
+            .record_case("g", "tempban", "other", "mod", "r", None)
+            .unwrap();
+        store
+            .replace_scheduled_unban("g", "other", 300, other_target)
+            .unwrap();
+        let other_guild = store
+            .record_case("g2", "tempban", "u", "mod", "r", None)
+            .unwrap();
+        store
+            .replace_scheduled_unban("g2", "u", 400, other_guild)
+            .unwrap();
+        let jobs = store.due_scheduled_actions(i64::MAX, 10).unwrap();
+        assert_eq!(jobs.len(), 3);
+        let own: Vec<_> = jobs
+            .iter()
+            .filter(|job| job.1 == "g" && job.3 == "u")
+            .collect();
+        assert_eq!(own.len(), 1);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&own[0].4).unwrap()["case_id"],
+            second
+        );
+
+        assert!(!store.has_ban_case_after("g", "u", second).unwrap());
+        store
+            .record_case("g", "warn", "u", "mod", "w", None)
+            .unwrap();
+        store
+            .record_case("g2", "ban", "u", "mod", "perm", None)
+            .unwrap();
+        store
+            .record_case("g", "ban", "other", "mod", "perm", None)
+            .unwrap();
+        assert!(!store.has_ban_case_after("g", "u", second).unwrap());
+        let ban = store
+            .record_case("g", "ban", "u", "mod", "perm", None)
+            .unwrap();
+        assert!(store.has_ban_case_after("g", "u", second).unwrap());
+        assert!(!store.has_ban_case_after("g", "u", ban).unwrap());
+        store
+            .record_case("g", "tempban", "u", "mod", "again", Some(3_000))
+            .unwrap();
+        assert!(store.has_ban_case_after("g", "u", ban).unwrap());
+    }
+
+    #[test]
+    fn failed_scheduled_actions_back_off_without_blocking_other_guilds() {
+        let store = Store::open(":memory:").unwrap();
+        for i in 0..100 {
+            store
+                .schedule_typed("bad", "reminder", &i.to_string(), 0, "{}")
+                .unwrap();
+        }
+        let good = store
+            .schedule_typed("good", "reminder", "u", 1, "{}")
+            .unwrap();
+        let due = store.due_scheduled_actions(10, 100).unwrap();
+        assert_eq!(due.len(), 100);
+        assert!(due.iter().all(|job| job.1 == "bad"));
+        for job in &due {
+            assert!(store.retry_scheduled_action(job.0, 30_010).unwrap());
+        }
+        let bad = due[0].0;
+        let due = store.due_scheduled_actions(10, 100).unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].0, good);
+        assert_eq!(due[0].1, "good");
+        assert_eq!(store.scheduled_action_attempts(bad).unwrap(), Some(1));
+        assert_eq!(store.scheduled_action_attempts(good).unwrap(), Some(0));
+        assert_eq!(store.scheduled_action_attempts(i64::MAX).unwrap(), None);
+        assert!(!store.retry_scheduled_action(i64::MAX, 1).unwrap());
+        store.migrate().unwrap();
+        assert_eq!(store.scheduled_action_attempts(bad).unwrap(), Some(1));
+    }
+
+    #[test]
+    fn pending_reminders_are_counted_per_member_and_guild() {
+        let store = Store::open(":memory:").unwrap();
+        store.schedule("g", "u", 10, "{}").unwrap();
+        store.schedule("g", "u", 10, "{}").unwrap();
+        store.schedule("g", "other", 10, "{}").unwrap();
+        store.schedule("g2", "u", 10, "{}").unwrap();
+        store
+            .schedule_typed("g", "event_reminder", "u", 10, "{}")
+            .unwrap();
+        assert_eq!(store.pending_reminder_count("g", "u").unwrap(), 2);
+    }
+
+    #[test]
     fn giveaway_draft_and_end_job_are_created_and_removed_together() {
         let store = Store::open(":memory:").unwrap();
         let id = store
@@ -6844,6 +7450,29 @@ mod tests {
         assert_eq!(retry, selected);
         store.mark_giveaway_announced(id, retry_claim).unwrap();
         assert_eq!(store.prepare_giveaway_result("g", id).unwrap(), None);
+    }
+
+    #[test]
+    fn giveaway_rerolls_skip_previous_winners_and_are_recorded() {
+        let store = Store::open(":memory:").unwrap();
+        let id = store
+            .create_giveaway("g", "c", "Prize", 1, i64::MAX, None, "host")
+            .unwrap();
+        store.add_giveaway_entry(id, "a").unwrap();
+        store.add_giveaway_entry(id, "b").unwrap();
+        let (winners, claim) = store.prepare_giveaway_result("g", id).unwrap().unwrap();
+        // The original announcement is still running.
+        assert_eq!(store.giveaway_reroll_candidate("g", id).unwrap(), None);
+        store.mark_giveaway_announced(id, claim).unwrap();
+        let other = store.giveaway_reroll_candidate("g", id).unwrap().unwrap();
+        assert!(!winners.contains(&other));
+        assert_eq!(
+            store.giveaway_reroll_candidate("other-guild", id).unwrap(),
+            None
+        );
+        store.record_giveaway_reroll(id, &other).unwrap();
+        // Everyone has won once now.
+        assert_eq!(store.giveaway_reroll_candidate("g", id).unwrap(), None);
     }
 
     #[test]
@@ -7272,6 +7901,58 @@ mod tests {
             .filter_map(|handle| handle.join().unwrap().then_some(()))
             .count();
         assert_eq!(winners, 1);
+    }
+
+    #[test]
+    fn deleted_ticket_channel_closes_the_ticket_and_frees_the_limit() {
+        let store = Store::open(":memory:").unwrap();
+        assert!(store.try_open_ticket("g", "u", "20", 1).unwrap());
+        assert!(!store.try_open_ticket("g", "u", "21", 1).unwrap());
+        assert!(
+            !store
+                .close_ticket_for_deleted_channel("other", "20")
+                .unwrap()
+        );
+        assert_eq!(
+            store.ticket_by_channel("20").unwrap().unwrap().status,
+            "open"
+        );
+        assert!(store.close_ticket_for_deleted_channel("g", "20").unwrap());
+        let ticket = store.ticket_by_channel("20").unwrap().unwrap();
+        assert_eq!(ticket.status, "closed");
+        assert!(ticket.closed_at.is_some());
+        assert!(!store.close_ticket_for_deleted_channel("g", "20").unwrap());
+        assert!(store.try_open_ticket("g", "u", "21", 1).unwrap());
+    }
+
+    #[test]
+    fn tickets_whose_channel_vanished_are_closed_on_reconnect() {
+        let store = Store::open(":memory:").unwrap();
+        store.open_ticket("g", "a", "20").unwrap();
+        store.open_ticket("g", "b", "21").unwrap();
+        store.open_ticket("g", "d", "22").unwrap();
+        store.open_ticket("g2", "c", "20x").unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE tickets SET created_at=0 WHERE channel_id IN ('20','21','20x')",
+                [],
+            )
+            .unwrap();
+        }
+        let status = |channel: &str| store.ticket_by_channel(channel).unwrap().unwrap().status;
+        assert_eq!(
+            store
+                .close_tickets_without_channel("g", &["21".to_string(), "99".to_string()])
+                .unwrap(),
+            1
+        );
+        assert_eq!(status("20"), "closed");
+        assert_eq!(status("21"), "open");
+        assert_eq!(status("20x"), "open");
+        assert_eq!(status("22"), "open");
+        assert_eq!(store.close_tickets_without_channel("g", &[]).unwrap(), 0);
+        assert_eq!(status("21"), "open");
     }
 
     #[test]
@@ -8798,6 +9479,51 @@ mod tests {
     }
 
     #[test]
+    fn voice_presence_reconciliation_closes_unconfirmed_sessions_without_credit() {
+        let store = Store::open(":memory:").unwrap();
+        store.start_voice_session("g", "stay", "c1", 100).unwrap();
+        store.start_voice_session("g", "left", "c1", 100).unwrap();
+        store.start_voice_session("g", "moved", "c1", 100).unwrap();
+        store.start_voice_session("g2", "other", "c1", 100).unwrap();
+        store
+            .update_achievement_voice("g", "stay", Some("c1"), 100)
+            .unwrap();
+        store
+            .update_achievement_voice("g", "left", Some("c1"), 100)
+            .unwrap();
+        let present = vec![
+            ("stay".to_string(), "c1".to_string()),
+            ("moved".to_string(), "c2".to_string()),
+        ];
+        // XP sessions of `left` and `moved`, and the achievement session of `left`.
+        assert_eq!(store.reconcile_voice_presence("g", &present).unwrap(), 3);
+        assert_eq!(
+            store
+                .active_voice_session("g", "stay")
+                .unwrap()
+                .unwrap()
+                .started_at,
+            100
+        );
+        assert!(store.active_voice_session("g", "left").unwrap().is_none());
+        assert!(store.active_voice_session("g", "moved").unwrap().is_none());
+        assert!(store.active_voice_session("g2", "other").unwrap().is_some());
+        // Nothing is credited for the time the bot could not see.
+        assert_eq!(
+            store.achievement_progress("g", "left", 100_000).unwrap()[1].value,
+            0
+        );
+        // Nobody in voice is a valid snapshot and closes the rest of the guild.
+        assert_eq!(store.reconcile_voice_presence("g", &[]).unwrap(), 2);
+        assert!(store.active_voice_session("g", "stay").unwrap().is_none());
+        assert_eq!(
+            store.achievement_progress("g", "stay", 100_000).unwrap()[1].value,
+            0
+        );
+        assert!(store.active_voice_session("g2", "other").unwrap().is_some());
+    }
+
+    #[test]
     fn guild_config_import_is_validated_and_scoped() {
         let store = Store::open(":memory:").unwrap();
         store
@@ -9001,6 +9727,85 @@ mod tests {
     }
 
     #[test]
+    fn privacy_gap_invites_are_exported_and_erased() {
+        let store = Store::open(":memory:").unwrap();
+        store
+            .record_invite_attribution("g", "u", "abc", Some("inviter"))
+            .unwrap();
+        store
+            .record_invite_attribution("g", "friend", "abc", Some("u"))
+            .unwrap();
+
+        let export = store.export_user("g", "u").unwrap();
+        assert!(
+            export["voluntary"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["kind"] == "invite_attribution" && entry["value"] == "abc")
+        );
+
+        store.purge_user("g", "u").unwrap();
+        assert!(store.invite_attribution("g", "u").unwrap().is_none());
+        assert_eq!(
+            store.invite_attribution("g", "friend").unwrap(),
+            Some(("abc".to_string(), None))
+        );
+    }
+
+    #[test]
+    fn privacy_gap_guild_purge_covers_legacy_node_tables() {
+        let store = Store::open(":memory:").unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute_batch(
+                "CREATE TABLE notes (id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id TEXT NOT NULL, target_id TEXT NOT NULL, author_id TEXT NOT NULL, content TEXT NOT NULL, created_at INTEGER NOT NULL);
+                 CREATE TABLE sticky_roles (guild_id TEXT NOT NULL, user_id TEXT NOT NULL, role_ids TEXT NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY (guild_id, user_id));
+                 INSERT INTO notes(guild_id,target_id,author_id,content,created_at) VALUES('g','u','mod','note',1),('other','u','mod','note',1);
+                 INSERT INTO sticky_roles(guild_id,user_id,role_ids,updated_at) VALUES('g','u','[\"r\"]',1),('other','u','[\"r\"]',1);",
+            )
+            .unwrap();
+        }
+
+        store.purge_guild("g").unwrap();
+
+        {
+            let conn = store.conn.lock().unwrap();
+            for (table, statement) in [
+                ("notes", "SELECT COUNT(*) FROM notes WHERE guild_id=?1"),
+                (
+                    "sticky_roles",
+                    "SELECT COUNT(*) FROM sticky_roles WHERE guild_id=?1",
+                ),
+            ] {
+                let count = |guild: &str| -> i64 {
+                    conn.query_row(statement, [guild], |row| row.get(0))
+                        .unwrap()
+                };
+                assert_eq!(count("g"), 0, "{table} kept rows of the purged guild");
+                assert_eq!(count("other"), 1, "{table} lost rows of another guild");
+            }
+        }
+    }
+
+    #[test]
+    fn privacy_gap_guild_purge_without_legacy_tables_still_works() {
+        let store = Store::open(":memory:").unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            let legacy: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('notes','sticky_roles')",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(legacy, 0);
+        }
+        assert!(store.purge_guild("g").is_ok());
+    }
+
+    #[test]
     fn retention_sweep_removes_expired_records_and_keeps_recent_cases() {
         let store = Store::open(":memory:").unwrap();
         let now = Utc::now().timestamp_millis();
@@ -9034,6 +9839,506 @@ mod tests {
         assert_eq!(summary.deleted["cases"], 1);
         assert_eq!(store.recent_cases("g", 10).unwrap().len(), 1);
         assert_eq!(store.recent_audit_events("g", 10).unwrap().len(), 1);
+    }
+
+    // Each retention_window_ test puts one row just past the cutoff ("old",
+    // must go) and one just inside it ("new", must stay).
+    #[test]
+    fn retention_window_existing_ms_rules_hold() {
+        const DAY: i64 = 86_400_000;
+        let store = Store::open(":memory:").unwrap();
+        let now = Utc::now().timestamp_millis();
+        let old = |days: i64| now - days * DAY - 1_000;
+        let new = |days: i64| now - days * DAY + 1_000;
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO audit_events(correlation_id,guild_id,actor_id,action,outcome,created_at) VALUES('window-old','g','mod','old','recorded',?1),('window-new','g','mod','new','recorded',?2)",
+                params![old(30), new(30)],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO activity_log(guild_id,type,user_id,detail,created_at) VALUES('g','old','u','{}',?1),('g','new','u','{}',?2)",
+                params![old(90), new(90)],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO infractions(guild_id,target_id,created_at) VALUES('g','old',?1),('g','new',?2)",
+                params![old(365), new(365)],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO cases(guild_id,type,target_id,moderator_id,created_at) VALUES('g','warn','old','mod',?1),('g','warn','new','mod',?2)",
+                params![old(730), new(730)],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO quarantine(guild_id,user_id,role_ids,created_at) VALUES('g','old','[]',?1),('g','new','[]',?2)",
+                params![old(365), new(365)],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO scheduled_actions(guild_id,type,target_id,execute_at) VALUES('g','remind','old',?1),('g','remind','new',?2)",
+                params![old(90), new(90)],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO tickets(guild_id,channel_id,opener_id,status,created_at,closed_at) VALUES('g','old','u','closed',?1,?1),('g','new','u','closed',?2,?2)",
+                params![old(365), new(365)],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO suggestions(id,guild_id,author_id,content,created_at) VALUES(1,'g','u','old',?1),(2,'g','u','new',?2)",
+                params![old(365), new(365)],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO giveaways(id,guild_id,channel_id,prize,end_at,ended,host_id,created_at) VALUES(1,'g','c','old',?1,1,'host',?1),(2,'g','c','new',?2,1,'host',?2)",
+                params![old(90), new(90)],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO polls(id,guild_id,channel_id,question,options,end_at,closed,created_at) VALUES(1,'g','c','old','[]',?1,1,?1),(2,'g','c','new','[]',?2,1,?2)",
+                params![old(90), new(90)],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO xp_events(guild_id,user_id,event_key,source,amount,created_at) VALUES('g','u','old','message',1,?1),('g','u','new','message',1,?2)",
+                params![old(365), new(365)],
+            )
+            .unwrap();
+            conn.execute_batch(
+                "INSERT INTO suggestion_votes(suggestion_id,user_id,vote) VALUES(1,'voter',1),(2,'voter',1);
+                 INSERT INTO giveaway_entries(giveaway_id,user_id) VALUES(1,'entrant'),(2,'entrant');
+                 INSERT INTO giveaway_results(giveaway_id,winners_json) VALUES(1,'[]'),(2,'[]');
+                 INSERT INTO poll_votes(poll_id,user_id,choice) VALUES(1,'voter',0),(2,'voter',0);",
+            )
+            .unwrap();
+        }
+
+        store.prune_retention(now).unwrap();
+
+        let count = |sql: &str| -> i64 {
+            let conn = store.conn.lock().unwrap();
+            conn.query_row(sql, [], |row| row.get(0)).unwrap()
+        };
+        for (rule, old_rows, new_rows) in [
+            (
+                "R1 audit_events (30 d)",
+                "SELECT COUNT(*) FROM audit_events WHERE action='old'",
+                "SELECT COUNT(*) FROM audit_events WHERE action='new'",
+            ),
+            (
+                "R2 activity_log (90 d)",
+                "SELECT COUNT(*) FROM activity_log WHERE type='old'",
+                "SELECT COUNT(*) FROM activity_log WHERE type='new'",
+            ),
+            (
+                "R5 infractions (365 d)",
+                "SELECT COUNT(*) FROM infractions WHERE target_id='old'",
+                "SELECT COUNT(*) FROM infractions WHERE target_id='new'",
+            ),
+            (
+                "R6 cases (730 d)",
+                "SELECT COUNT(*) FROM cases WHERE target_id='old'",
+                "SELECT COUNT(*) FROM cases WHERE target_id='new'",
+            ),
+            (
+                "R7 quarantine (365 d)",
+                "SELECT COUNT(*) FROM quarantine WHERE user_id='old'",
+                "SELECT COUNT(*) FROM quarantine WHERE user_id='new'",
+            ),
+            (
+                "R8 scheduled_actions (90 d)",
+                "SELECT COUNT(*) FROM scheduled_actions WHERE target_id='old'",
+                "SELECT COUNT(*) FROM scheduled_actions WHERE target_id='new'",
+            ),
+            (
+                "R9 tickets (365 d after closing)",
+                "SELECT COUNT(*) FROM tickets WHERE channel_id='old'",
+                "SELECT COUNT(*) FROM tickets WHERE channel_id='new'",
+            ),
+            (
+                "R10 suggestions (365 d)",
+                "SELECT COUNT(*) FROM suggestions WHERE id=1",
+                "SELECT COUNT(*) FROM suggestions WHERE id=2",
+            ),
+            (
+                "R10 suggestion_votes",
+                "SELECT COUNT(*) FROM suggestion_votes WHERE suggestion_id=1",
+                "SELECT COUNT(*) FROM suggestion_votes WHERE suggestion_id=2",
+            ),
+            (
+                "R11 giveaways (90 d after the end)",
+                "SELECT COUNT(*) FROM giveaways WHERE id=1",
+                "SELECT COUNT(*) FROM giveaways WHERE id=2",
+            ),
+            (
+                "R11 giveaway_entries",
+                "SELECT COUNT(*) FROM giveaway_entries WHERE giveaway_id=1",
+                "SELECT COUNT(*) FROM giveaway_entries WHERE giveaway_id=2",
+            ),
+            (
+                "R11 giveaway_results",
+                "SELECT COUNT(*) FROM giveaway_results WHERE giveaway_id=1",
+                "SELECT COUNT(*) FROM giveaway_results WHERE giveaway_id=2",
+            ),
+            (
+                "R12 polls (90 d after the end)",
+                "SELECT COUNT(*) FROM polls WHERE id=1",
+                "SELECT COUNT(*) FROM polls WHERE id=2",
+            ),
+            (
+                "R12 poll_votes",
+                "SELECT COUNT(*) FROM poll_votes WHERE poll_id=1",
+                "SELECT COUNT(*) FROM poll_votes WHERE poll_id=2",
+            ),
+            (
+                "R14 xp_events (365 d)",
+                "SELECT COUNT(*) FROM xp_events WHERE event_key='old'",
+                "SELECT COUNT(*) FROM xp_events WHERE event_key='new'",
+            ),
+        ] {
+            assert_eq!(
+                count(old_rows),
+                0,
+                "{rule}: the row past the cutoff survived"
+            );
+            assert_eq!(
+                count(new_rows),
+                1,
+                "{rule}: the row inside the window was deleted"
+            );
+        }
+    }
+
+    #[test]
+    fn retention_window_existing_growth_rules_hold() {
+        const DAY: i64 = 86_400_000;
+        let store = Store::open(":memory:").unwrap();
+        let now = Utc::now().timestamp_millis();
+        {
+            let conn = store.conn.lock().unwrap();
+            for (guild, departed_at) in [
+                ("gold", Some(now - 30 * DAY - 1_000)),
+                ("gnew", Some(now - 30 * DAY + 1_000)),
+                ("gstay", None),
+            ] {
+                conn.execute(
+                    "INSERT INTO helper_growth_lifecycle(guild_id,first_joined_at,last_joined_at,departed_at) VALUES(?1,?2,?2,?3)",
+                    params![guild, now - 400 * DAY, departed_at],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO helper_growth_activity_day(guild_id,day) VALUES(?1,'2026-01-01')",
+                    [guild],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO helper_growth_activity_day_v2(guild_id,day) VALUES(?1,'2026-01-01')",
+                    [guild],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO helper_growth_retention_record(guild_id,window_days) VALUES(?1,7)",
+                    [guild],
+                )
+                .unwrap();
+            }
+        }
+
+        store.prune_retention(now).unwrap();
+
+        let count = |sql: &str| -> i64 {
+            let conn = store.conn.lock().unwrap();
+            conn.query_row(sql, [], |row| row.get(0)).unwrap()
+        };
+        for table in [
+            "helper_growth_lifecycle",
+            "helper_growth_activity_day",
+            "helper_growth_activity_day_v2",
+            "helper_growth_retention_record",
+        ] {
+            for (guild, expected) in [("gold", 0), ("gnew", 1), ("gstay", 1)] {
+                assert_eq!(
+                    count(&format!(
+                        "SELECT COUNT(*) FROM {table} WHERE guild_id='{guild}'"
+                    )),
+                    expected,
+                    "R3/R4 {table}: wrong row count for guild {guild}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn retention_window_existing_other_unit_rules_hold() {
+        const DAY: i64 = 86_400_000;
+        const HOUR: i64 = 3_600_000;
+        let store = Store::open(":memory:").unwrap();
+        let now = Utc::now().timestamp_millis();
+        let date = |ms: i64| {
+            DateTime::<Utc>::from_timestamp_millis(ms)
+                .unwrap()
+                .format("%Y-%m-%d")
+                .to_string()
+        };
+        let rfc3339 = |ms: i64| {
+            DateTime::<Utc>::from_timestamp_millis(ms)
+                .unwrap()
+                .to_rfc3339()
+        };
+        let cutoff_seconds = now / 1_000 - 86_400;
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO stats(guild_id,date) VALUES('old',?1),('new',?2)",
+                params![date(now - 365 * DAY - DAY), date(now - 365 * DAY + DAY)],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO voice_sessions(guild_id,user_id,channel_id,started_at) VALUES('g','old','c',?1),('g','new','c',?2)",
+                params![cutoff_seconds - 10, cutoff_seconds + 10],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO helper_sessions(id,user_id,guild_id,issued_at,expires_at,last_seen_at) VALUES('old','u','g',?1,?1,?1),('new','u','g',?2,?2,?2)",
+                params![rfc3339(now - 25 * HOUR), rfc3339(now - 23 * HOUR)],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO helper_session_guilds(session_id,guild_id,name) VALUES('old','g','Guild'),('new','g','Guild')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO helper_oauth_states(state_hash,expires_at,used_at) VALUES('old',?1,NULL),('new',?2,NULL)",
+                params![cutoff_seconds - 10, cutoff_seconds + 10],
+            )
+            .unwrap();
+        }
+
+        store.prune_retention(now).unwrap();
+
+        let count = |sql: &str| -> i64 {
+            let conn = store.conn.lock().unwrap();
+            conn.query_row(sql, [], |row| row.get(0)).unwrap()
+        };
+        for (rule, old_rows, new_rows) in [
+            (
+                "R13 stats (365 d, text date)",
+                "SELECT COUNT(*) FROM stats WHERE guild_id='old'",
+                "SELECT COUNT(*) FROM stats WHERE guild_id='new'",
+            ),
+            (
+                "R15 voice_sessions (24 h, seconds)",
+                "SELECT COUNT(*) FROM voice_sessions WHERE user_id='old'",
+                "SELECT COUNT(*) FROM voice_sessions WHERE user_id='new'",
+            ),
+            (
+                "R16 helper_sessions (24 h, RFC 3339)",
+                "SELECT COUNT(*) FROM helper_sessions WHERE id='old'",
+                "SELECT COUNT(*) FROM helper_sessions WHERE id='new'",
+            ),
+            (
+                "R16 helper_session_guilds",
+                "SELECT COUNT(*) FROM helper_session_guilds WHERE session_id='old'",
+                "SELECT COUNT(*) FROM helper_session_guilds WHERE session_id='new'",
+            ),
+            (
+                "R17 helper_oauth_states (24 h, seconds)",
+                "SELECT COUNT(*) FROM helper_oauth_states WHERE state_hash='old'",
+                "SELECT COUNT(*) FROM helper_oauth_states WHERE state_hash='new'",
+            ),
+        ] {
+            assert_eq!(
+                count(old_rows),
+                0,
+                "{rule}: the row past the cutoff survived"
+            );
+            assert_eq!(
+                count(new_rows),
+                1,
+                "{rule}: the row inside the window was deleted"
+            );
+        }
+    }
+
+    #[test]
+    fn retention_window_event_registrations() {
+        const DAY: i64 = 86_400_000;
+        let store = Store::open(":memory:").unwrap();
+        let now = Utc::now().timestamp_millis();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO event_registrations(guild_id,event_id,user_id,status,created_at) VALUES('g','e','old','registered',?1),('g','e','new','registered',?2)",
+                params![now - 365 * DAY - 1_000, now - 365 * DAY + 1_000],
+            )
+            .unwrap();
+        }
+
+        let summary = store.prune_retention(now).unwrap();
+
+        let count = |sql: &str| -> i64 {
+            let conn = store.conn.lock().unwrap();
+            conn.query_row(sql, [], |row| row.get(0)).unwrap()
+        };
+        assert_eq!(
+            count("SELECT COUNT(*) FROM event_registrations WHERE user_id='old'"),
+            0,
+            "N1: a registration older than one year survived"
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM event_registrations WHERE user_id='new'"),
+            1,
+            "N1: a registration inside the year was deleted"
+        );
+        assert_eq!(summary.deleted["event_registrations"], 1);
+    }
+
+    #[test]
+    fn retention_window_welcome_claims() {
+        let store = Store::open(":memory:").unwrap();
+        let now = Utc::now().timestamp_millis();
+        let cutoff_seconds = now / 1_000 - 86_400;
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO welcome_delivery_claims(guild_id,user_id,kind,claimed_at) VALUES('g','old','welcome',?1),('g','new','welcome',?2)",
+                params![cutoff_seconds - 10, cutoff_seconds + 10],
+            )
+            .unwrap();
+        }
+
+        let summary = store.prune_retention(now).unwrap();
+
+        let count = |sql: &str| -> i64 {
+            let conn = store.conn.lock().unwrap();
+            conn.query_row(sql, [], |row| row.get(0)).unwrap()
+        };
+        assert_eq!(
+            count("SELECT COUNT(*) FROM welcome_delivery_claims WHERE user_id='old'"),
+            0,
+            "N2: a welcome claim older than 24 hours survived"
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM welcome_delivery_claims WHERE user_id='new'"),
+            1,
+            "N2: a welcome claim inside 24 hours was deleted"
+        );
+        assert_eq!(summary.deleted["welcome_delivery_claims"], 1);
+    }
+
+    #[test]
+    fn retention_window_achievement_links() {
+        let store = Store::open(":memory:").unwrap();
+        let now = Utc::now().timestamp_millis();
+        let cutoff_seconds = now / 1_000 - 86_400;
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO achievement_links(token_hash,guild_id,user_id,name,avatar,expires_at) VALUES('old-hash','g','old','Old','',?1),('new-hash','g','new','New','',?2)",
+                params![cutoff_seconds - 10, cutoff_seconds + 10],
+            )
+            .unwrap();
+        }
+
+        let summary = store.prune_retention(now).unwrap();
+
+        let count = |sql: &str| -> i64 {
+            let conn = store.conn.lock().unwrap();
+            conn.query_row(sql, [], |row| row.get(0)).unwrap()
+        };
+        assert_eq!(
+            count("SELECT COUNT(*) FROM achievement_links WHERE user_id='old'"),
+            0,
+            "N3: a link expired more than 24 hours ago survived"
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM achievement_links WHERE user_id='new'"),
+            1,
+            "N3: a link expired less than 24 hours ago was deleted"
+        );
+        assert_eq!(summary.deleted["achievement_links"], 1);
+    }
+
+    #[test]
+    fn retention_window_legacy_notes() {
+        const DAY: i64 = 86_400_000;
+        let store = Store::open(":memory:").unwrap();
+        let now = Utc::now().timestamp_millis();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute_batch(
+                "CREATE TABLE notes (id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id TEXT NOT NULL, target_id TEXT NOT NULL, author_id TEXT NOT NULL, content TEXT NOT NULL, created_at INTEGER NOT NULL);",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO notes(guild_id,target_id,author_id,content,created_at) VALUES('g','old','mod','old',?1),('g','new','mod','new',?2)",
+                params![now - 730 * DAY - 1_000, now - 730 * DAY + 1_000],
+            )
+            .unwrap();
+        }
+
+        let summary = store.prune_retention(now).unwrap();
+
+        let count = |sql: &str| -> i64 {
+            let conn = store.conn.lock().unwrap();
+            conn.query_row(sql, [], |row| row.get(0)).unwrap()
+        };
+        assert_eq!(
+            count("SELECT COUNT(*) FROM notes WHERE target_id='old'"),
+            0,
+            "N4: a Node-era note older than two years survived"
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM notes WHERE target_id='new'"),
+            1,
+            "N4: a Node-era note inside two years was deleted"
+        );
+        assert_eq!(summary.deleted["notes"], 1);
+
+        // A database created by the Rust Helper has no Node-era tables.
+        let without_legacy = Store::open(":memory:").unwrap();
+        assert!(without_legacy.prune_retention(now).is_ok());
+    }
+
+    #[test]
+    fn retention_window_legacy_sticky_roles() {
+        const DAY: i64 = 86_400_000;
+        let store = Store::open(":memory:").unwrap();
+        let now = Utc::now().timestamp_millis();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute_batch(
+                "CREATE TABLE sticky_roles (guild_id TEXT NOT NULL, user_id TEXT NOT NULL, role_ids TEXT NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY (guild_id, user_id));",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO sticky_roles(guild_id,user_id,role_ids,updated_at) VALUES('g','old','[]',?1),('g','new','[]',?2)",
+                params![now - 365 * DAY - 1_000, now - 365 * DAY + 1_000],
+            )
+            .unwrap();
+        }
+
+        let summary = store.prune_retention(now).unwrap();
+
+        let count = |sql: &str| -> i64 {
+            let conn = store.conn.lock().unwrap();
+            conn.query_row(sql, [], |row| row.get(0)).unwrap()
+        };
+        assert_eq!(
+            count("SELECT COUNT(*) FROM sticky_roles WHERE user_id='old'"),
+            0,
+            "N5: Node-era sticky roles older than one year survived"
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM sticky_roles WHERE user_id='new'"),
+            1,
+            "N5: Node-era sticky roles inside one year were deleted"
+        );
+        assert_eq!(summary.deleted["sticky_roles"], 1);
     }
 
     #[test]
@@ -9258,6 +10563,292 @@ mod tests {
         assert_eq!(store.recent_cases("g", 10).unwrap().len(), 1);
     }
 
+    /// Balance 110, two ledger rows and one cooldown.
+    fn seed_member_economy(store: &Store, user_id: &str) {
+        store.claim_daily("g", user_id, 100).unwrap().unwrap();
+        store
+            .claim_economy_reward("g", user_id, "work", 10, 60_000)
+            .unwrap()
+            .unwrap();
+    }
+
+    #[test]
+    fn econ_kept_on_leave() {
+        let store = Store::open(":memory:").unwrap();
+        seed_member_economy(&store, "u");
+        let deleted = store.delete_member_voluntary_data("g", "u").unwrap();
+        assert!(deleted.get("economy_ledger").is_none());
+        let count = |sql: &str| -> i64 {
+            let conn = store.conn.lock().unwrap();
+            conn.query_row(sql, [], |row| row.get(0)).unwrap()
+        };
+        assert_eq!(
+            count("SELECT COUNT(*) FROM economy_ledger WHERE guild_id='g' AND user_id='u'"),
+            2
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM economy_cooldowns WHERE guild_id='g' AND user_id='u'"),
+            1
+        );
+        assert_eq!(
+            count("SELECT balance FROM economy_accounts WHERE guild_id='g' AND user_id='u'"),
+            110
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM member_departures WHERE guild_id='g' AND user_id='u'"),
+            1
+        );
+        assert!(store.economy_top("g", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn econ_kept_rejoin_restores_the_ranking() {
+        let store = Store::open(":memory:").unwrap();
+        seed_member_economy(&store, "u");
+        store.delete_member_voluntary_data("g", "u").unwrap();
+        assert!(store.clear_member_departure("g", "u").unwrap());
+        assert!(!store.clear_member_departure("g", "u").unwrap());
+        assert_eq!(
+            store.economy_top("g", 10).unwrap(),
+            vec![("u".to_string(), 110)]
+        );
+    }
+
+    #[test]
+    fn econ_kept_no_marker_when_the_rejoin_came_first() {
+        let store = Store::open(":memory:").unwrap();
+        let markers = |user_id: &str| -> i64 {
+            let conn = store.conn.lock().unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM member_departures WHERE guild_id='g' AND user_id=?1",
+                [user_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        // The leave handler captured its time, then the rejoin was handled
+        // while it was still waiting on Discord.
+        let left_at = Utc::now().timestamp_millis() - 1_000;
+        store
+            .record_activity("g", "member_join", "u", Some("U"), None, "{}")
+            .unwrap();
+        store
+            .delete_member_voluntary_data_at("g", "u", left_at)
+            .unwrap();
+        assert_eq!(markers("u"), 0);
+        // Control: a join from before the departure does not cancel it.
+        store
+            .record_activity("g", "member_join", "v", Some("V"), None, "{}")
+            .unwrap();
+        store
+            .delete_member_voluntary_data_at("g", "v", Utc::now().timestamp_millis() + 60_000)
+            .unwrap();
+        assert_eq!(markers("v"), 1);
+    }
+
+    /// Rows of one member's kept economy and departure marker, in the order
+    /// accounts, ledger, cooldowns, orders, marker.
+    fn kept_economy_rows(store: &Store, user_id: &str) -> [i64; 5] {
+        let conn = store.conn.lock().unwrap();
+        [
+            "economy_accounts",
+            "economy_ledger",
+            "economy_cooldowns",
+            "economy_orders",
+            "member_departures",
+        ]
+        .map(|table| {
+            conn.query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE guild_id='g' AND user_id=?1"),
+                [user_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+        })
+    }
+
+    #[test]
+    fn econ_kept_erased_after_30_days() {
+        let store = Store::open(":memory:").unwrap();
+        store
+            .set_setting("g", "community.economy.staff_channel", "20")
+            .unwrap();
+        store
+            .save_shop_product(
+                "g",
+                None,
+                0,
+                &ShopProductInput {
+                    name: "Item".into(),
+                    price: 80,
+                    delivery: "manual".into(),
+                    role_id: None,
+                },
+            )
+            .unwrap();
+        let p = store.shop_products("g").unwrap().remove(0);
+        let mut orders = Vec::new();
+        for user_id in ["old", "recent"] {
+            seed_member_economy(&store, user_id);
+            let order = store
+                .buy_shop_product(
+                    "g",
+                    user_id,
+                    "Name",
+                    p.id,
+                    p.version,
+                    &format!("req-{user_id}"),
+                )
+                .unwrap();
+            orders.push(order.id);
+        }
+        // Seed first with the real clock, then depart and sweep in the future
+        // so none of the seed stamps count as presence.
+        let now = Utc::now().timestamp_millis() + 60 * 86_400_000;
+        let cutoff = now - 30 * 86_400_000;
+        store
+            .delete_member_voluntary_data_at("g", "old", cutoff - 1_000)
+            .unwrap();
+        store
+            .delete_member_voluntary_data_at("g", "recent", cutoff + 1_000)
+            .unwrap();
+        store.prune_retention(now).unwrap();
+        let count = |sql: &str| -> i64 {
+            let conn = store.conn.lock().unwrap();
+            conn.query_row(sql, [], |row| row.get(0)).unwrap()
+        };
+        assert_eq!(kept_economy_rows(&store, "old"), [0, 0, 0, 0, 0]);
+        assert_eq!(
+            count(&format!(
+                "SELECT COUNT(*) FROM scheduled_actions WHERE type='shop_notice' AND target_id='{}'",
+                orders[0]
+            )),
+            0
+        );
+        assert_eq!(kept_economy_rows(&store, "recent"), [1, 3, 1, 1, 1]);
+        assert_eq!(
+            count(&format!(
+                "SELECT COUNT(*) FROM scheduled_actions WHERE type='shop_notice' AND target_id='{}'",
+                orders[1]
+            )),
+            1
+        );
+        assert_eq!(
+            count("SELECT balance FROM economy_accounts WHERE guild_id='g' AND user_id='recent'"),
+            30
+        );
+    }
+
+    #[test]
+    fn econ_kept_returned_members_keep_their_economy() {
+        let store = Store::open(":memory:").unwrap();
+        let members = ["join", "cmd", "xp", "daily", "work", "ban", "early"];
+        for user_id in members {
+            seed_member_economy(&store, user_id);
+        }
+        let now = Utc::now().timestamp_millis() + 60 * 86_400_000;
+        let cutoff = now - 30 * 86_400_000;
+        let left_at = cutoff - 1_000;
+        for user_id in members {
+            store
+                .delete_member_voluntary_data_at("g", user_id, left_at)
+                .unwrap();
+        }
+        // The departure removes XP events, so the proofs go in afterwards.
+        {
+            let conn = store.conn.lock().unwrap();
+            let after_grace = left_at + DEPARTURE_PRESENCE_GRACE_MS + 1;
+            let activity = |user_id: &str, kind: &str, at: i64| {
+                conn.execute(
+                    "INSERT INTO activity_log(guild_id,type,user_id,detail,created_at) VALUES('g',?1,?2,'{}',?3)",
+                    params![kind, user_id, at],
+                )
+                .unwrap();
+            };
+            activity("join", "member_join", left_at);
+            activity("cmd", "helper_command", after_grace);
+            activity("ban", "member_ban", after_grace);
+            let xp = |user_id: &str, at: i64| {
+                conn.execute(
+                    "INSERT INTO xp_events(guild_id,user_id,event_key,source,amount,created_at) VALUES('g',?1,?2,'message',5,?3)",
+                    params![user_id, format!("proof-{user_id}"), at],
+                )
+                .unwrap();
+            };
+            xp("xp", after_grace);
+            xp("early", left_at + 1);
+            conn.execute(
+                "UPDATE economy_accounts SET last_daily_at=?1 WHERE guild_id='g' AND user_id='daily'",
+                [after_grace],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE economy_cooldowns SET last_claim_at=?1 WHERE guild_id='g' AND user_id='work'",
+                [after_grace],
+            )
+            .unwrap();
+        }
+        store.prune_retention(now).unwrap();
+        for user_id in ["join", "cmd", "xp", "daily", "work"] {
+            assert_eq!(
+                kept_economy_rows(&store, user_id),
+                [1, 2, 1, 0, 0],
+                "{user_id} came back and keeps the economy"
+            );
+        }
+        for user_id in ["ban", "early"] {
+            assert_eq!(
+                kept_economy_rows(&store, user_id),
+                [0, 0, 0, 0, 0],
+                "{user_id} is no proof of presence"
+            );
+        }
+    }
+
+    #[test]
+    fn econ_kept_returned_rule_has_no_30_day_gate() {
+        let store = Store::open(":memory:").unwrap();
+        seed_member_economy(&store, "back");
+        seed_member_economy(&store, "away");
+        // Captured after the seed so its stamps are not after the departure.
+        let left_at = Utc::now().timestamp_millis();
+        for user_id in ["back", "away"] {
+            store
+                .delete_member_voluntary_data_at("g", user_id, left_at)
+                .unwrap();
+        }
+        store
+            .record_activity("g", "member_join", "back", Some("B"), None, "{}")
+            .unwrap();
+        store
+            .prune_retention(Utc::now().timestamp_millis())
+            .unwrap();
+        assert_eq!(kept_economy_rows(&store, "back"), [1, 2, 1, 0, 0]);
+        assert_eq!(kept_economy_rows(&store, "away"), [1, 2, 1, 0, 1]);
+    }
+
+    #[test]
+    fn econ_kept_marker_is_erased_by_privacy_and_guild_purge() {
+        let store = Store::open(":memory:").unwrap();
+        store.delete_member_voluntary_data("g", "u").unwrap();
+        store.delete_member_voluntary_data("g2", "w").unwrap();
+        let markers = |guild_id: &str, user_id: &str| -> i64 {
+            let conn = store.conn.lock().unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM member_departures WHERE guild_id=?1 AND user_id=?2",
+                [guild_id, user_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(markers("g", "u"), 1);
+        assert_eq!(markers("g2", "w"), 1);
+        store.purge_user("g", "u").unwrap();
+        assert_eq!(markers("g", "u"), 0);
+        store.purge_guild("g2").unwrap();
+        assert_eq!(markers("g2", "w"), 0);
+    }
+
     #[test]
     fn birthdays_are_idempotent_per_year() {
         let store = Store::open(":memory:").unwrap();
@@ -9281,6 +10872,101 @@ mod tests {
         assert_eq!(store.due_birthdays(8, 3, 2027, 10).unwrap().len(), 1);
         assert!(store.remove_birthday("g", "u").unwrap());
         assert!(store.due_birthdays(8, 3, 2027, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn store_birthdays_reject_impossible_dates() {
+        let store = Store::open(":memory:").unwrap();
+        assert!(store.set_birthday("g", "u", 2, 30).is_err());
+        assert!(store.set_birthday("g", "u", 4, 31).is_err());
+        assert!(store.set_birthday("g", "u", 2, 29).is_ok());
+    }
+
+    #[test]
+    fn birthday_import_keeps_this_years_announcement_when_the_date_is_unchanged() {
+        let store = Store::open(":memory:").unwrap();
+        store.set_birthday("target", "u1", 8, 3).unwrap();
+        assert!(store.mark_birthday_announced("target", "u1", 2026).unwrap());
+        store.set_birthday("source", "u1", 8, 3).unwrap();
+        store
+            .import_guild_config("target", &store.export_guild("source").unwrap())
+            .unwrap();
+        assert!(
+            store
+                .due_birthdays_for_guild("target", 8, 3, 2026, 10)
+                .unwrap()
+                .is_empty()
+        );
+        store.set_birthday("source", "u1", 8, 4).unwrap();
+        store
+            .import_guild_config("target", &store.export_guild("source").unwrap())
+            .unwrap();
+        assert_eq!(
+            store
+                .due_birthdays_for_guild("target", 8, 4, 2026, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn leap_day_birthdays_are_announced_on_february_28_in_common_years() {
+        let store = Store::open(":memory:").unwrap();
+        store.set_birthday("g", "leap", 2, 29).unwrap();
+        let due = |month, day, year| {
+            store
+                .due_birthdays_for_guild("g", month, day, year, 10)
+                .unwrap()
+                .into_iter()
+                .map(|record| record.user_id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(due(2, 28, 2027), vec!["leap".to_string()]);
+        assert!(due(2, 28, 2028).is_empty());
+        assert_eq!(due(2, 29, 2028), vec!["leap".to_string()]);
+        assert!(due(3, 1, 2027).is_empty());
+        assert!(store.mark_birthday_announced("g", "leap", 2027).unwrap());
+        assert!(due(2, 28, 2027).is_empty());
+    }
+
+    #[test]
+    fn leaving_members_promote_the_event_waitlist() {
+        let store = Store::open(":memory:").unwrap();
+        for (event, user, status) in [
+            ("e", "a", "registered"),
+            ("e", "b", "waitlisted"),
+            ("e2", "c", "registered"),
+            ("e2", "d", "waitlisted"),
+            ("e3", "x", "registered"),
+            ("e3", "w", "waitlisted"),
+        ] {
+            assert_eq!(
+                store
+                    .register_event_with_capacity("g", event, user, Some(1))
+                    .unwrap()
+                    .as_deref(),
+                Some(status)
+            );
+        }
+        let status = |event: &str, user: &str| {
+            store
+                .event_registration("g", event, user)
+                .unwrap()
+                .map(|record| record.status)
+        };
+        store.delete_member_voluntary_data("g", "a").unwrap();
+        assert_eq!(status("e", "a"), None);
+        assert_eq!(status("e", "b").as_deref(), Some("registered"));
+        store.purge_user("g", "c").unwrap();
+        assert_eq!(status("e2", "c"), None);
+        assert_eq!(status("e2", "d").as_deref(), Some("registered"));
+        // A member who was only waiting frees no seat.
+        store.delete_member_voluntary_data("g", "w").unwrap();
+        assert_eq!(status("e3", "w"), None);
+        assert_eq!(status("e3", "x").as_deref(), Some("registered"));
+        assert_eq!(status("e", "b").as_deref(), Some("registered"));
+        assert_eq!(status("e2", "d").as_deref(), Some("registered"));
     }
 
     #[test]
@@ -9446,6 +11132,111 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_two_connections_wait_for_the_write_lock() {
+        let path = std::env::temp_dir().join(format!(
+            "vozen-helper-two-connections-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let api = Store::open(path.to_str().unwrap()).unwrap();
+        // Stands for the gateway's own Store::open on the same file (Serve mode).
+        let gateway = Connection::open(&path).unwrap();
+        gateway
+            .execute_batch("BEGIN IMMEDIATE; INSERT INTO settings(guild_id,key,value,updated_at) VALUES('other','k','v',0);")
+            .unwrap();
+        let daily = {
+            let api = api.clone();
+            std::thread::spawn(move || {
+                api.claim_daily("g", "u", 100)
+                    .map(|account| account.map(|account| account.balance))
+                    .map_err(|error| error.to_string())
+            })
+        };
+        let event = {
+            let api = api.clone();
+            std::thread::spawn(move || {
+                api.register_event_with_capacity("g", "event-1", "u", Some(10))
+                    .map_err(|error| error.to_string())
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        gateway.execute_batch("COMMIT").unwrap();
+        assert_eq!(daily.join().unwrap(), Ok(Some(100)));
+        assert_eq!(event.join().unwrap(), Ok(Some("registered".to_string())));
+        drop(api);
+        drop(gateway);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    #[test]
+    fn sqlite_busy_timeout_is_explicit() {
+        let store = Store::open(":memory:").unwrap();
+        let busy_timeout_ms = {
+            let conn = store.conn.lock().unwrap();
+            conn.query_row("PRAGMA busy_timeout", [], |row| row.get::<_, i64>(0))
+                .unwrap()
+        };
+        assert_eq!(busy_timeout_ms, 5000);
+    }
+
+    #[test]
+    fn sqlite_member_lookups_use_their_indexes() {
+        let store = Store::open(":memory:").unwrap();
+        let conn = store.conn.lock().unwrap();
+        let plan_for = |sql: &str| -> String {
+            let mut statement = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+            statement
+                .query_map([], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+                .join(" | ")
+        };
+        for (sql, index) in [
+            (
+                "SELECT id,guild_id,type,target_id,moderator_id,reason,duration_ms,created_at FROM cases WHERE guild_id='g' AND target_id='u' ORDER BY id DESC LIMIT 5",
+                "idx_cases_target",
+            ),
+            (
+                "SELECT user_tag FROM activity_log WHERE guild_id='g' AND user_id='u' AND user_tag IS NOT NULL AND user_tag<>'' ORDER BY id DESC LIMIT 1",
+                "idx_activity_user",
+            ),
+            (
+                "SELECT COUNT(*) FROM levels WHERE guild_id='g' AND xp>10",
+                "idx_levels_xp",
+            ),
+        ] {
+            let plan = plan_for(sql);
+            assert!(plan.contains(index), "{index} not used by {sql}: {plan}");
+        }
+    }
+
+    #[test]
+    fn sqlite_schema_version_is_recorded_and_never_lowered() {
+        let store = Store::open(":memory:").unwrap();
+        let meta = |key: &str| -> String {
+            let conn = store.conn.lock().unwrap();
+            conn.query_row("SELECT value FROM helper_meta WHERE key=?1", [key], |row| {
+                row.get(0)
+            })
+            .unwrap()
+        };
+        assert_eq!(meta("rust_schema_version"), RUST_SCHEMA_VERSION.to_string());
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE helper_meta SET value='99' WHERE key='rust_schema_version'",
+                [],
+            )
+            .unwrap();
+        }
+        store.migrate().unwrap();
+        assert_eq!(meta("rust_schema_version"), "99");
+        assert_eq!(meta("growth_taxonomy_v2"), "complete");
+    }
+
+    #[test]
     fn economy_daily_is_atomic_and_rate_limited() {
         let store = Store::open(":memory:").unwrap();
         assert_eq!(store.economy_account("g", "u").unwrap().balance, 0);
@@ -9454,8 +11245,8 @@ mod tests {
         assert!(store.claim_daily("g", "u", 250).unwrap().is_none());
         assert_eq!(store.economy_account("g", "u").unwrap().balance, 250);
         let deleted = store.delete_member_voluntary_data("g", "u").unwrap();
-        assert_eq!(deleted["economy_ledger"], 1);
-        assert_eq!(store.economy_account("g", "u").unwrap().balance, 0);
+        assert!(deleted.get("economy_ledger").is_none());
+        assert_eq!(store.economy_account("g", "u").unwrap().balance, 250);
     }
 
     #[test]
@@ -9477,7 +11268,7 @@ mod tests {
             vec![("u".to_string(), 75)]
         );
         let deleted = store.delete_member_voluntary_data("g", "u").unwrap();
-        assert_eq!(deleted["economy_cooldowns"], 1);
+        assert!(deleted.get("economy_cooldowns").is_none());
     }
 
     #[test]
@@ -9560,6 +11351,95 @@ mod tests {
                 .as_deref(),
             Some("false")
         );
+    }
+
+    #[test]
+    fn anti_raid_latch_never_shortens_an_active_gate() {
+        let store = Store::open(":memory:").unwrap();
+
+        // A long anti-nuke containment followed by a short anti-raid burst
+        // must keep the longer deadline while the incident is active.
+        store.arm_anti_raid_latch("guild", 7_200).unwrap();
+        store.arm_anti_raid_latch("guild", 600).unwrap();
+
+        assert_eq!(
+            store
+                .get_setting("guild", "security.anti_raid.gate_until")
+                .unwrap()
+                .as_deref(),
+            Some("7200")
+        );
+        assert!(!store.release_expired_anti_raid_latch("guild", 601).unwrap());
+        assert!(
+            !store
+                .release_expired_anti_raid_latch("guild", 7_199)
+                .unwrap()
+        );
+        assert!(
+            store
+                .release_expired_anti_raid_latch("guild", 7_200)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn anti_raid_latch_ignores_released_or_unreadable_deadlines() {
+        let store = Store::open(":memory:").unwrap();
+        store
+            .set_setting("released", "security.anti_raid.latch_active", "false")
+            .unwrap();
+        store
+            .set_setting("released", "security.anti_raid.gate_until", "999999")
+            .unwrap();
+        store
+            .set_setting("corrupt", "security.anti_raid.latch_active", "true")
+            .unwrap();
+        store
+            .set_setting(
+                "corrupt",
+                "security.anti_raid.gate_until",
+                "not-a-timestamp",
+            )
+            .unwrap();
+
+        // A stale deadline from a released incident, or an unreadable one,
+        // must never hold the new gate closed.
+        store.arm_anti_raid_latch("released", 100).unwrap();
+        store.arm_anti_raid_latch("corrupt", 100).unwrap();
+
+        for guild in ["released", "corrupt"] {
+            assert_eq!(
+                store
+                    .get_setting(guild, "security.anti_raid.gate_until")
+                    .unwrap()
+                    .as_deref(),
+                Some("100"),
+                "{guild}"
+            );
+        }
+    }
+
+    #[test]
+    fn anti_raid_latch_arms_a_fresh_gate() {
+        let store = Store::open(":memory:").unwrap();
+        store
+            .set_setting("fresh", "security.join_gate.enabled", "false")
+            .unwrap();
+
+        store.arm_anti_raid_latch("fresh", 600).unwrap();
+
+        for (key, expected) in [
+            ("security.anti_raid.gate_until", "600"),
+            ("security.join_gate.enabled", "true"),
+            ("security.anti_raid.latch_active", "true"),
+            ("security.anti_raid.previous_gate_enabled", "false"),
+        ] {
+            assert_eq!(
+                store.get_setting("fresh", key).unwrap().as_deref(),
+                Some(expected),
+                "{key}"
+            );
+        }
     }
 
     #[test]

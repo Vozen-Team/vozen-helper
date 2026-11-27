@@ -14,5 +14,10 @@
   "r_eb4a6ce8e56d": " davet edenlerin adlarıyla",
   "r_f22ae96535a7": " (yalnızca animasyonlu)",
   "r_fe6ebea0bf5e": " · dahili not kaydedildi",
-  "r_4aeacdd823e2": "Creator Channel: <#{0}>. Kendi odanı oluşturmak için katıl."
+  "r_4aeacdd823e2": "Creator Channel: <#{0}>. Kendi odanı oluşturmak için katıl.",
+  "r_5b2765ff3bd5": "Bu sunucuda zaten 25 bekleyen hatırlatıcın var. Yenisini eklemeden önce birinin gönderilmesini bekle.",
+  "r_76dcd789bfcb": "Çekiliş bulunamadı, hâlâ etkin, hâlâ duyuruluyor veya seçilecek başka katılımcı yok.",
+  "r_03bbc7b8b6ed": " Kayıtlı {0} rol artık mevcut değil ve çıkarıldı.",
+  "r_db9acf706d49": "<@{0}> için karantina kaldırıldı; {1} rol geri yüklendi.{2}",
+  "r_1b29f6412df3": "<@{0}> için karantina rolleri kısmen geri yüklendi: {1} rol geri yüklendi, {2} rol bekliyor. Bekleyen roller kayıtlı; izinleri kontrol edip /unquarantine komutunu tekrar dene.{3}"
 }

@@ -14,5 +14,10 @@
   "r_eb4a6ce8e56d": " avec les noms des auteurs d'invitations",
   "r_f22ae96535a7": " (animés uniquement)",
   "r_fe6ebea0bf5e": " · note interne enregistrée",
-  "r_4aeacdd823e2": "Creator Channel : <#{0}>. Rejoins-le pour créer ton salon."
+  "r_4aeacdd823e2": "Creator Channel : <#{0}>. Rejoins-le pour créer ton salon.",
+  "r_5b2765ff3bd5": "Tu as déjà 25 rappels en attente sur ce serveur. Attends qu'un rappel soit envoyé avant d'en ajouter un autre.",
+  "r_76dcd789bfcb": "Tirage au sort introuvable, encore actif, encore en cours d'annonce ou sans autre participant à choisir.",
+  "r_03bbc7b8b6ed": " {0} rôle(s) enregistré(s) n'existent plus et ont été ignorés.",
+  "r_db9acf706d49": "Quarantaine levée pour <@{0}> ; {1} rôle(s) rétabli(s).{2}",
+  "r_1b29f6412df3": "Rôles de quarantaine partiellement rétablis pour <@{0}> : {1} rôle(s) rétabli(s), {2} encore en attente. Les rôles en attente sont enregistrés ; vérifie les permissions et relance /unquarantine.{3}"
 }

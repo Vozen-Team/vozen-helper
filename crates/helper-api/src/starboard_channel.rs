@@ -2,7 +2,7 @@
 use super::*;
 use serde_json::{Value, json};
 
-static CREATE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+static CREATE_LOCKS: GuildLocks = GuildLocks::new();
 #[derive(Clone, Copy)]
 enum ChannelPurpose {
     Starboard,
@@ -360,7 +360,8 @@ async fn create_for(
             "starboard_too_many_staff_roles",
         ));
     }
-    let _guard = CREATE_LOCK
+    let create_lock = CREATE_LOCKS.for_guild(&claims.guild_id);
+    let _guard = create_lock
         .try_lock()
         .map_err(|_| client_error(StatusCode::CONFLICT, "starboard_creation_busy"))?;
     if state.discord_token.len() < 20 {
