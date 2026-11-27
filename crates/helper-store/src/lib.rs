@@ -40,7 +40,13 @@ pub struct Store {
 /// (for example a column rename) runs only when the stored version is lower.
 /// `PRAGMA user_version` belongs to the Node bot (src/store/db.ts) on databases
 /// converted in place, so it must not be used here.
-const RUST_SCHEMA_VERSION: i64 = 1;
+const RUST_SCHEMA_VERSION: i64 = 2;
+
+/// Owner decision 2026-11-25: a departed member's economy is kept this long.
+const DEPARTED_ECONOMY_RETENTION_DAYS: i64 = 30;
+/// Activity (other than a rejoin) this long after a departure proves the member
+/// came back even if the rejoin event was missed.
+const DEPARTURE_PRESENCE_GRACE_MS: i64 = 5 * 60 * 1_000;
 
 #[derive(Debug, Clone, Copy, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1038,6 +1044,12 @@ impl Store {
              CREATE INDEX IF NOT EXISTS idx_activity_user ON activity_log(guild_id,user_id);
              CREATE INDEX IF NOT EXISTS idx_levels_xp ON levels(guild_id,xp DESC);",
         )?;
+        // Owner decision 2026-11-25: a departed member's economy is kept for 30
+        // days behind this marker, then erased by `prune_retention`.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS member_departures (guild_id TEXT NOT NULL, user_id TEXT NOT NULL, left_at INTEGER NOT NULL, PRIMARY KEY(guild_id,user_id));
+             CREATE INDEX IF NOT EXISTS idx_member_departures_left ON member_departures(left_at);",
+        )?;
         conn.execute_batch("CREATE TABLE IF NOT EXISTS birthdays (guild_id TEXT NOT NULL, user_id TEXT NOT NULL, month INTEGER NOT NULL, day INTEGER NOT NULL, last_announced_year INTEGER, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY(guild_id,user_id)); CREATE INDEX IF NOT EXISTS idx_birthdays_day ON birthdays(month,day,last_announced_year); CREATE TABLE IF NOT EXISTS economy_accounts (guild_id TEXT NOT NULL, user_id TEXT NOT NULL, balance INTEGER NOT NULL DEFAULT 0, last_daily_at INTEGER, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY(guild_id,user_id)); CREATE INDEX IF NOT EXISTS idx_economy_guild_balance ON economy_accounts(guild_id,balance DESC); CREATE TABLE IF NOT EXISTS economy_ledger (id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id TEXT NOT NULL, user_id TEXT NOT NULL, amount INTEGER NOT NULL, reason TEXT NOT NULL, idempotency_key TEXT NOT NULL UNIQUE, created_at INTEGER NOT NULL); CREATE INDEX IF NOT EXISTS idx_economy_ledger_account ON economy_ledger(guild_id,user_id,created_at DESC); CREATE TABLE IF NOT EXISTS temp_channels (guild_id TEXT NOT NULL, channel_id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, created_at INTEGER NOT NULL); CREATE INDEX IF NOT EXISTS idx_temp_channels_guild ON temp_channels(guild_id); CREATE TABLE IF NOT EXISTS voice_sessions (guild_id TEXT NOT NULL, user_id TEXT NOT NULL, channel_id TEXT NOT NULL, started_at INTEGER NOT NULL, PRIMARY KEY(guild_id,user_id)); CREATE INDEX IF NOT EXISTS idx_voice_sessions_guild ON voice_sessions(guild_id,started_at);")?;
         economy_shop::migrate(&conn)?;
         conn.execute_batch("CREATE TABLE IF NOT EXISTS economy_cooldowns (guild_id TEXT NOT NULL, user_id TEXT NOT NULL, kind TEXT NOT NULL, last_claim_at INTEGER NOT NULL, PRIMARY KEY(guild_id,user_id,kind)); CREATE INDEX IF NOT EXISTS idx_economy_cooldowns_kind ON economy_cooldowns(guild_id,kind,last_claim_at);")?;
@@ -1647,13 +1659,27 @@ impl Store {
         )? > 0)
     }
 
-    /// Remove only voluntary member state. Moderation records remain intact so
-    /// that the server's audit history is not silently rewritten when a member
-    /// leaves or requests deletion of personal preferences.
+    /// Remove only voluntary member state when a member leaves now. Moderation
+    /// records remain intact so that the server's audit history is not
+    /// silently rewritten. The economy (balance, ledger, cooldowns, orders and
+    /// their shop notices) is kept for 30 days behind a `member_departures`
+    /// marker (owner decision 2026-11-25); everything else is removed at once.
     pub fn delete_member_voluntary_data(
         &self,
         guild_id: &str,
         user_id: &str,
+    ) -> Result<serde_json::Value> {
+        self.delete_member_voluntary_data_at(guild_id, user_id, Utc::now().timestamp_millis())
+    }
+
+    /// Same as `delete_member_voluntary_data` for a departure observed at
+    /// `left_at_ms`. When a rejoin was already recorded at or after that time,
+    /// the member is back and no departure marker is written.
+    pub fn delete_member_voluntary_data_at(
+        &self,
+        guild_id: &str,
+        user_id: &str,
+        left_at_ms: i64,
     ) -> Result<serde_json::Value> {
         let mut conn = self.conn.lock().expect("store mutex poisoned");
         let tx = conn.transaction()?;
@@ -1698,26 +1724,6 @@ impl Store {
                 "DELETE FROM birthdays WHERE guild_id=?2 AND user_id=?1",
             ),
             (
-                "shop_notifications",
-                "DELETE FROM scheduled_actions WHERE guild_id=?2 AND type='shop_notice' AND target_id IN (SELECT CAST(id AS TEXT) FROM economy_orders WHERE guild_id=?2 AND user_id=?1)",
-            ),
-            (
-                "economy_orders",
-                "DELETE FROM economy_orders WHERE guild_id=?2 AND user_id=?1",
-            ),
-            (
-                "economy_accounts",
-                "DELETE FROM economy_accounts WHERE guild_id=?2 AND user_id=?1",
-            ),
-            (
-                "economy_ledger",
-                "DELETE FROM economy_ledger WHERE guild_id=?2 AND user_id=?1",
-            ),
-            (
-                "economy_cooldowns",
-                "DELETE FROM economy_cooldowns WHERE guild_id=?2 AND user_id=?1",
-            ),
-            (
                 "tags",
                 "DELETE FROM tags WHERE guild_id=?2 AND author_id=?1",
             ),
@@ -1734,8 +1740,32 @@ impl Store {
         for event_id in &freed_events {
             promote_next_waitlisted(&tx, guild_id, event_id)?;
         }
+        // The leave handler waits on Discord before reaching this point, so a
+        // rejoin may already have been handled; a marker written now would be
+        // left on a present member.
+        let rejoined: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM activity_log WHERE guild_id=?1 AND user_id=?2 AND type='member_join' AND created_at>=?3)",
+            params![guild_id, user_id, left_at_ms],
+            |row| row.get(0),
+        )?;
+        if !rejoined {
+            tx.execute(
+                "INSERT INTO member_departures(guild_id,user_id,left_at) VALUES(?1,?2,?3) ON CONFLICT(guild_id,user_id) DO UPDATE SET left_at=excluded.left_at",
+                params![guild_id, user_id, left_at_ms],
+            )?;
+        }
         tx.commit()?;
         Ok(serde_json::Value::Object(deleted))
+    }
+
+    /// A member who rejoins gets their kept economy back. Returns whether a
+    /// departure marker was removed.
+    pub fn clear_member_departure(&self, guild_id: &str, user_id: &str) -> Result<bool> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        Ok(conn.execute(
+            "DELETE FROM member_departures WHERE guild_id=?1 AND user_id=?2",
+            params![guild_id, user_id],
+        )? > 0)
     }
 
     pub fn upsert_tag(
@@ -2045,7 +2075,7 @@ impl Store {
     pub fn economy_top(&self, guild_id: &str, limit: u32) -> Result<Vec<(String, i64)>> {
         let conn = self.conn.lock().expect("store mutex poisoned");
         let mut stmt = conn.prepare(
-            "SELECT user_id,balance FROM economy_accounts WHERE guild_id=?1 AND balance>0 ORDER BY balance DESC,user_id ASC LIMIT ?2",
+            "SELECT user_id,balance FROM economy_accounts WHERE guild_id=?1 AND balance>0 AND NOT EXISTS (SELECT 1 FROM member_departures d WHERE d.guild_id=economy_accounts.guild_id AND d.user_id=economy_accounts.user_id) ORDER BY balance DESC,user_id ASC LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![guild_id, i64::from(limit.clamp(1, 25))], |row| {
             Ok((row.get(0)?, row.get(1)?))
@@ -4800,6 +4830,10 @@ impl Store {
                 "DELETE FROM economy_cooldowns WHERE guild_id=?2 AND user_id=?1",
             ),
             (
+                "member_departures",
+                "DELETE FROM member_departures WHERE guild_id=?2 AND user_id=?1",
+            ),
+            (
                 "tags",
                 "DELETE FROM tags WHERE guild_id=?2 AND author_id=?1",
             ),
@@ -5291,6 +5325,7 @@ impl Store {
             "DELETE FROM economy_accounts WHERE guild_id=?1",
             "DELETE FROM economy_cooldowns WHERE guild_id=?1",
             "DELETE FROM economy_ledger WHERE guild_id=?1",
+            "DELETE FROM member_departures WHERE guild_id=?1",
             "DELETE FROM temp_channels WHERE guild_id=?1",
             "DELETE FROM stats WHERE guild_id=?1",
             "DELETE FROM tickets WHERE guild_id=?1",
@@ -5337,6 +5372,8 @@ impl Store {
         let cutoff_date_1y = (now - Duration::days(365)).format("%Y-%m-%d").to_string();
         let cutoff_rfc3339 = (now - Duration::hours(24)).to_rfc3339();
         let cutoff_seconds = (now - Duration::hours(24)).timestamp();
+        let cutoff_departed =
+            (now - Duration::days(DEPARTED_ECONOMY_RETENTION_DAYS)).timestamp_millis();
 
         let mut conn = self.conn.lock().expect("store mutex poisoned");
         let tx = conn.transaction()?;
@@ -5346,6 +5383,60 @@ impl Store {
                 deleted.insert(name.to_string(), serde_json::json!(count));
             }
         };
+
+        // Departed members' economy (owner decision 2026-11-25). A member with
+        // any sign of having come back keeps it whatever the age of the marker:
+        // a rejoin recorded at or after the departure, or XP, a command, a
+        // daily or a reward claimed after the grace period. A ban is no proof.
+        remove(
+            "member_departures_returned",
+            tx.execute(
+                "DELETE FROM member_departures WHERE EXISTS (SELECT 1 FROM activity_log a WHERE a.guild_id=member_departures.guild_id AND a.user_id=member_departures.user_id AND a.type='member_join' AND a.created_at >= member_departures.left_at) OR EXISTS (SELECT 1 FROM activity_log a WHERE a.guild_id=member_departures.guild_id AND a.user_id=member_departures.user_id AND a.type='helper_command' AND a.created_at > member_departures.left_at + ?1) OR EXISTS (SELECT 1 FROM xp_events x WHERE x.guild_id=member_departures.guild_id AND x.user_id=member_departures.user_id AND x.created_at > member_departures.left_at + ?1) OR EXISTS (SELECT 1 FROM economy_accounts e WHERE e.guild_id=member_departures.guild_id AND e.user_id=member_departures.user_id AND e.last_daily_at > member_departures.left_at + ?1) OR EXISTS (SELECT 1 FROM economy_cooldowns c WHERE c.guild_id=member_departures.guild_id AND c.user_id=member_departures.user_id AND c.last_claim_at > member_departures.left_at + ?1)",
+                params![DEPARTURE_PRESENCE_GRACE_MS],
+            )?,
+        );
+        remove(
+            "departed_shop_notifications",
+            tx.execute(
+                "DELETE FROM scheduled_actions WHERE type='shop_notice' AND (guild_id,target_id) IN (SELECT guild_id,CAST(id AS TEXT) FROM economy_orders WHERE (guild_id,user_id) IN (SELECT guild_id,user_id FROM member_departures WHERE left_at < ?1))",
+                [cutoff_departed],
+            )?,
+        );
+        remove(
+            "departed_economy_orders",
+            tx.execute(
+                "DELETE FROM economy_orders WHERE (guild_id,user_id) IN (SELECT guild_id,user_id FROM member_departures WHERE left_at < ?1)",
+                [cutoff_departed],
+            )?,
+        );
+        remove(
+            "departed_economy_accounts",
+            tx.execute(
+                "DELETE FROM economy_accounts WHERE (guild_id,user_id) IN (SELECT guild_id,user_id FROM member_departures WHERE left_at < ?1)",
+                [cutoff_departed],
+            )?,
+        );
+        remove(
+            "departed_economy_ledger",
+            tx.execute(
+                "DELETE FROM economy_ledger WHERE (guild_id,user_id) IN (SELECT guild_id,user_id FROM member_departures WHERE left_at < ?1)",
+                [cutoff_departed],
+            )?,
+        );
+        remove(
+            "departed_economy_cooldowns",
+            tx.execute(
+                "DELETE FROM economy_cooldowns WHERE (guild_id,user_id) IN (SELECT guild_id,user_id FROM member_departures WHERE left_at < ?1)",
+                [cutoff_departed],
+            )?,
+        );
+        remove(
+            "member_departures_expired",
+            tx.execute(
+                "DELETE FROM member_departures WHERE left_at < ?1",
+                [cutoff_departed],
+            )?,
+        );
 
         remove(
             "audit_events",
@@ -9828,6 +9919,292 @@ mod tests {
         assert_eq!(store.recent_cases("g", 10).unwrap().len(), 1);
     }
 
+    /// Balance 110, two ledger rows and one cooldown.
+    fn seed_member_economy(store: &Store, user_id: &str) {
+        store.claim_daily("g", user_id, 100).unwrap().unwrap();
+        store
+            .claim_economy_reward("g", user_id, "work", 10, 60_000)
+            .unwrap()
+            .unwrap();
+    }
+
+    #[test]
+    fn econ_kept_on_leave() {
+        let store = Store::open(":memory:").unwrap();
+        seed_member_economy(&store, "u");
+        let deleted = store.delete_member_voluntary_data("g", "u").unwrap();
+        assert!(deleted.get("economy_ledger").is_none());
+        let count = |sql: &str| -> i64 {
+            let conn = store.conn.lock().unwrap();
+            conn.query_row(sql, [], |row| row.get(0)).unwrap()
+        };
+        assert_eq!(
+            count("SELECT COUNT(*) FROM economy_ledger WHERE guild_id='g' AND user_id='u'"),
+            2
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM economy_cooldowns WHERE guild_id='g' AND user_id='u'"),
+            1
+        );
+        assert_eq!(
+            count("SELECT balance FROM economy_accounts WHERE guild_id='g' AND user_id='u'"),
+            110
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM member_departures WHERE guild_id='g' AND user_id='u'"),
+            1
+        );
+        assert!(store.economy_top("g", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn econ_kept_rejoin_restores_the_ranking() {
+        let store = Store::open(":memory:").unwrap();
+        seed_member_economy(&store, "u");
+        store.delete_member_voluntary_data("g", "u").unwrap();
+        assert!(store.clear_member_departure("g", "u").unwrap());
+        assert!(!store.clear_member_departure("g", "u").unwrap());
+        assert_eq!(
+            store.economy_top("g", 10).unwrap(),
+            vec![("u".to_string(), 110)]
+        );
+    }
+
+    #[test]
+    fn econ_kept_no_marker_when_the_rejoin_came_first() {
+        let store = Store::open(":memory:").unwrap();
+        let markers = |user_id: &str| -> i64 {
+            let conn = store.conn.lock().unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM member_departures WHERE guild_id='g' AND user_id=?1",
+                [user_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        // The leave handler captured its time, then the rejoin was handled
+        // while it was still waiting on Discord.
+        let left_at = Utc::now().timestamp_millis() - 1_000;
+        store
+            .record_activity("g", "member_join", "u", Some("U"), None, "{}")
+            .unwrap();
+        store
+            .delete_member_voluntary_data_at("g", "u", left_at)
+            .unwrap();
+        assert_eq!(markers("u"), 0);
+        // Control: a join from before the departure does not cancel it.
+        store
+            .record_activity("g", "member_join", "v", Some("V"), None, "{}")
+            .unwrap();
+        store
+            .delete_member_voluntary_data_at("g", "v", Utc::now().timestamp_millis() + 60_000)
+            .unwrap();
+        assert_eq!(markers("v"), 1);
+    }
+
+    /// Rows of one member's kept economy and departure marker, in the order
+    /// accounts, ledger, cooldowns, orders, marker.
+    fn kept_economy_rows(store: &Store, user_id: &str) -> [i64; 5] {
+        let conn = store.conn.lock().unwrap();
+        [
+            "economy_accounts",
+            "economy_ledger",
+            "economy_cooldowns",
+            "economy_orders",
+            "member_departures",
+        ]
+        .map(|table| {
+            conn.query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE guild_id='g' AND user_id=?1"),
+                [user_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+        })
+    }
+
+    #[test]
+    fn econ_kept_erased_after_30_days() {
+        let store = Store::open(":memory:").unwrap();
+        store
+            .set_setting("g", "community.economy.staff_channel", "20")
+            .unwrap();
+        store
+            .save_shop_product(
+                "g",
+                None,
+                0,
+                &ShopProductInput {
+                    name: "Item".into(),
+                    price: 80,
+                    delivery: "manual".into(),
+                    role_id: None,
+                },
+            )
+            .unwrap();
+        let p = store.shop_products("g").unwrap().remove(0);
+        let mut orders = Vec::new();
+        for user_id in ["old", "recent"] {
+            seed_member_economy(&store, user_id);
+            let order = store
+                .buy_shop_product(
+                    "g",
+                    user_id,
+                    "Name",
+                    p.id,
+                    p.version,
+                    &format!("req-{user_id}"),
+                )
+                .unwrap();
+            orders.push(order.id);
+        }
+        // Seed first with the real clock, then depart and sweep in the future
+        // so none of the seed stamps count as presence.
+        let now = Utc::now().timestamp_millis() + 60 * 86_400_000;
+        let cutoff = now - 30 * 86_400_000;
+        store
+            .delete_member_voluntary_data_at("g", "old", cutoff - 1_000)
+            .unwrap();
+        store
+            .delete_member_voluntary_data_at("g", "recent", cutoff + 1_000)
+            .unwrap();
+        store.prune_retention(now).unwrap();
+        let count = |sql: &str| -> i64 {
+            let conn = store.conn.lock().unwrap();
+            conn.query_row(sql, [], |row| row.get(0)).unwrap()
+        };
+        assert_eq!(kept_economy_rows(&store, "old"), [0, 0, 0, 0, 0]);
+        assert_eq!(
+            count(&format!(
+                "SELECT COUNT(*) FROM scheduled_actions WHERE type='shop_notice' AND target_id='{}'",
+                orders[0]
+            )),
+            0
+        );
+        assert_eq!(kept_economy_rows(&store, "recent"), [1, 3, 1, 1, 1]);
+        assert_eq!(
+            count(&format!(
+                "SELECT COUNT(*) FROM scheduled_actions WHERE type='shop_notice' AND target_id='{}'",
+                orders[1]
+            )),
+            1
+        );
+        assert_eq!(
+            count("SELECT balance FROM economy_accounts WHERE guild_id='g' AND user_id='recent'"),
+            30
+        );
+    }
+
+    #[test]
+    fn econ_kept_returned_members_keep_their_economy() {
+        let store = Store::open(":memory:").unwrap();
+        let members = ["join", "cmd", "xp", "daily", "work", "ban", "early"];
+        for user_id in members {
+            seed_member_economy(&store, user_id);
+        }
+        let now = Utc::now().timestamp_millis() + 60 * 86_400_000;
+        let cutoff = now - 30 * 86_400_000;
+        let left_at = cutoff - 1_000;
+        for user_id in members {
+            store
+                .delete_member_voluntary_data_at("g", user_id, left_at)
+                .unwrap();
+        }
+        // The departure removes XP events, so the proofs go in afterwards.
+        {
+            let conn = store.conn.lock().unwrap();
+            let after_grace = left_at + DEPARTURE_PRESENCE_GRACE_MS + 1;
+            let activity = |user_id: &str, kind: &str, at: i64| {
+                conn.execute(
+                    "INSERT INTO activity_log(guild_id,type,user_id,detail,created_at) VALUES('g',?1,?2,'{}',?3)",
+                    params![kind, user_id, at],
+                )
+                .unwrap();
+            };
+            activity("join", "member_join", left_at);
+            activity("cmd", "helper_command", after_grace);
+            activity("ban", "member_ban", after_grace);
+            let xp = |user_id: &str, at: i64| {
+                conn.execute(
+                    "INSERT INTO xp_events(guild_id,user_id,event_key,source,amount,created_at) VALUES('g',?1,?2,'message',5,?3)",
+                    params![user_id, format!("proof-{user_id}"), at],
+                )
+                .unwrap();
+            };
+            xp("xp", after_grace);
+            xp("early", left_at + 1);
+            conn.execute(
+                "UPDATE economy_accounts SET last_daily_at=?1 WHERE guild_id='g' AND user_id='daily'",
+                [after_grace],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE economy_cooldowns SET last_claim_at=?1 WHERE guild_id='g' AND user_id='work'",
+                [after_grace],
+            )
+            .unwrap();
+        }
+        store.prune_retention(now).unwrap();
+        for user_id in ["join", "cmd", "xp", "daily", "work"] {
+            assert_eq!(
+                kept_economy_rows(&store, user_id),
+                [1, 2, 1, 0, 0],
+                "{user_id} came back and keeps the economy"
+            );
+        }
+        for user_id in ["ban", "early"] {
+            assert_eq!(
+                kept_economy_rows(&store, user_id),
+                [0, 0, 0, 0, 0],
+                "{user_id} is no proof of presence"
+            );
+        }
+    }
+
+    #[test]
+    fn econ_kept_returned_rule_has_no_30_day_gate() {
+        let store = Store::open(":memory:").unwrap();
+        seed_member_economy(&store, "back");
+        seed_member_economy(&store, "away");
+        // Captured after the seed so its stamps are not after the departure.
+        let left_at = Utc::now().timestamp_millis();
+        for user_id in ["back", "away"] {
+            store
+                .delete_member_voluntary_data_at("g", user_id, left_at)
+                .unwrap();
+        }
+        store
+            .record_activity("g", "member_join", "back", Some("B"), None, "{}")
+            .unwrap();
+        store
+            .prune_retention(Utc::now().timestamp_millis())
+            .unwrap();
+        assert_eq!(kept_economy_rows(&store, "back"), [1, 2, 1, 0, 0]);
+        assert_eq!(kept_economy_rows(&store, "away"), [1, 2, 1, 0, 1]);
+    }
+
+    #[test]
+    fn econ_kept_marker_is_erased_by_privacy_and_guild_purge() {
+        let store = Store::open(":memory:").unwrap();
+        store.delete_member_voluntary_data("g", "u").unwrap();
+        store.delete_member_voluntary_data("g2", "w").unwrap();
+        let markers = |guild_id: &str, user_id: &str| -> i64 {
+            let conn = store.conn.lock().unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM member_departures WHERE guild_id=?1 AND user_id=?2",
+                [guild_id, user_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(markers("g", "u"), 1);
+        assert_eq!(markers("g2", "w"), 1);
+        store.purge_user("g", "u").unwrap();
+        assert_eq!(markers("g", "u"), 0);
+        store.purge_guild("g2").unwrap();
+        assert_eq!(markers("g2", "w"), 0);
+    }
+
     #[test]
     fn birthdays_are_idempotent_per_year() {
         let store = Store::open(":memory:").unwrap();
@@ -10224,8 +10601,8 @@ mod tests {
         assert!(store.claim_daily("g", "u", 250).unwrap().is_none());
         assert_eq!(store.economy_account("g", "u").unwrap().balance, 250);
         let deleted = store.delete_member_voluntary_data("g", "u").unwrap();
-        assert_eq!(deleted["economy_ledger"], 1);
-        assert_eq!(store.economy_account("g", "u").unwrap().balance, 0);
+        assert!(deleted.get("economy_ledger").is_none());
+        assert_eq!(store.economy_account("g", "u").unwrap().balance, 250);
     }
 
     #[test]
@@ -10247,7 +10624,7 @@ mod tests {
             vec![("u".to_string(), 75)]
         );
         let deleted = store.delete_member_voluntary_data("g", "u").unwrap();
-        assert_eq!(deleted["economy_cooldowns"], 1);
+        assert!(deleted.get("economy_cooldowns").is_none());
     }
 
     #[test]

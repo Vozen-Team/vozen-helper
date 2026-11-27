@@ -51,6 +51,18 @@ reter com prazo e dar direitos**.
 | `localStorage vh_sess` (browser) | token de sessão + timestamp                          | Persistir sessão entre F5 (timeout 5 min)   | **Estritamente necessário** | Limpo no logout / 5 min inativo                             |
 | Token OAuth Discord              | access token implícito                               | Verificar identidade no login               | **Estritamente necessário** | **Não persistido** (trocado por sessão e descartado)        |
 
+## Helper em Rust: dados pessoais (desde 2026-11)
+
+### Economia de quem sai (30 dias)
+
+Quando um membro sai, é expulso ou banido, a sua economia (saldo, histórico, tempos de espera, encomendas, incluindo
+as pendentes, e os avisos da loja dessas encomendas) fica guardada **30 dias** (decisão do dono de 25/11/2026). Fica
+marcada na tabela `member_departures` (servidor, utilizador, hora da saída). Se o membro reentrar, a marca sai e fica
+tudo como estava. Ao fim de 30 dias, a limpeza apaga a economia e a marca, salvo se houver sinal de que voltou:
+entrada registada depois da saída, ou XP, comando, `/daily` ou recompensa mais de 5 minutos depois da saída. Enquanto
+está fora, o membro não aparece no ranking de saldo. `/privacidade apagar` e apagar o servidor apagam logo a economia e
+a marca.
+
 ## Conclusões que alimentam as fases seguintes
 
 - **Sem cookies não-essenciais → sem banner de consentimento.** O cookie e o localStorage

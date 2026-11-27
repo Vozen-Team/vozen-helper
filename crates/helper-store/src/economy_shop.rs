@@ -371,7 +371,7 @@ mod tests {
             1
         );
         assert_eq!(store.economy_account("g", "u").unwrap().balance, 20);
-        store.delete_member_voluntary_data("g", "u").unwrap();
+        store.purge_user("g", "u").unwrap();
         assert!(store.shop_orders("g", i64::MAX).unwrap().is_empty());
         assert_eq!(store.shop_products("g").unwrap().len(), 1);
     }

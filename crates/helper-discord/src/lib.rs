@@ -2323,6 +2323,13 @@ impl EventHandler for Handler {
         let day = chrono::Utc::now().format("%Y-%m-%d").to_string();
         let _ = self.store.record_join(&guild_id.to_string(), &day);
         let guild_text = guild_id.to_string();
+        // A member who returns within 30 days gets their kept economy back.
+        if let Err(error) = self
+            .store
+            .clear_member_departure(&guild_text, &new_member.user.id.to_string())
+        {
+            warn!(%guild_text, %error, "could not clear member departure marker");
+        }
         let detail = serde_json::json!({
             "event": "member_join",
             "contentAvailable": false,
@@ -2838,6 +2845,7 @@ impl EventHandler for Handler {
         user: serenity::all::User,
         _member_data_if_available: Option<serenity::all::Member>,
     ) {
+        let left_at = Utc::now().timestamp_millis();
         let day = chrono::Utc::now().format("%Y-%m-%d").to_string();
         let guild_text = guild_id.to_string();
         let _ = self.store.record_leave(&guild_text, &day);
@@ -2903,9 +2911,9 @@ impl EventHandler for Handler {
                     .await;
             }
         }
-        if let Ok(deleted) = self
-            .store
-            .delete_member_voluntary_data(&guild_text, &user.id.to_string())
+        if let Ok(deleted) =
+            self.store
+                .delete_member_voluntary_data_at(&guild_text, &user.id.to_string(), left_at)
         {
             tracing::debug!(
                 guild_id = %guild_id,
