@@ -80,8 +80,6 @@ const HELPER_INSTALL_PERMISSIONS: &str = "19099133930742";
 const SESSION_RESPONSE_HEADER: &str = "x-vozen-session";
 const SESSION_MAX_HOURS: i64 = 8;
 const IDLE_MINUTES: i64 = 30;
-static TICKET_PANEL_SAVE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-static NICKNAME_SAVE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Async locks keyed by guild id: work in one server never waits for another.
 /// An entry nobody holds is dropped on the next lookup, so the map stays small.
@@ -103,6 +101,8 @@ impl GuildLocks {
 }
 
 static QUICK_SETUP_LOCKS: GuildLocks = GuildLocks::new();
+static TICKET_PANEL_SAVE_LOCKS: GuildLocks = GuildLocks::new();
+static NICKNAME_SAVE_LOCKS: GuildLocks = GuildLocks::new();
 
 #[derive(Clone)]
 pub struct ApiState {
@@ -9581,7 +9581,19 @@ async fn update_feature_detail(
     State(state): State<Arc<ApiState>>,
     headers: HeaderMap,
     Path(key): Path<String>,
-    Json(mut update): Json<FeatureDetailUpdate>,
+    Json(update): Json<FeatureDetailUpdate>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
+    update_feature_detail_inner(state, headers, key, update, false).await
+}
+
+/// The one publish path shared by save, toggle, repair and rollback. It takes
+/// the per-guild save locks itself, so callers must not hold them.
+async fn update_feature_detail_inner(
+    state: Arc<ApiState>,
+    headers: HeaderMap,
+    key: String,
+    mut update: FeatureDetailUpdate,
+    recover_ticket_panel: bool,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
     let claims = require_mutation_auth(&state, &headers).await?;
     if key == "community.levels"
@@ -9589,13 +9601,15 @@ async fn update_feature_detail(
     {
         config.insert("bannerEnabled".into(), serde_json::Value::Bool(true));
     }
+    let ticket_lock = TICKET_PANEL_SAVE_LOCKS.for_guild(&claims.guild_id);
     let _ticket_save_guard = if key == "support.tickets" {
-        Some(TICKET_PANEL_SAVE_LOCK.lock().await)
+        Some(ticket_lock.lock().await)
     } else {
         None
     };
+    let nickname_lock = NICKNAME_SAVE_LOCKS.for_guild(&claims.guild_id);
     let _nickname_save_guard = if key == "management.nickname" {
-        Some(NICKNAME_SAVE_LOCK.lock().await)
+        Some(nickname_lock.lock().await)
     } else {
         None
     };
@@ -9876,12 +9890,15 @@ async fn update_feature_detail(
             &claims.guild_id,
             &update.config,
             quota_limit(&plan, "panels"),
-            DISCORD_API_BASE,
+            &discord_api_base(),
+            recover_ticket_panel,
         )
         .await
         {
             Ok(result) => result,
-            Err(_) => serde_json::json!({"applied": false, "code": "ticket_panel_publish_failed"}),
+            Err(error) => {
+                serde_json::json!({"applied": false, "code": ticket_panel::error_code(&error)})
+            }
         }
     } else {
         serde_json::json!(null)
@@ -10344,218 +10361,29 @@ async fn feature_rollback(
     }
     let config: serde_json::Value = serde_json::from_str(&previous.config_json)
         .map_err(|_| client_error(StatusCode::INTERNAL_SERVER_ERROR, "invalid_stored_config"))?;
-    // Rollback is a mutation just like a fresh publish: re-run the same
-    // guild-scoped preflight before touching either the feature setting or a
-    // provider subscription. This prevents a historical revision from
-    // bypassing current permissions/hierarchy checks.
-    let preflight = if key == "management.nickname" {
-        nickname_preflight_for_claims(
-            &state,
-            &claims,
-            FeaturePreflightRequest {
-                config: config.clone(),
-                enabled: previous.enabled,
-            },
-        )
-        .await?
-    } else if matches!(key.as_str(), "protection.antispam" | "protection.antiscam") {
-        preflight(
-            State(state.clone()),
-            headers.clone(),
-            Json(PreflightRequest {
-                operation: format!("{key}.rollback"),
-                config: config.clone(),
-                enabled: previous.enabled,
-            }),
-        )
-        .await?
-    } else {
-        generic_feature_preflight(
-            State(state.clone()),
-            headers.clone(),
-            key.clone(),
-            FeaturePreflightRequest {
-                config: config.clone(),
-                enabled: previous.enabled,
-            },
-        )
-        .await?
-    };
-    if !preflight
-        .0
-        .get("ok")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
-    {
-        return Err(client_error(
-            StatusCode::PRECONDITION_FAILED,
-            "feature_preflight_failed",
-        ));
+    // Rollback is a publish of an older revision: it goes through the same
+    // path as a save, with its locks, preflight, validation, provider
+    // subscriptions, nickname and ticket panel delivery.
+    let response = update_feature_detail_inner(
+        state,
+        headers,
+        key,
+        FeatureDetailUpdate {
+            enabled: previous.enabled,
+            config,
+            expected_revision: request.expected_revision,
+        },
+        false,
+    )
+    .await?;
+    let mut body = response.0;
+    if let Some(object) = body.as_object_mut() {
+        object.insert(
+            "rolledBackFrom".to_string(),
+            serde_json::Value::from(request.revision),
+        );
     }
-    let issues = validate_feature_config(&key, &config);
-    if previous.enabled && issues.iter().any(|issue| issue.severity == "error") {
-        return Err(client_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_stored_config",
-        ));
-    }
-    // Provider revisions need their subscription projection restored in the
-    // same transaction as feature_settings/feature_revisions. Reusing the
-    // normal preparation path also validates the historical source and
-    // ensures the provider is still reachable before the transaction starts.
-    let youtube_subscription = if key == "social.youtube" {
-        prepare_youtube_feature(&state, &claims, &config, previous.enabled).await?
-    } else {
-        None
-    };
-    let rss_subscription = if matches!(key.as_str(), "social.rss" | "social.podcasts") {
-        prepare_rss_feature(&state, &claims, &config, previous.enabled).await?
-    } else {
-        None
-    };
-    let twitch_subscription = if key == "social.twitch" {
-        prepare_twitch_feature(&state, &claims, &config, previous.enabled).await?
-    } else {
-        None
-    };
-    let bluesky_subscription = if key == "social.bluesky" {
-        prepare_bluesky_feature(&state, &claims, &config, previous.enabled).await?
-    } else {
-        None
-    };
-    let tiktok_subscription = if key == "social.tiktok" {
-        prepare_tiktok_feature(&state, &claims, &config, previous.enabled).await?
-    } else {
-        None
-    };
-    let instagram_subscription = if key == "social.instagram" {
-        prepare_instagram_feature(&state, &claims, &config, previous.enabled).await?
-    } else {
-        None
-    };
-    let kick_subscription = if key == "social.kick" {
-        prepare_kick_feature(&state, &claims, &config, previous.enabled).await?
-    } else {
-        None
-    };
-    let mut projections = vec![
-        (
-            feature_key(&key),
-            if previous.enabled { "true" } else { "false" }.into(),
-        ),
-        (feature_config_key(&key), previous.config_json.clone()),
-    ];
-    projections.extend(runtime_projection_pairs(&key, &config));
-    if let Some(runtime_key) = runtime_feature_key(&key) {
-        projections.push((
-            runtime_key.to_string(),
-            if previous.enabled { "true" } else { "false" }.into(),
-        ));
-    }
-    let publish_result = if key == "social.youtube" {
-        state.store.publish_youtube_feature_setting(
-            &claims.guild_id,
-            &key,
-            previous.enabled,
-            &previous.config_json,
-            request.expected_revision,
-            &claims.user_id,
-            &projections,
-            youtube_subscription.as_ref(),
-        )
-    } else if matches!(key.as_str(), "social.rss" | "social.podcasts") {
-        state.store.publish_rss_feature_setting(
-            &claims.guild_id,
-            &key,
-            previous.enabled,
-            &previous.config_json,
-            request.expected_revision,
-            &claims.user_id,
-            &projections,
-            rss_subscription.as_ref(),
-        )
-    } else if key == "social.twitch" {
-        state.store.publish_twitch_feature_setting(
-            &claims.guild_id,
-            &key,
-            previous.enabled,
-            &previous.config_json,
-            request.expected_revision,
-            &claims.user_id,
-            &projections,
-            twitch_subscription.as_ref(),
-        )
-    } else if key == "social.bluesky" {
-        state.store.publish_bluesky_feature_setting(
-            &claims.guild_id,
-            &key,
-            previous.enabled,
-            &previous.config_json,
-            request.expected_revision,
-            &claims.user_id,
-            &projections,
-            bluesky_subscription.as_ref(),
-        )
-    } else if key == "social.tiktok" {
-        state.store.publish_tiktok_feature_setting(
-            &claims.guild_id,
-            &key,
-            previous.enabled,
-            &previous.config_json,
-            request.expected_revision,
-            &claims.user_id,
-            &projections,
-            tiktok_subscription.as_ref(),
-        )
-    } else if key == "social.instagram" {
-        state.store.publish_instagram_feature_setting(
-            &claims.guild_id,
-            &key,
-            previous.enabled,
-            &previous.config_json,
-            request.expected_revision,
-            &claims.user_id,
-            &projections,
-            instagram_subscription.as_ref(),
-        )
-    } else if key == "social.kick" {
-        state.store.publish_kick_feature_setting(
-            &claims.guild_id,
-            &key,
-            previous.enabled,
-            &previous.config_json,
-            request.expected_revision,
-            &claims.user_id,
-            &projections,
-            kick_subscription.as_ref(),
-        )
-    } else {
-        state.store.publish_feature_setting(
-            &claims.guild_id,
-            &key,
-            previous.enabled,
-            &previous.config_json,
-            request.expected_revision,
-            &claims.user_id,
-            &projections,
-        )
-    };
-    let record = publish_result.map_err(|error| {
-        if error.to_string().starts_with("feature_revision_conflict:") {
-            client_error(StatusCode::CONFLICT, "feature_revision_conflict")
-        } else {
-            client_error(StatusCode::INTERNAL_SERVER_ERROR, "store_error")
-        }
-    })?;
-    Ok(Json(serde_json::json!({
-        "guildId": claims.guild_id,
-        "key": key,
-        "enabled": record.enabled,
-        "config": config,
-        "revision": record.revision,
-        "rolledBackFrom": request.revision,
-        "issues": issues,
-    })))
+    Ok(Json(body))
 }
 
 /// Rebuild the runtime projection (and any provider subscription) from the
@@ -10563,7 +10391,8 @@ async fn feature_rollback(
 /// through the normal update path so it gets the same authentication,
 /// validation, preflight, revision checks and atomic provider handling as a
 /// regular publish.  A successful repair therefore creates a new revision
-/// instead of mutating history in place.
+/// instead of mutating history in place.  It is also the only path allowed to
+/// resolve an expired unknown ticket panel delivery by reading the channel.
 async fn feature_repair(
     State(state): State<Arc<ApiState>>,
     headers: HeaderMap,
@@ -10582,15 +10411,16 @@ async fn feature_repair(
     };
     let config = serde_json::from_str(&current.config_json)
         .map_err(|_| client_error(StatusCode::INTERNAL_SERVER_ERROR, "invalid_stored_config"))?;
-    let response = update_feature_detail(
-        State(state),
+    let response = update_feature_detail_inner(
+        state,
         headers,
-        Path(key),
-        Json(FeatureDetailUpdate {
+        key,
+        FeatureDetailUpdate {
             enabled: current.enabled,
             config,
             expected_revision: Some(current.revision),
-        }),
+        },
+        true,
     )
     .await?;
     let mut body = response.0;
@@ -14343,6 +14173,65 @@ mod tests {
                 .revision,
             2
         );
+    }
+
+    #[tokio::test]
+    async fn feature_rollback_goes_through_the_publish_path() {
+        let store = Store::open(":memory:").unwrap();
+        let session = claims("guild-a");
+        let token = sign_session(&session, "test-session-secret-with-at-least-32-bytes");
+        store.save_session(&session).unwrap();
+        store
+            .replace_session_guilds(
+                session.session_id,
+                &[("guild-a".into(), "Alpha".into(), Some("32".into()))],
+            )
+            .unwrap();
+
+        for expected_revision in [1, 2] {
+            let response = router(state(store.clone()))
+                .oneshot(
+                    Request::builder()
+                        .method("PUT")
+                        .uri("/api/config/features/utility.help")
+                        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(r#"{"enabled":false,"config":{}}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                store
+                    .get_feature_setting("guild-a", "utility.help")
+                    .unwrap()
+                    .unwrap()
+                    .revision,
+                expected_revision
+            );
+        }
+
+        let response = router(state(store.clone()))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/config/features/utility.help/rollback")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"revision":1}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 1_000_000).await.unwrap())
+                .unwrap();
+        assert_eq!(body["rolledBackFrom"], 1);
+        assert_eq!(body["revision"], 3);
+        // Only the shared publish path reports what it applied in Discord.
+        assert!(body.get("discordApply").is_some());
     }
 
     #[tokio::test]
