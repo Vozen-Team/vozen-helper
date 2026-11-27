@@ -14,5 +14,10 @@
   "r_eb4a6ce8e56d": " com nomes de quem convidou",
   "r_f22ae96535a7": " (somente animados)",
   "r_fe6ebea0bf5e": " · nota interna salva",
-  "r_4aeacdd823e2": "Creator Channel: <#{0}>. Entre para criar sua sala."
+  "r_4aeacdd823e2": "Creator Channel: <#{0}>. Entre para criar sua sala.",
+  "r_5b2765ff3bd5": "Você já tem 25 lembretes pendentes neste servidor. Espere um deles ser enviado antes de adicionar outro.",
+  "r_76dcd789bfcb": "Sorteio não encontrado, ainda ativo, ainda sendo anunciado ou sem outros participantes para sortear.",
+  "r_03bbc7b8b6ed": " {0} cargo(s) salvo(s) não existem mais e foram descartados.",
+  "r_db9acf706d49": "Quarentena removida de <@{0}>; {1} cargo(s) restaurado(s).{2}",
+  "r_1b29f6412df3": "Cargos anteriores à quarentena parcialmente restaurados para <@{0}>: {1} cargo(s) restaurado(s), {2} ainda pendente(s). Os cargos pendentes estão salvos; verifique as permissões e tente /unquarantine novamente.{3}"
 }

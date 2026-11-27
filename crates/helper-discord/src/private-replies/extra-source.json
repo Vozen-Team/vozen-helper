@@ -14,5 +14,10 @@
   "r_e838c2444527": "`{0}` — {1} uses — {2}",
   "r_eb4a6ce8e56d": " with inviter names",
   "r_f22ae96535a7": " (animated only)",
-  "r_fe6ebea0bf5e": " · internal note saved"
+  "r_fe6ebea0bf5e": " · internal note saved",
+  "r_5b2765ff3bd5": "You already have 25 pending reminders in this server. Wait for one to fire before adding another.",
+  "r_76dcd789bfcb": "Giveaway not found, still active, still being announced, or no other participants to pick.",
+  "r_03bbc7b8b6ed": " {0} saved role(s) no longer exist and were dropped.",
+  "r_db9acf706d49": "Quarantine removed from <@{0}>; {1} role(s) restored.{2}",
+  "r_1b29f6412df3": "Quarantine partially restored for <@{0}>: {1} role(s) restored, {2} still pending. Pending roles are saved; check permissions and retry /unquarantine.{3}"
 }

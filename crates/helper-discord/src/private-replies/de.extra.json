@@ -14,5 +14,10 @@
 "r_eb4a6ce8e56d":" mit Namen der Einladenden",
 "r_f22ae96535a7":" (nur animierte)",
 "r_fe6ebea0bf5e":" · interne Notiz gespeichert",
-  "r_4aeacdd823e2": "Creator Channel: <#{0}>. Tritt bei, um deinen Raum zu erstellen."
+  "r_4aeacdd823e2": "Creator Channel: <#{0}>. Tritt bei, um deinen Raum zu erstellen.",
+  "r_5b2765ff3bd5": "Du hast auf diesem Server bereits 25 ausstehende Erinnerungen. Warte, bis eine davon ausgelöst wurde, bevor du eine weitere hinzufügst.",
+  "r_76dcd789bfcb": "Verlosung nicht gefunden, noch aktiv, wird noch angekündigt oder hat keine weiteren Teilnehmer zur Auswahl.",
+  "r_03bbc7b8b6ed": " {0} gespeicherte Rolle(n) existieren nicht mehr und wurden entfernt.",
+  "r_db9acf706d49": "Quarantäne für <@{0}> aufgehoben; {1} Rollen wiederhergestellt.{2}",
+  "r_1b29f6412df3": "Rollen nach Quarantäne für <@{0}> teilweise wiederhergestellt: {1} Rollen wiederhergestellt, {2} noch ausstehend. Ausstehende Rollen sind gespeichert; prüfe Berechtigungen und versuche /unquarantine erneut.{3}"
 }

@@ -14,5 +14,10 @@
   "r_eb4a6ce8e56d": " se jmény zvoucích",
   "r_f22ae96535a7": " (pouze animované)",
   "r_fe6ebea0bf5e": " · interní poznámka uložena",
-  "r_4aeacdd823e2": "Creator Channel: <#{0}>. Připoj se a vytvoř si místnost."
+  "r_4aeacdd823e2": "Creator Channel: <#{0}>. Připoj se a vytvoř si místnost.",
+  "r_5b2765ff3bd5": "Na tomto serveru už máte 25 čekajících připomenutí. Než přidáte další, počkejte, až se některé z nich odešle.",
+  "r_76dcd789bfcb": "Slosování nebylo nalezeno, stále probíhá, stále se vyhlašuje nebo nemá další účastníky k výběru.",
+  "r_03bbc7b8b6ed": " Uložené role, které už neexistují a byly vynechány: {0}.",
+  "r_db9acf706d49": "Karanténa uživatele <@{0}> byla zrušena; obnoveno {1} rolí.{2}",
+  "r_1b29f6412df3": "Částečné obnovení po karanténě pro <@{0}>: obnoveno {1} rolí, zbývá {2}. Zbývající role jsou uložené; zkontrolujte oprávnění a zkuste znovu /unquarantine.{3}"
 }

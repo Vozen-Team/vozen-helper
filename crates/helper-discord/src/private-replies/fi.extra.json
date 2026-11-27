@@ -14,5 +14,10 @@
   "r_eb4a6ce8e56d": " kutsujien nimillä",
   "r_f22ae96535a7": " (vain animoidut)",
   "r_fe6ebea0bf5e": " · sisäinen huomautus tallennettiin",
-  "r_4aeacdd823e2": "Creator Channel: <#{0}>. Liity luodaksesi oman huoneesi."
+  "r_4aeacdd823e2": "Creator Channel: <#{0}>. Liity luodaksesi oman huoneesi.",
+  "r_5b2765ff3bd5": "Sinulla on jo 25 odottavaa muistutusta tällä palvelimella. Odota, että yksi niistä lähetetään, ennen kuin lisäät uuden.",
+  "r_76dcd789bfcb": "Arvontaa ei löytynyt, se on yhä käynnissä, sitä julkistetaan vielä tai siinä ei ole muita valittavia osallistujia.",
+  "r_03bbc7b8b6ed": " Tallennettuja rooleja, joita ei enää ole, poistettiin: {0}.",
+  "r_db9acf706d49": "Käyttäjän <@{0}> karanteeni poistettiin; {1} roolia palautettiin.{2}",
+  "r_1b29f6412df3": "Karanteeni palautettiin osittain käyttäjälle <@{0}>: {1} roolia palautettiin, {2} on kesken. Kesken olevat roolit on tallennettu; tarkista käyttöoikeudet ja yritä /unquarantine uudelleen.{3}"
 }

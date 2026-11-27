@@ -14,5 +14,10 @@
   "r_eb4a6ce8e56d": " cu numele celor care au invitat",
   "r_f22ae96535a7": " (doar animate)",
   "r_fe6ebea0bf5e": " · notă internă salvată",
-  "r_4aeacdd823e2": "Creator Channel: <#{0}>. Intră pentru a-ți crea camera."
+  "r_4aeacdd823e2": "Creator Channel: <#{0}>. Intră pentru a-ți crea camera.",
+  "r_5b2765ff3bd5": "Ai deja 25 de mementouri în așteptare pe acest server. Așteaptă să fie trimis unul dintre ele înainte să adaugi altul.",
+  "r_76dcd789bfcb": "Concursul nu a fost găsit, este încă activ, este încă în curs de anunțare sau nu are alți participanți din care să se aleagă.",
+  "r_03bbc7b8b6ed": " Roluri salvate care nu mai există și au fost eliminate: {0}.",
+  "r_db9acf706d49": "Carantină eliminată pentru <@{0}>; {1} roluri restabilite.{2}",
+  "r_1b29f6412df3": "Roluri din carantină restabilite parțial pentru <@{0}>: {1} restabilite, {2} încă în așteptare. Rolurile în așteptare sunt salvate; verifică permisiunile și reîncearcă /unquarantine.{3}"
 }

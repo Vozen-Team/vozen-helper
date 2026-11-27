@@ -14,5 +14,10 @@
 "r_eb4a6ce8e56d":" med navn på dem som inviterte",
 "r_f22ae96535a7":" (bare animerte)",
 "r_fe6ebea0bf5e":" · intern merknad lagret",
-  "r_4aeacdd823e2": "Creator Channel: <#{0}>. Bli med for å opprette rommet ditt."
+  "r_4aeacdd823e2": "Creator Channel: <#{0}>. Bli med for å opprette rommet ditt.",
+  "r_5b2765ff3bd5": "Du har allerede 25 ventende påminnelser på denne serveren. Vent til en av dem er sendt før du legger til en ny.",
+  "r_76dcd789bfcb": "Premietrekningen ble ikke funnet, er fortsatt aktiv, blir fortsatt kunngjort eller har ingen andre deltakere å velge blant.",
+  "r_03bbc7b8b6ed": " {0} lagrede rolle(r) finnes ikke lenger og ble fjernet.",
+  "r_db9acf706d49": "Karantene fjernet fra <@{0}>; {1} roller gjenopprettet.{2}",
+  "r_1b29f6412df3": "Roller etter karantene delvis gjenopprettet for <@{0}>: {1} roller gjenopprettet, {2} venter fortsatt. Ventende roller er lagret; kontroller tillatelser, og prøv /unquarantine igjen.{3}"
 }

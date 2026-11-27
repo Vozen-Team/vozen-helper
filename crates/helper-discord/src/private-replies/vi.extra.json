@@ -14,5 +14,10 @@
   "r_eb4a6ce8e56d": " có tên người mời",
   "r_f22ae96535a7": " (chỉ biểu tượng động)",
   "r_fe6ebea0bf5e": " · đã lưu ghi chú nội bộ",
-  "r_4aeacdd823e2": "Creator Channel: <#{0}>. Tham gia để tạo phòng của bạn."
+  "r_4aeacdd823e2": "Creator Channel: <#{0}>. Tham gia để tạo phòng của bạn.",
+  "r_5b2765ff3bd5": "Bạn đã có 25 lời nhắc đang chờ trong máy chủ này. Hãy đợi một lời nhắc được gửi trước khi thêm lời nhắc mới.",
+  "r_76dcd789bfcb": "Không tìm thấy đợt tặng quà, đợt tặng quà vẫn đang diễn ra, vẫn đang được công bố hoặc không còn người tham gia nào khác để chọn.",
+  "r_03bbc7b8b6ed": " {0} vai trò đã lưu không còn tồn tại và đã bị loại bỏ.",
+  "r_db9acf706d49": "Đã gỡ cách ly cho <@{0}>; đã khôi phục {1} vai trò.{2}",
+  "r_1b29f6412df3": "Đã khôi phục một phần vai trò trước cách ly cho <@{0}>: {1} vai trò đã khôi phục, {2} vẫn đang chờ. Các vai trò đang chờ được lưu; hãy kiểm tra quyền và thử lại /unquarantine.{3}"
 }
