@@ -526,6 +526,7 @@ impl EventHandler for Handler {
                 // per minute instead of once per UTC day so a guild at UTC-14
                 // or UTC+14 is still announced on its own local day.
                 let mut last_birthday_minute: Option<i64> = None;
+                let mut last_retention: Option<Instant> = None;
                 loop {
                     if let Ok(actions) =
                         store.due_scheduled_actions(chrono::Utc::now().timestamp_millis(), 100)
@@ -545,6 +546,11 @@ impl EventHandler for Handler {
                     if last_birthday_minute != Some(birthday_minute) {
                         let _ = deliver_birthday_announcements(&http, &store, birthday_now).await;
                         last_birthday_minute = Some(birthday_minute);
+                    }
+                    if last_retention.is_none_or(|at| at.elapsed() >= Duration::from_secs(60 * 60))
+                    {
+                        run_retention_sweep(&store);
+                        last_retention = Some(Instant::now());
                     }
                     tokio::time::sleep(Duration::from_secs(1)).await;
                 }
@@ -5078,6 +5084,18 @@ async fn run_growth_lifecycle_purge_worker(store: Store) {
             }
         }
         tokio::time::sleep(Duration::from_secs(24 * 60 * 60)).await;
+    }
+}
+
+/// Hourly retention with the periods listed in docs/GDPR-INVENTARIO.md.
+/// Runs on the gateway only; `helper_modules::start_scheduler` stays unused.
+fn run_retention_sweep(store: &Store) {
+    let started = Instant::now();
+    let result = store.prune_retention(Utc::now().timestamp_millis());
+    let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    match result {
+        Ok(summary) => info!(deleted = %summary.deleted, elapsed_ms, "retention sweep completed"),
+        Err(error) => warn!(%error, elapsed_ms, "retention sweep failed"),
     }
 }
 

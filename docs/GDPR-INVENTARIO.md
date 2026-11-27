@@ -87,6 +87,34 @@ convite (código e data), mas não quem convidou. Os registos de moderação fic
 `sticky_roles`) quando existem. `invite_snapshots` guarda o criador de cada convite tal como o Discord o mostra; volta a
 ser lido do Discord enquanto o convite existir e apaga-se com o servidor.
 
+### Retenção automática
+
+Corre de hora a hora no gateway do Helper. Apaga:
+
+| Dados | Prazo |
+|---|---|
+| Economia de quem saiu (`member_departures`) | 30 dias depois da saída |
+| `audit_events` | 30 dias |
+| `activity_log` | 90 dias |
+| Crescimento de servidores que removeram o Helper | 30 dias depois da saída |
+| `infractions`, `quarantine` | 1 ano |
+| `cases` | 2 anos |
+| `scheduled_actions` | 90 dias depois da data prevista |
+| `tickets` fechados | 1 ano depois de fechar |
+| `suggestions` e votos | 1 ano |
+| `giveaways`, `polls` terminados (com entradas, resultados e votos) | 90 dias depois de terminar |
+| `stats` | 1 ano |
+| `xp_events` | 1 ano |
+| `event_registrations` | 1 ano depois da inscrição |
+| `voice_sessions` paradas | 24 horas |
+| `welcome_delivery_claims` | 24 horas |
+| `achievement_links` expirados | 24 horas depois de expirar |
+| Sessões do painel e estados OAuth | 24 horas depois de expirar |
+| `notes` (tabela antiga do Node) | 2 anos |
+| `sticky_roles` (tabela antiga do Node) | 1 ano |
+
+`invite_attributions` não tem prazo: apaga-se com `/privacidade apagar` ou com o servidor.
+
 ## Conclusões que alimentam as fases seguintes
 
 - **Sem cookies não-essenciais → sem banner de consentimento.** O cookie e o localStorage

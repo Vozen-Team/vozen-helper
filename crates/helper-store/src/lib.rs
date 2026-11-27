@@ -5602,6 +5602,43 @@ impl Store {
                 [cutoff_seconds],
             )?,
         );
+        remove(
+            "event_registrations",
+            tx.execute(
+                "DELETE FROM event_registrations WHERE created_at < ?1",
+                [cutoff_1y],
+            )?,
+        );
+        remove(
+            "welcome_delivery_claims",
+            tx.execute(
+                "DELETE FROM welcome_delivery_claims WHERE claimed_at < ?1",
+                [cutoff_seconds],
+            )?,
+        );
+        remove(
+            "achievement_links",
+            tx.execute(
+                "DELETE FROM achievement_links WHERE expires_at < ?1",
+                [cutoff_seconds],
+            )?,
+        );
+        // Node-era tables (src/store/db.ts); periods copied from src/store/gdpr.ts.
+        if legacy_table_exists(&tx, "notes")? {
+            remove(
+                "notes",
+                tx.execute("DELETE FROM notes WHERE created_at < ?1", [cutoff_2y])?,
+            );
+        }
+        if legacy_table_exists(&tx, "sticky_roles")? {
+            remove(
+                "sticky_roles",
+                tx.execute(
+                    "DELETE FROM sticky_roles WHERE updated_at < ?1",
+                    [cutoff_1y],
+                )?,
+            );
+        }
         tx.commit()?;
         Ok(RetentionSummary {
             deleted: serde_json::Value::Object(deleted),
@@ -9802,6 +9839,506 @@ mod tests {
         assert_eq!(summary.deleted["cases"], 1);
         assert_eq!(store.recent_cases("g", 10).unwrap().len(), 1);
         assert_eq!(store.recent_audit_events("g", 10).unwrap().len(), 1);
+    }
+
+    // Each retention_window_ test puts one row just past the cutoff ("old",
+    // must go) and one just inside it ("new", must stay).
+    #[test]
+    fn retention_window_existing_ms_rules_hold() {
+        const DAY: i64 = 86_400_000;
+        let store = Store::open(":memory:").unwrap();
+        let now = Utc::now().timestamp_millis();
+        let old = |days: i64| now - days * DAY - 1_000;
+        let new = |days: i64| now - days * DAY + 1_000;
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO audit_events(correlation_id,guild_id,actor_id,action,outcome,created_at) VALUES('window-old','g','mod','old','recorded',?1),('window-new','g','mod','new','recorded',?2)",
+                params![old(30), new(30)],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO activity_log(guild_id,type,user_id,detail,created_at) VALUES('g','old','u','{}',?1),('g','new','u','{}',?2)",
+                params![old(90), new(90)],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO infractions(guild_id,target_id,created_at) VALUES('g','old',?1),('g','new',?2)",
+                params![old(365), new(365)],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO cases(guild_id,type,target_id,moderator_id,created_at) VALUES('g','warn','old','mod',?1),('g','warn','new','mod',?2)",
+                params![old(730), new(730)],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO quarantine(guild_id,user_id,role_ids,created_at) VALUES('g','old','[]',?1),('g','new','[]',?2)",
+                params![old(365), new(365)],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO scheduled_actions(guild_id,type,target_id,execute_at) VALUES('g','remind','old',?1),('g','remind','new',?2)",
+                params![old(90), new(90)],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO tickets(guild_id,channel_id,opener_id,status,created_at,closed_at) VALUES('g','old','u','closed',?1,?1),('g','new','u','closed',?2,?2)",
+                params![old(365), new(365)],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO suggestions(id,guild_id,author_id,content,created_at) VALUES(1,'g','u','old',?1),(2,'g','u','new',?2)",
+                params![old(365), new(365)],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO giveaways(id,guild_id,channel_id,prize,end_at,ended,host_id,created_at) VALUES(1,'g','c','old',?1,1,'host',?1),(2,'g','c','new',?2,1,'host',?2)",
+                params![old(90), new(90)],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO polls(id,guild_id,channel_id,question,options,end_at,closed,created_at) VALUES(1,'g','c','old','[]',?1,1,?1),(2,'g','c','new','[]',?2,1,?2)",
+                params![old(90), new(90)],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO xp_events(guild_id,user_id,event_key,source,amount,created_at) VALUES('g','u','old','message',1,?1),('g','u','new','message',1,?2)",
+                params![old(365), new(365)],
+            )
+            .unwrap();
+            conn.execute_batch(
+                "INSERT INTO suggestion_votes(suggestion_id,user_id,vote) VALUES(1,'voter',1),(2,'voter',1);
+                 INSERT INTO giveaway_entries(giveaway_id,user_id) VALUES(1,'entrant'),(2,'entrant');
+                 INSERT INTO giveaway_results(giveaway_id,winners_json) VALUES(1,'[]'),(2,'[]');
+                 INSERT INTO poll_votes(poll_id,user_id,choice) VALUES(1,'voter',0),(2,'voter',0);",
+            )
+            .unwrap();
+        }
+
+        store.prune_retention(now).unwrap();
+
+        let count = |sql: &str| -> i64 {
+            let conn = store.conn.lock().unwrap();
+            conn.query_row(sql, [], |row| row.get(0)).unwrap()
+        };
+        for (rule, old_rows, new_rows) in [
+            (
+                "R1 audit_events (30 d)",
+                "SELECT COUNT(*) FROM audit_events WHERE action='old'",
+                "SELECT COUNT(*) FROM audit_events WHERE action='new'",
+            ),
+            (
+                "R2 activity_log (90 d)",
+                "SELECT COUNT(*) FROM activity_log WHERE type='old'",
+                "SELECT COUNT(*) FROM activity_log WHERE type='new'",
+            ),
+            (
+                "R5 infractions (365 d)",
+                "SELECT COUNT(*) FROM infractions WHERE target_id='old'",
+                "SELECT COUNT(*) FROM infractions WHERE target_id='new'",
+            ),
+            (
+                "R6 cases (730 d)",
+                "SELECT COUNT(*) FROM cases WHERE target_id='old'",
+                "SELECT COUNT(*) FROM cases WHERE target_id='new'",
+            ),
+            (
+                "R7 quarantine (365 d)",
+                "SELECT COUNT(*) FROM quarantine WHERE user_id='old'",
+                "SELECT COUNT(*) FROM quarantine WHERE user_id='new'",
+            ),
+            (
+                "R8 scheduled_actions (90 d)",
+                "SELECT COUNT(*) FROM scheduled_actions WHERE target_id='old'",
+                "SELECT COUNT(*) FROM scheduled_actions WHERE target_id='new'",
+            ),
+            (
+                "R9 tickets (365 d after closing)",
+                "SELECT COUNT(*) FROM tickets WHERE channel_id='old'",
+                "SELECT COUNT(*) FROM tickets WHERE channel_id='new'",
+            ),
+            (
+                "R10 suggestions (365 d)",
+                "SELECT COUNT(*) FROM suggestions WHERE id=1",
+                "SELECT COUNT(*) FROM suggestions WHERE id=2",
+            ),
+            (
+                "R10 suggestion_votes",
+                "SELECT COUNT(*) FROM suggestion_votes WHERE suggestion_id=1",
+                "SELECT COUNT(*) FROM suggestion_votes WHERE suggestion_id=2",
+            ),
+            (
+                "R11 giveaways (90 d after the end)",
+                "SELECT COUNT(*) FROM giveaways WHERE id=1",
+                "SELECT COUNT(*) FROM giveaways WHERE id=2",
+            ),
+            (
+                "R11 giveaway_entries",
+                "SELECT COUNT(*) FROM giveaway_entries WHERE giveaway_id=1",
+                "SELECT COUNT(*) FROM giveaway_entries WHERE giveaway_id=2",
+            ),
+            (
+                "R11 giveaway_results",
+                "SELECT COUNT(*) FROM giveaway_results WHERE giveaway_id=1",
+                "SELECT COUNT(*) FROM giveaway_results WHERE giveaway_id=2",
+            ),
+            (
+                "R12 polls (90 d after the end)",
+                "SELECT COUNT(*) FROM polls WHERE id=1",
+                "SELECT COUNT(*) FROM polls WHERE id=2",
+            ),
+            (
+                "R12 poll_votes",
+                "SELECT COUNT(*) FROM poll_votes WHERE poll_id=1",
+                "SELECT COUNT(*) FROM poll_votes WHERE poll_id=2",
+            ),
+            (
+                "R14 xp_events (365 d)",
+                "SELECT COUNT(*) FROM xp_events WHERE event_key='old'",
+                "SELECT COUNT(*) FROM xp_events WHERE event_key='new'",
+            ),
+        ] {
+            assert_eq!(
+                count(old_rows),
+                0,
+                "{rule}: the row past the cutoff survived"
+            );
+            assert_eq!(
+                count(new_rows),
+                1,
+                "{rule}: the row inside the window was deleted"
+            );
+        }
+    }
+
+    #[test]
+    fn retention_window_existing_growth_rules_hold() {
+        const DAY: i64 = 86_400_000;
+        let store = Store::open(":memory:").unwrap();
+        let now = Utc::now().timestamp_millis();
+        {
+            let conn = store.conn.lock().unwrap();
+            for (guild, departed_at) in [
+                ("gold", Some(now - 30 * DAY - 1_000)),
+                ("gnew", Some(now - 30 * DAY + 1_000)),
+                ("gstay", None),
+            ] {
+                conn.execute(
+                    "INSERT INTO helper_growth_lifecycle(guild_id,first_joined_at,last_joined_at,departed_at) VALUES(?1,?2,?2,?3)",
+                    params![guild, now - 400 * DAY, departed_at],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO helper_growth_activity_day(guild_id,day) VALUES(?1,'2026-01-01')",
+                    [guild],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO helper_growth_activity_day_v2(guild_id,day) VALUES(?1,'2026-01-01')",
+                    [guild],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO helper_growth_retention_record(guild_id,window_days) VALUES(?1,7)",
+                    [guild],
+                )
+                .unwrap();
+            }
+        }
+
+        store.prune_retention(now).unwrap();
+
+        let count = |sql: &str| -> i64 {
+            let conn = store.conn.lock().unwrap();
+            conn.query_row(sql, [], |row| row.get(0)).unwrap()
+        };
+        for table in [
+            "helper_growth_lifecycle",
+            "helper_growth_activity_day",
+            "helper_growth_activity_day_v2",
+            "helper_growth_retention_record",
+        ] {
+            for (guild, expected) in [("gold", 0), ("gnew", 1), ("gstay", 1)] {
+                assert_eq!(
+                    count(&format!(
+                        "SELECT COUNT(*) FROM {table} WHERE guild_id='{guild}'"
+                    )),
+                    expected,
+                    "R3/R4 {table}: wrong row count for guild {guild}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn retention_window_existing_other_unit_rules_hold() {
+        const DAY: i64 = 86_400_000;
+        const HOUR: i64 = 3_600_000;
+        let store = Store::open(":memory:").unwrap();
+        let now = Utc::now().timestamp_millis();
+        let date = |ms: i64| {
+            DateTime::<Utc>::from_timestamp_millis(ms)
+                .unwrap()
+                .format("%Y-%m-%d")
+                .to_string()
+        };
+        let rfc3339 = |ms: i64| {
+            DateTime::<Utc>::from_timestamp_millis(ms)
+                .unwrap()
+                .to_rfc3339()
+        };
+        let cutoff_seconds = now / 1_000 - 86_400;
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO stats(guild_id,date) VALUES('old',?1),('new',?2)",
+                params![date(now - 365 * DAY - DAY), date(now - 365 * DAY + DAY)],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO voice_sessions(guild_id,user_id,channel_id,started_at) VALUES('g','old','c',?1),('g','new','c',?2)",
+                params![cutoff_seconds - 10, cutoff_seconds + 10],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO helper_sessions(id,user_id,guild_id,issued_at,expires_at,last_seen_at) VALUES('old','u','g',?1,?1,?1),('new','u','g',?2,?2,?2)",
+                params![rfc3339(now - 25 * HOUR), rfc3339(now - 23 * HOUR)],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO helper_session_guilds(session_id,guild_id,name) VALUES('old','g','Guild'),('new','g','Guild')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO helper_oauth_states(state_hash,expires_at,used_at) VALUES('old',?1,NULL),('new',?2,NULL)",
+                params![cutoff_seconds - 10, cutoff_seconds + 10],
+            )
+            .unwrap();
+        }
+
+        store.prune_retention(now).unwrap();
+
+        let count = |sql: &str| -> i64 {
+            let conn = store.conn.lock().unwrap();
+            conn.query_row(sql, [], |row| row.get(0)).unwrap()
+        };
+        for (rule, old_rows, new_rows) in [
+            (
+                "R13 stats (365 d, text date)",
+                "SELECT COUNT(*) FROM stats WHERE guild_id='old'",
+                "SELECT COUNT(*) FROM stats WHERE guild_id='new'",
+            ),
+            (
+                "R15 voice_sessions (24 h, seconds)",
+                "SELECT COUNT(*) FROM voice_sessions WHERE user_id='old'",
+                "SELECT COUNT(*) FROM voice_sessions WHERE user_id='new'",
+            ),
+            (
+                "R16 helper_sessions (24 h, RFC 3339)",
+                "SELECT COUNT(*) FROM helper_sessions WHERE id='old'",
+                "SELECT COUNT(*) FROM helper_sessions WHERE id='new'",
+            ),
+            (
+                "R16 helper_session_guilds",
+                "SELECT COUNT(*) FROM helper_session_guilds WHERE session_id='old'",
+                "SELECT COUNT(*) FROM helper_session_guilds WHERE session_id='new'",
+            ),
+            (
+                "R17 helper_oauth_states (24 h, seconds)",
+                "SELECT COUNT(*) FROM helper_oauth_states WHERE state_hash='old'",
+                "SELECT COUNT(*) FROM helper_oauth_states WHERE state_hash='new'",
+            ),
+        ] {
+            assert_eq!(
+                count(old_rows),
+                0,
+                "{rule}: the row past the cutoff survived"
+            );
+            assert_eq!(
+                count(new_rows),
+                1,
+                "{rule}: the row inside the window was deleted"
+            );
+        }
+    }
+
+    #[test]
+    fn retention_window_event_registrations() {
+        const DAY: i64 = 86_400_000;
+        let store = Store::open(":memory:").unwrap();
+        let now = Utc::now().timestamp_millis();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO event_registrations(guild_id,event_id,user_id,status,created_at) VALUES('g','e','old','registered',?1),('g','e','new','registered',?2)",
+                params![now - 365 * DAY - 1_000, now - 365 * DAY + 1_000],
+            )
+            .unwrap();
+        }
+
+        let summary = store.prune_retention(now).unwrap();
+
+        let count = |sql: &str| -> i64 {
+            let conn = store.conn.lock().unwrap();
+            conn.query_row(sql, [], |row| row.get(0)).unwrap()
+        };
+        assert_eq!(
+            count("SELECT COUNT(*) FROM event_registrations WHERE user_id='old'"),
+            0,
+            "N1: a registration older than one year survived"
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM event_registrations WHERE user_id='new'"),
+            1,
+            "N1: a registration inside the year was deleted"
+        );
+        assert_eq!(summary.deleted["event_registrations"], 1);
+    }
+
+    #[test]
+    fn retention_window_welcome_claims() {
+        let store = Store::open(":memory:").unwrap();
+        let now = Utc::now().timestamp_millis();
+        let cutoff_seconds = now / 1_000 - 86_400;
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO welcome_delivery_claims(guild_id,user_id,kind,claimed_at) VALUES('g','old','welcome',?1),('g','new','welcome',?2)",
+                params![cutoff_seconds - 10, cutoff_seconds + 10],
+            )
+            .unwrap();
+        }
+
+        let summary = store.prune_retention(now).unwrap();
+
+        let count = |sql: &str| -> i64 {
+            let conn = store.conn.lock().unwrap();
+            conn.query_row(sql, [], |row| row.get(0)).unwrap()
+        };
+        assert_eq!(
+            count("SELECT COUNT(*) FROM welcome_delivery_claims WHERE user_id='old'"),
+            0,
+            "N2: a welcome claim older than 24 hours survived"
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM welcome_delivery_claims WHERE user_id='new'"),
+            1,
+            "N2: a welcome claim inside 24 hours was deleted"
+        );
+        assert_eq!(summary.deleted["welcome_delivery_claims"], 1);
+    }
+
+    #[test]
+    fn retention_window_achievement_links() {
+        let store = Store::open(":memory:").unwrap();
+        let now = Utc::now().timestamp_millis();
+        let cutoff_seconds = now / 1_000 - 86_400;
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO achievement_links(token_hash,guild_id,user_id,name,avatar,expires_at) VALUES('old-hash','g','old','Old','',?1),('new-hash','g','new','New','',?2)",
+                params![cutoff_seconds - 10, cutoff_seconds + 10],
+            )
+            .unwrap();
+        }
+
+        let summary = store.prune_retention(now).unwrap();
+
+        let count = |sql: &str| -> i64 {
+            let conn = store.conn.lock().unwrap();
+            conn.query_row(sql, [], |row| row.get(0)).unwrap()
+        };
+        assert_eq!(
+            count("SELECT COUNT(*) FROM achievement_links WHERE user_id='old'"),
+            0,
+            "N3: a link expired more than 24 hours ago survived"
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM achievement_links WHERE user_id='new'"),
+            1,
+            "N3: a link expired less than 24 hours ago was deleted"
+        );
+        assert_eq!(summary.deleted["achievement_links"], 1);
+    }
+
+    #[test]
+    fn retention_window_legacy_notes() {
+        const DAY: i64 = 86_400_000;
+        let store = Store::open(":memory:").unwrap();
+        let now = Utc::now().timestamp_millis();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute_batch(
+                "CREATE TABLE notes (id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id TEXT NOT NULL, target_id TEXT NOT NULL, author_id TEXT NOT NULL, content TEXT NOT NULL, created_at INTEGER NOT NULL);",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO notes(guild_id,target_id,author_id,content,created_at) VALUES('g','old','mod','old',?1),('g','new','mod','new',?2)",
+                params![now - 730 * DAY - 1_000, now - 730 * DAY + 1_000],
+            )
+            .unwrap();
+        }
+
+        let summary = store.prune_retention(now).unwrap();
+
+        let count = |sql: &str| -> i64 {
+            let conn = store.conn.lock().unwrap();
+            conn.query_row(sql, [], |row| row.get(0)).unwrap()
+        };
+        assert_eq!(
+            count("SELECT COUNT(*) FROM notes WHERE target_id='old'"),
+            0,
+            "N4: a Node-era note older than two years survived"
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM notes WHERE target_id='new'"),
+            1,
+            "N4: a Node-era note inside two years was deleted"
+        );
+        assert_eq!(summary.deleted["notes"], 1);
+
+        // A database created by the Rust Helper has no Node-era tables.
+        let without_legacy = Store::open(":memory:").unwrap();
+        assert!(without_legacy.prune_retention(now).is_ok());
+    }
+
+    #[test]
+    fn retention_window_legacy_sticky_roles() {
+        const DAY: i64 = 86_400_000;
+        let store = Store::open(":memory:").unwrap();
+        let now = Utc::now().timestamp_millis();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute_batch(
+                "CREATE TABLE sticky_roles (guild_id TEXT NOT NULL, user_id TEXT NOT NULL, role_ids TEXT NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY (guild_id, user_id));",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO sticky_roles(guild_id,user_id,role_ids,updated_at) VALUES('g','old','[]',?1),('g','new','[]',?2)",
+                params![now - 365 * DAY - 1_000, now - 365 * DAY + 1_000],
+            )
+            .unwrap();
+        }
+
+        let summary = store.prune_retention(now).unwrap();
+
+        let count = |sql: &str| -> i64 {
+            let conn = store.conn.lock().unwrap();
+            conn.query_row(sql, [], |row| row.get(0)).unwrap()
+        };
+        assert_eq!(
+            count("SELECT COUNT(*) FROM sticky_roles WHERE user_id='old'"),
+            0,
+            "N5: Node-era sticky roles older than one year survived"
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM sticky_roles WHERE user_id='new'"),
+            1,
+            "N5: Node-era sticky roles inside one year were deleted"
+        );
+        assert_eq!(summary.deleted["sticky_roles"], 1);
     }
 
     #[test]
